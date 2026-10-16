@@ -75,6 +75,22 @@ Les dossiers Qlik et l'extension sont retirés, seul le nom du fichier reste :
 - tout autre fichier lu → `data/input/<nom>/` (vue SQL `in_<nom>`) ;
 - table de base lue par `SQL SELECT ... FROM dbo.clients` → `data/input/clients`.
 
+## Voir ce que le modèle a fait
+
+Pour chaque table envoyée au modèle, dans `work/<script>/<table>/` :
+
+| Fichier | Contenu |
+|---|---|
+| `prompt.md` | ce que le modèle a reçu (brouillon SQL, code Qlik, faits) |
+| `model_1.log`, `model_2.log` | commande, message, durée et **réponse brute** du modèle, par tentative |
+| `query.attempt1.sql`, `query.attempt2.sql` | la requête après chaque tentative |
+| `retry.md` | les erreurs renvoyées au modèle pour sa 2e tentative |
+
+La console signale aussi les deux comportements classiques d'un modèle
+faible : « n'a PAS modifié query.sql » (il n'a rien écrit), ou « a AFFICHÉ
+la requête sans écrire le fichier » (récupérée automatiquement depuis sa
+réponse).
+
 ## Quand une table est à corriger
 
 1. Corrige `work/<script>/<table>/query.sql` (`prompt.md` à côté contient le

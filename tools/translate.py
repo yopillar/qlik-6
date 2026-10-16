@@ -13,6 +13,9 @@ et « erreur_modele ». Les « escalade » ne sont jamais retraduites
 automatiquement (ta correction manuelle serait écrasée) : --retry-escalated
 pour le faire exprès. Les « deterministic » ne passent jamais par le modèle.
 
+Pour voir ce que le modèle a fait : work/<script>/<table>/model_<n>.log
+(réponse brute) et query.attempt<n>.sql (requête après chaque tentative).
+
 Usage :
     python tools/translate.py work/ventes
     python tools/translate.py work/ventes --only 012_lot --force
@@ -25,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +46,14 @@ RETRY = ("Read the file {prompt}, then the file {retry}: it lists the errors "
          "found in your previous {out}. Rewrite {out} fixing ALL of them.")
 
 
+def extract_sql(text: str) -> str | None:
+    """SQL affiché par le modèle au lieu d'être écrit dans le fichier : on
+    prend le plus long bloc ```sql``` de sa réponse."""
+    blocks = re.findall(r"```(?:sql)?\s*\n(.*?)```", text, re.S | re.I)
+    blocks = [b for b in blocks if re.search(r"\bSELECT\b", b, re.I)]
+    return max(blocks, key=len) if blocks else None
+
+
 def run_opencode(message: str, args) -> tuple[bool, str]:
     cmd = [args.opencode_bin, "run", "--agent", args.agent]
     if args.model:
@@ -55,39 +67,75 @@ def run_opencode(message: str, args) -> tuple[bool, str]:
                              timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return False, f"timeout après {args.timeout}s"
-    return res.returncode == 0, (res.stdout + res.stderr)[-1500:]
+    return res.returncode == 0, res.stdout + ("\n--- stderr ---\n" + res.stderr
+                                              if res.stderr.strip() else "")
 
 
 def translate_section(workdir: Path, sec: dict, args,
                       parser=None) -> tuple[str, int, str]:
-    """Le modèle complète les TODO(model) de query.sql (une relance)."""
+    """Le modèle complète les TODO(model) de query.sql (une relance).
+
+    Chaque tentative laisse une trace dans le dossier de la table :
+      model_<n>.log         commande, message, durée, réponse brute du modèle
+      query.attempt<n>.sql  la requête telle qu'elle était après la tentative
+    """
     d = workdir / sec["id"]
     out, prompt, retry = d / "query.sql", d / "prompt.md", d / "retry.md"
     draft = out.read_text(encoding="utf-8") if out.exists() else ""
     retry.unlink(missing_ok=True)
+    for old in list(d.glob("model_*.log")) + list(d.glob("query.attempt*.sql")):
+        old.unlink()
     errors: list[str] = []
     for attempt in range(1, args.retries + 2):
         if attempt == 1:
             msg = MESSAGE.format(prompt=prompt.as_posix(), out=out.as_posix())
         else:
+            allowed = ", ".join(sorted(sec.get("views", {}))) or "aucune"
             retry.write_text(
                 "# Errors found in your previous query.sql\n\n"
                 + "\n".join(f"- {e}" for e in errors)
-                + "\n\nFix every error. Keep everything that was correct.\n",
+                + f"\n\nViews you may use: {allowed}, plus the CTEs defined "
+                "in the query. Do not rename the existing CTEs.\n"
+                "Fix every error. Keep everything that was correct.\n",
                 encoding="utf-8")
             msg = RETRY.format(prompt=prompt.as_posix(),
                                retry=retry.as_posix(), out=out.as_posix())
+        before = out.read_text(encoding="utf-8") if out.exists() else ""
+        t0 = time.perf_counter()
         ok, log = run_opencode(msg, args)
         if args.dry_run:
             return "dry-run", attempt, ""
+        after = out.read_text(encoding="utf-8") if out.exists() else ""
+        note = ""
+        if after == before:
+            sql = extract_sql(log)
+            if sql:
+                out.write_text(sql, encoding="utf-8")
+                note = ("le modèle a AFFICHÉ la requête sans écrire le fichier : "
+                        "récupérée depuis sa réponse")
+            else:
+                note = "le modèle n'a PAS modifié query.sql"
+        (d / f"model_{attempt}.log").write_text(
+            f"# Tentative {attempt} — {round(time.perf_counter() - t0)}s, "
+            f"code retour {'0' if ok else 'erreur'}\n"
+            f"# Commande : {args.opencode_bin} run --agent {args.agent}"
+            f"{' --model ' + args.model if args.model else ''}\n"
+            f"# Message  : {msg}\n"
+            + (f"# Note     : {note}\n" if note else "")
+            + "\n" + log, encoding="utf-8")
+        if out.exists():
+            (d / f"query.attempt{attempt}.sql").write_text(
+                out.read_text(encoding="utf-8"), encoding="utf-8")
         if not ok:
             out.write_text(draft, encoding="utf-8")      # brouillon intact
             last = log.strip().splitlines()
             return "erreur_modele", attempt, last[-1] if last else "échec opencode"
         errors, _ = check_section(sec, out, parser)
+        if note:
+            print(f"    {sec['id']} : {note}")
         if not errors:
             return "ok", attempt, ""
-        print(f"    {sec['id']} ✗ tentative {attempt} : {len(errors)} erreur(s)")
+        print(f"    {sec['id']} ✗ tentative {attempt} : {errors[0][:120]}")
     return "escalade", args.retries + 1, " | ".join(errors)[:500]
 
 
