@@ -610,7 +610,10 @@ def analyze(inst: Inst) -> None:
     if inst.target is None:
         inst.target = inst.label
 
-    rm = re.search(r"\bRESIDENT\s+" + NAME, body, re.I)
+    # « … AS Resident » ou « …, Resident » : un champ, pas la clause
+    rm = next((m for m in re.finditer(r"\bRESIDENT\s+" + NAME, body, re.I)
+               if not re.search(r"(\bAS|,)\s*$", body[:m.start()], re.I)
+               and m.group(1) != ","), None)
     if rm:
         inst.resident = strip_name(rm.group(1))
         inst.constructs.add("resident")
@@ -801,6 +804,9 @@ def build_graph(insts: list[Inst]):
                 key = ref(inst.target) if inst.target in live else \
                     create(inst.target)
             elif "keep" in inst.constructs:
+                # la table entre parenthèses filtre la table chargée : c'est
+                # une dépendance (ordre des sections, vue à exposer)
+                inst.keep_other = ref(inst.target)
                 key = create(inst.label) if inst.label else ref(inst.target)
             else:
                 key = create(inst.target)
@@ -829,6 +835,9 @@ def build_graph(insts: list[Inst]):
             if inst.resident and inst.resident != key:
                 t["deps"].add(inst.resident)
             t["deps"].update(a["map"] for a in inst.applymaps)
+            other = getattr(inst, "keep_other", None)
+            if other and other != key:
+                t["deps"].add(other)
             if not explicit:
                 last = key
         elif inst.kind == "store" and inst.stored:
@@ -887,6 +896,17 @@ def build_sections(insts, tables, schemas):
         else:
             f = downstream(n)
             owner[n] = next(iter(f)) if len(f) == 1 else n
+    # une table interne à une section mais lue par une autre section doit
+    # devenir sa propre section (sinon elle n'existe pas comme vue SQL)
+    changed = True
+    while changed:
+        changed = False
+        for n, t in tables.items():
+            for d in t["deps"]:
+                if d in owner and owner[d] != d and owner[d] != owner[n] \
+                        and not tables[d]["mapping"]:
+                    owner[d] = d
+                    changed = True
     groups: dict[str, list[str]] = {}
     for n in tables:
         groups.setdefault(owner[n], []).append(n)
@@ -1004,8 +1024,10 @@ Complete ONE Spark SQL query (Spark 3.5.8) translated from a Qlik Sense
 script. A parser already translated most of it: every part it could not
 translate safely is a CTE marked `TODO(model)`.
 
-Write the complete query to `{out}`, with every `TODO(model)` CTE replaced
-by its translation. Do not read other files.
+Everything you need is in this message: do not look for documentation,
+skills or other files, and do not use any tool (they are all disabled).
+Answer ONLY with the complete query, every `TODO(model)` CTE replaced by its
+translation, in one single ```sql block.
 
 # Rules
 1. Keep every part that is already translated EXACTLY as it is.
@@ -1265,7 +1287,7 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
         inputs.clear()
         ctx = SectionContext(
             section_tables=names, final_table=g,
-            table_view=lambda t: table_views.get(t, view_name(t)),
+            table_view=lambda t: table_views.get(t),
             input_view=input_view, file_schema=file_schema,
             mapping_insts=lambda m: [insts[k] for k in tables.get(m, {})
                                      .get("insts", [])],
@@ -1319,7 +1341,7 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                 f"{mapping_code([insts[k] for k in tables[m]['insts']])}\n```\n"
                 for m in sorted(maps) if m in tables)
             prompt = PROMPT.format(
-                out=(d / "query.sql").as_posix(), draft=sql.rstrip(),
+                draft=sql.rstrip(),
                 code=numbered(sec_insts),
                 facts=facts_block(sec, sec_insts, schemas, env, sec["views"],
                                   applicable),

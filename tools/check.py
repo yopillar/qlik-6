@@ -37,8 +37,18 @@ def strip_sql_comments(sql: str) -> str:
     return re.sub(r"--[^\n]*", " ", sql)
 
 
-def strip_sql_strings(sql: str) -> str:
-    return re.sub(r"'(?:\\.|[^'\\])*'", "''", sql)
+TOKENS = re.compile(r"'(?:\\.|[^'\\])*'|`(?:``|[^`])*`")
+
+
+def strip_sql_strings(sql: str, idents: bool = False) -> str:
+    """Vide les chaînes '…' (et les noms `…` si idents). Les deux sont lus
+    ensemble : un nom `Payment's type` ne doit pas ouvrir une chaîne."""
+    def repl(m):
+        tok = m.group()
+        if tok.startswith("'"):
+            return "''"
+        return "``" if idents else tok
+    return TOKENS.sub(repl, sql)
 
 
 def get_parser():
@@ -60,8 +70,11 @@ def check_section(section: dict, query_path: Path,
         return ["query.sql absent ou vide"], []
     raw = query_path.read_text(encoding="utf-8")
     if "TODO(model)" in raw:
-        errors.append(f"{raw.count('TODO(model)')} bloc(s) TODO(model) restant(s)")
+        left = re.findall(r"TODO\(model\):\s*(l\.\d+)", raw)
+        errors.append(f"{raw.count('TODO(model)')} bloc(s) TODO(model) "
+                      f"restant(s) : {', '.join(left) or '?'}")
     code = strip_sql_strings(strip_sql_comments(raw))
+    code_no_idents = strip_sql_strings(strip_sql_comments(raw), idents=True)
     if code.strip().rstrip(";").count(";"):
         errors.append("plusieurs instructions : une seule requête attendue")
     for kw in FORBIDDEN:
@@ -71,12 +84,20 @@ def check_section(section: dict, query_path: Path,
         errors.append("balises ``` dans le fichier : SQL seul attendu")
 
     # vues et CTE lues
-    ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code, re.I)}
+    ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents,
+                                          re.I)}
     allowed = ctes | {v.lower() for v in section.get("views", {})}
-    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)", code, re.I):
+    unknown = []
+    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)", code_no_idents,
+                         re.I):
         name = m.group(1).lower()
-        if name not in allowed and name not in ("values", "lateral"):
-            errors.append(f"table ou vue inconnue : {m.group(1)}")
+        if name not in allowed and name not in ("values", "lateral") \
+                and m.group(1) not in unknown:
+            unknown.append(m.group(1))
+    if unknown:
+        errors.append(f"table ou vue inconnue : {', '.join(unknown)} (vues "
+                      f"autorisées : {', '.join(sorted(section.get('views', {}))) or 'aucune'}"
+                      " + les CTE de la requête)")
 
     # colonnes de sortie attendues
     cols = section.get("columns") or []

@@ -559,8 +559,10 @@ def parse_fields(text: str) -> list[tuple[str, str | None]]:
             m = pos
             break
         if m is not None:
-            alias = part[m + 2:].strip()
-            out.append((part[:m].strip(), alias.strip("[]\"")))
+            alias = part[m + 2:].strip().strip("[]\"")
+            if not alias:
+                raise Untranslatable(f"alias vide : {part[:40]}")
+            out.append((part[:m].strip(), alias))
         else:
             out.append((part.strip(), None))
     return out
@@ -573,7 +575,11 @@ def parse_segment(text: str) -> Segment:
     m = re.match(r"DISTINCT\b", body, re.I)
     if m:
         distinct, body = True, body[m.end():].strip()
-    kws = find_keywords(body, CLAUSES)
+    # un champ peut porter le nom d'un mot-clé (« …, Resident » ou
+    # « … AS Resident ») : ce n'est alors pas une clause
+    kws = [(pos, kw) for pos, kw in find_keywords(body, CLAUSES)
+           if not re.search(r"(\bAS|,)\s*$", body[:pos], re.I)
+           and not re.match(r"\s*(,|$)", body[pos + len(kw):])]
     end_fields = kws[0][0] if kws else len(body)
     seg = Segment(parse_fields(body[:end_fields]), distinct)
     for k, (pos, kw) in enumerate(kws):
@@ -708,7 +714,12 @@ class SectionTranslator:
         """CTE de la section, sinon vue d'une table amont."""
         if table in self.cur:
             return self.cur[table], self.cols[self.cur[table]]
-        return self.ctx.table_view(table), self.ctx.graph_schema(table)
+        view = self.ctx.table_view(table)
+        if view is None:
+            raise Untranslatable(f"RESIDENT {table} : table introuvable dans "
+                                 "le script (créée dynamiquement ou dans un "
+                                 "include ?)")
+        return view, self.ctx.graph_schema(table)
 
     # -- instructions
     def translate(self, inst, text: str):
@@ -736,7 +747,10 @@ class SectionTranslator:
         elif inst.sources:
             src = self.ctx.input_view(inst.sources[0])
         elif inst.resident:
-            src = self.source_of(inst.resident)[0]
+            try:
+                src = self.source_of(inst.resident)[0]
+            except Untranslatable:
+                src = None
         else:
             src = None
         self.todos.append(f"l.{line} : {reason}")
@@ -968,13 +982,16 @@ class SectionTranslator:
         if not m:
             raise Untranslatable("KEEP sans table cible explicite")
         other_name = m.group(1).strip("[]\"")
-        other = next((t for t in self.cur
-                      if self.ctx.table_name(t) == other_name), None)
+        other_key = getattr(inst, "keep_other", None) or other_name
+        other = other_key if other_key in self.cur else next(
+            (t for t in self.cur if self.ctx.table_name(t) == other_name), None)
         if other is not None:
             other_src, other_cols = self.cur[other], self.cols[self.cur[other]]
         elif how == "left":
-            other_src = self.ctx.table_view(other_name)
-            other_cols = self.ctx.graph_schema(other_name)
+            other_src = self.ctx.table_view(other_key)
+            other_cols = self.ctx.graph_schema(other_key)
+            if other_src is None:
+                raise Untranslatable(f"KEEP ({other_name}) : table introuvable")
         else:
             raise Untranslatable(f"{how.upper()} KEEP sur une table d'une "
                                  "autre section")

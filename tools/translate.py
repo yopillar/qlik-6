@@ -5,13 +5,18 @@ Seules les tables au statut « todo » passent ici : leur query.sql est déjà
   1. opencode run --agent translator, session neuve, avec son prompt.md
      (le brouillon SQL + le code Qlik + les faits) ;
   2. check.py sur le query.sql complété ;
-  3. si erreurs : UNE relance avec la liste exacte des erreurs (retry.md) ;
+  3. si erreurs : UNE relance, avec sa réponse et la liste exacte des erreurs ;
   4. statut mis à jour dans le manifest et dans journal.csv.
 
 Reprise naturelle : relancer la commande ne traite que les sections « todo »
 et « erreur_modele ». Les « escalade » ne sont jamais retraduites
 automatiquement (ta correction manuelle serait écrasée) : --retry-escalated
 pour le faire exprès. Les « deterministic » ne passent jamais par le modèle.
+
+Le prompt est envoyé DANS le message et le modèle répond par un bloc
+```sql``` : il n'a besoin d'aucun outil ni d'aucun fichier (tous ses outils
+sont coupés). Pour voir ce qu'il a fait : work/<script>/<table>/model_<n>.log
+(message et réponse brute) et query.attempt<n>.sql.
 
 Usage :
     python tools/translate.py work/ventes
@@ -25,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -36,10 +42,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from check import check_section, get_parser  # noqa: E402
 
-MESSAGE = ("Read the file {prompt} and follow its instructions exactly. "
-           "Write the complete query to {out} and nothing else.")
-RETRY = ("Read the file {prompt}, then the file {retry}: it lists the errors "
-         "found in your previous {out}. Rewrite {out} fixing ALL of them.")
+# Le prompt est envoyé DANS le message et le modèle répond par un bloc
+# ```sql``` : aucun outil, aucune lecture de fichier, aucune permission à
+# demander. Taille max d'un argument de ligne de commande sous Linux : 128 Kio.
+MAX_INLINE = 120_000
+RETRY_TEXT = """
+
+# Your previous answer had errors
+
+```sql
+{previous}
+```
+
+Errors found:
+{errors}
+
+Views you may use: {allowed}, plus the CTEs defined in the query. Do not
+rename the existing CTEs. Fix every error, keep everything that was correct,
+and answer again with the complete query in one ```sql block."""
+
+
+def extract_sql(text: str) -> str | None:
+    """Requête dans la réponse du modèle : le plus long bloc ```sql```, ou à
+    défaut le texte à partir de la première ligne SQL."""
+    text = text.split("\n--- stderr ---\n")[0]
+    blocks = re.findall(r"```(?:sql)?\s*\n(.*?)```", text, re.S | re.I)
+    blocks = [b for b in blocks if re.search(r"\bSELECT\b", b, re.I)]
+    if blocks:
+        return max(blocks, key=len)
+    # pas de balises : la requête commence à la première ligne SQL
+    m = re.search(r"^\s*(--|WITH\b|SELECT\b)", text, re.M | re.I)
+    if m and re.search(r"\bSELECT\b", text[m.start():], re.I):
+        return text[m.start():].strip()
+    return None
+
+
+def shrink(msg: str) -> str:
+    """Allège un message trop long : skills puis traductions de fonctions."""
+    for marker in ("\n# Skill: ", "\n# Function translations"):
+        if len(msg.encode("utf-8")) <= MAX_INLINE:
+            break
+        head, sep, tail = msg.partition(marker)
+        if sep:
+            # on retire la rubrique jusqu'à la rubrique suivante non concernée
+            rest = re.split(r"\n# (?!Skill: )(?=\S)", tail, maxsplit=1)
+            msg = head + ("\n# " + rest[1] if len(rest) > 1 else "")
+    return msg
 
 
 def run_opencode(message: str, args) -> tuple[bool, str]:
@@ -55,39 +103,87 @@ def run_opencode(message: str, args) -> tuple[bool, str]:
                              timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return False, f"timeout après {args.timeout}s"
-    return res.returncode == 0, (res.stdout + res.stderr)[-1500:]
+    return res.returncode == 0, res.stdout + ("\n--- stderr ---\n" + res.stderr
+                                              if res.stderr.strip() else "")
 
 
 def translate_section(workdir: Path, sec: dict, args,
                       parser=None) -> tuple[str, int, str]:
-    """Le modèle complète les TODO(model) de query.sql (une relance)."""
+    """Le modèle complète les TODO(model) de query.sql (une relance).
+
+    Le prompt est envoyé dans le message ; la requête est lue dans la réponse
+    du modèle (bloc ```sql```) puis écrite dans query.sql par ce script.
+    Chaque tentative laisse une trace dans le dossier de la table :
+      model_<n>.log         commande, message, durée, réponse brute du modèle
+      query.attempt<n>.sql  la requête extraite de la réponse
+    """
     d = workdir / sec["id"]
-    out, prompt, retry = d / "query.sql", d / "prompt.md", d / "retry.md"
+    out, prompt_path = d / "query.sql", d / "prompt.md"
+    prompt = prompt_path.read_text(encoding="utf-8")
     draft = out.read_text(encoding="utf-8") if out.exists() else ""
-    retry.unlink(missing_ok=True)
+    for old in list(d.glob("model_*.log")) + list(d.glob("query.attempt*.sql")) \
+            + [d / "retry.md"]:
+        old.unlink(missing_ok=True)
     errors: list[str] = []
+    previous = draft
+    failures = 0
     for attempt in range(1, args.retries + 2):
-        if attempt == 1:
-            msg = MESSAGE.format(prompt=prompt.as_posix(), out=out.as_posix())
-        else:
-            retry.write_text(
-                "# Errors found in your previous query.sql\n\n"
-                + "\n".join(f"- {e}" for e in errors)
-                + "\n\nFix every error. Keep everything that was correct.\n",
-                encoding="utf-8")
-            msg = RETRY.format(prompt=prompt.as_posix(),
-                               retry=retry.as_posix(), out=out.as_posix())
+        msg = prompt
+        if attempt > 1:
+            msg += RETRY_TEXT.format(
+                previous=previous.rstrip(),
+                errors="\n".join(f"- {e}" for e in errors),
+                allowed=", ".join(sorted(sec.get("views", {}))) or "none")
+        msg = shrink(msg)
+        if len(msg.encode("utf-8")) > MAX_INLINE:
+            # trop long pour la ligne de commande, même allégé : le modèle n'a
+            # pas le droit de lire un fichier, la table est à faire à la main
+            return "escalade", attempt, ("prompt trop long pour être envoyé "
+                                         "dans le message")
+        t0 = time.perf_counter()
         ok, log = run_opencode(msg, args)
         if args.dry_run:
             return "dry-run", attempt, ""
+        sql = extract_sql(log) if ok else None
+        answer = log.split("\n--- stderr ---\n")[0].strip()
         if not ok:
-            out.write_text(draft, encoding="utf-8")      # brouillon intact
-            last = log.strip().splitlines()
-            return "erreur_modele", attempt, last[-1] if last else "échec opencode"
-        errors, _ = check_section(sec, out, parser)
+            note = ("opencode a échoué (code retour non nul) : voir la fin "
+                    "du log, partie stderr")
+        elif not answer:
+            note = "réponse VIDE du modèle (rien sur stdout, voir stderr)"
+        elif not sql:
+            note = "aucune requête SQL trouvée dans la réponse du modèle"
+        else:
+            note = ""
+        (d / f"model_{attempt}.log").write_text(
+            f"# Tentative {attempt} — {round(time.perf_counter() - t0)}s, "
+            f"code retour {'0' if ok else 'erreur'}\n"
+            f"# Commande : {args.opencode_bin} run --agent {args.agent}"
+            f"{' --model ' + args.model if args.model else ''} <message>\n"
+            + (f"# Note     : {note}\n" if note else "")
+            + "\n## Message envoyé\n\n" + msg
+            + "\n\n## Réponse du modèle\n\n" + log, encoding="utf-8")
+        if not ok:
+            failures += 1
+            errors = ["the previous call failed: answer with the complete query "
+                      "in one ```sql block, without using any tool"]
+            print(f"    {sec['id']} ✗ tentative {attempt} : {note}")
+            continue
+        if sql:
+            out.write_text(sql, encoding="utf-8")
+            (d / f"query.attempt{attempt}.sql").write_text(sql, encoding="utf-8")
+            previous = sql
+            errors, _ = check_section(sec, out, parser)
+        else:
+            errors = ["no ```sql block in your answer: answer with the complete "
+                      "query in one ```sql block"]
+            print(f"    {sec['id']} : {note}")
         if not errors:
             return "ok", attempt, ""
-        print(f"    {sec['id']} ✗ tentative {attempt} : {len(errors)} erreur(s)")
+        print(f"    {sec['id']} ✗ tentative {attempt} : {errors[0][:120]}")
+    out.write_text(previous, encoding="utf-8")
+    if failures == args.retries + 1:      # aucun appel n'a abouti
+        return "erreur_modele", failures, "opencode en échec : voir model_*.log"
     return "escalade", args.retries + 1, " | ".join(errors)[:500]
 
 
