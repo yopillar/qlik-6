@@ -34,6 +34,16 @@ import pandas as pd
 MAX_EXAMPLES = 20
 
 
+def guess_sep(path: Path) -> str:
+    """Séparateur d'un CSV parmi , ; tabulation | (défaut : virgule).
+    pandas devine parfois une lettre quand le fichier n'a qu'une colonne."""
+    with path.open(encoding="utf-8-sig", errors="replace") as f:
+        head = f.readline()
+    counts = {c: head.count(c) for c in (",", ";", "\t", "|")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] else ","
+
+
 def read_any(path: Path, sep: str) -> pd.DataFrame:
     """Lit un QVD, un CSV ou un Parquet (fichier ou dossier de part-*)."""
     suffix = path.suffix.lower()
@@ -47,16 +57,15 @@ def read_any(path: Path, sep: str) -> pd.DataFrame:
         return QvdTable.from_qvd(str(path)).to_pandas()
     if suffix in (".csv", ".txt"):
         # séparateur détecté automatiquement si non fourni
-        return pd.read_csv(path, sep=sep, dtype=str, keep_default_na=False,
-                           encoding="utf-8-sig", engine="python")
+        return pd.read_csv(path, sep=sep or guess_sep(path), dtype=str,
+                           keep_default_na=False, encoding="utf-8-sig")
     if path.is_dir():
         if any(path.glob("*.parquet")):
             return pd.read_parquet(path)
         parts = sorted(path.glob("part-*.csv"))
         if parts:
-            return pd.concat(pd.read_csv(p, sep=sep, dtype=str,
-                                         keep_default_na=False,
-                                         engine="python")
+            return pd.concat(pd.read_csv(p, sep=sep or guess_sep(p), dtype=str,
+                                         keep_default_na=False)
                              for p in parts)
     if suffix == ".parquet":
         return pd.read_parquet(path)

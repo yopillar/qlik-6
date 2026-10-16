@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from conf import IoConf  # noqa: E402
 from qlik2sql import (SectionContext, translate_section,  # noqa: E402
                       view_name)
 
@@ -45,7 +46,6 @@ SKILL_BY_CONSTRUCT = {
     "resident_chain": "qlik-resident-chain-sql",
     "row_functions": "qlik-row-functions-sql",
 }
-FUNCTIONS_DOC = Path("docs/qlik-functions-sql.md")
 
 CONTROL_WORDS = {"FOR", "NEXT", "IF", "ELSEIF", "ELSE", "END", "ENDIF",
                  "SUB", "ENDSUB", "DO", "LOOP", "SWITCH", "CASE", "DEFAULT",
@@ -60,8 +60,6 @@ SYSTEM_VARS = {"ThousandSep", "DecimalSep", "MoneyThousandSep",
                "CreateSearchIndexOnReload"}
 MAX_UNROLL = 50
 NAME = r"(\[[^\]]+\]|\"[^\"]+\"|[^\s,;()\[\]\"'=]+)"
-# nom de champ simple (sans opérateur) : seul cas traduit sans modèle
-FIELD = r"(\[[^\]]+\]|\"[^\"]+\"|[^\W\d][\w.]*)"
 
 
 # ==========================================================================
@@ -178,6 +176,11 @@ def tokenize(text: str) -> list[Stmt]:
     return stmts
 
 
+def drop_rem(stmts: list[Stmt]) -> list[Stmt]:
+    """« REM … ; » est un commentaire Qlik : supprimé comme // et /* */."""
+    return [st for st in stmts if st.word != "REM"]
+
+
 def merge_preceding_loads(stmts: list[Stmt]) -> list[Stmt]:
     """Fusionne les LOAD empilés : en Qlik, un « preceding load »
     (LOAD sans FROM/RESIDENT/INLINE/AUTOGENERATE) se termine par ';' mais
@@ -279,27 +282,65 @@ class Inst:
     stored: tuple | None = None
     join_keys: list[str] | None = None
     directory: str = ""
-    vars_used: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
+LET_TOKEN = re.compile(r"'[^']*'|\[[^\]]*\]|\"[^\"]*\"|([^\W\d][\w.#]*)\s*(\()?")
+
+
 class Env:
+    def let_expression(self, name: str, text: str, pos: int) -> str | None:
+        """$(v) d'un LET calculé (LET v = Peek(…), Today(), NoOfRows(…)…) :
+        on substitue l'expression elle-même, traduite en SQL plus loin.
+        Seulement dans une expression (pas dans une chaîne ni un nom), et si
+        l'expression ne lit que des fonctions et des littéraux."""
+        rhs = self.lets.get(name)
+        if not rhs or "$(" in rhs or _in_quotes(text, pos):
+            return None
+        for m in LET_TOKEN.finditer(rhs):
+            if m.group(1) and not m.group(2):
+                return None          # nom nu : variable ou champ, incertain
+        return f"({rhs})"
+
+    def bare_variables(self, text: str) -> str:
+        """AUTOGENERATE vMax - vMin + 1 : sans table source, un nom nu ne peut
+        être qu'une variable ; on le remplace par sa valeur ou son expression."""
+        m = re.search(r"\bAUTOGENERATE\b(.*?)(;|$)", text, re.I | re.S)
+        if not m:
+            return text
+        clause = m.group(1)
+
+        def repl(w):
+            name = w.group(0)
+            if self.vars.get(name) is not None:
+                return self.vars[name]
+            return self.let_expression(name, "", 0) or name
+        new = re.sub(r"(?<![\w$.'\[\"])[A-Za-z_][\w.]*(?![\w(])", repl, clause)
+        return text[:m.start(1)] + new + text[m.end(1):]
+
     def __init__(self):
         self.directory = ""             # instruction DIRECTORY courante
         self.vars: dict[str, str | None] = {}
         self.lets: dict[str, str] = {}
 
-    def expand(self, text: str, used: dict | None = None) -> str:
+    def expand(self, text: str) -> str:
+        # '$(v)' seul entre apostrophes, v étant un LET calculé (date, Peek…) :
+        # Qlik interprète la valeur, on substitue l'expression elle-même
+        def quoted(m):
+            sub = self.let_expression(m.group(1), "", 0)
+            return sub if sub else m.group(0)
+        text = re.sub(r"'\$\(#?([A-Za-z_][\w.]*)\)'", quoted, text)
+
         def repl(m):
             name, args = m.group(2), m.group(4)
-            if name in SYSTEM_VARS or self.vars.get(name) is None:
+            if name in SYSTEM_VARS:
                 return m.group(0)
+            if self.vars.get(name) is None:
+                return self.let_expression(name, text, m.start()) or m.group(0)
             value = self.vars[name]
             if args is not None:
                 for k, a in enumerate(split_top(args), 1):
                     value = value.replace(f"${k}", a.strip())
-            if used is not None:
-                used[name] = self.vars[name]
             return value
         pattern = r"\$\((#?)([A-Za-z_][\w.]*)(\(([^()]*(?:\([^()]*\)[^()]*)*)\))?\)"
         for _ in range(5):
@@ -308,6 +349,18 @@ class Env:
                 break
             text = new
         return text
+
+
+def _in_quotes(text: str, pos: int) -> bool:
+    """La position est-elle dans une chaîne '…' ou un nom […] / "…" ?"""
+    quote = None
+    for ch in text[:pos]:
+        if quote:
+            if (quote == "[" and ch == "]") or (quote != "[" and ch == quote):
+                quote = None
+        elif ch in "'\"[":
+            quote = ch
+    return quote is not None
 
 
 def unquote(v: str) -> str:
@@ -376,9 +429,26 @@ def control_inst(st, env, ctx):
     return inst
 
 
+class StopScript(Exception):
+    """EXIT SCRIPT exécuté : Qlik s'arrête là."""
+
+    def __init__(self, line: int):
+        super().__init__(line)
+        self.line = line
+
+
 def run_stmt(st, env, ctx, subs, out, notes, depth):
     c = st.clean
     w = st.word
+    if w == "EXIT" and re.match(r"\s*EXIT\s+SCRIPT\s*;?\s*$", c, re.I):
+        # EXIT SCRIPT inconditionnel, hors IF/boucle incertains : fin du script
+        uncertain = [x for x in ctx if x.startswith(("branche", "boucle",
+                                                     "bloc"))]
+        if not uncertain:
+            raise StopScript(st.first_line)
+        return
+    if w == "EXIT":
+        return              # EXIT SCRIPT WHEN…, EXIT FOR/DO… : rien à traduire
     if w in ("SET", "LET"):
         m = re.match(r"\s*(SET|LET)\s+([\w.$()]+)\s*=\s*(.*?)\s*;?\s*$",
                      strip_comments(st.raw).strip(), re.I | re.S)
@@ -409,9 +479,10 @@ def run_stmt(st, env, ctx, subs, out, notes, depth):
                 env.vars[p] = v
             return
         notes.append(f"l.{st.first_line}: CALL vers une SUB inconnue : {c[:60]}")
-    used = {}
-    inst = Inst(st, env.expand(st.raw, used), list(ctx))
-    inst.vars_used = used
+    text = env.expand(st.raw)
+    if re.search(r"\bAUTOGENERATE\b", text, re.I):
+        text = env.bare_variables(text)
+    inst = Inst(st, text, list(ctx))
     if w == "DIRECTORY":
         m = re.match(r"\s*DIRECTORY\s*(.*?)\s*;", strip_comments(inst.text),
                      re.I | re.S)
@@ -659,13 +730,10 @@ def analyze(inst: Inst) -> None:
                              "IN", "AND", "OR", "NOT", "JOIN", "KEEP",
                              "CONCATENATE", "WHERE", "INTO", "TXT", "QVD"):
             inst.functions.add(f.lower())
-    if inst.functions & {"peek", "previous", "above", "below", "rowno", "recno"}:
+    # fonctions dépendant de l'ordre de chargement, laissées au modèle
+    if inst.functions & {"peek", "previous", "above", "below", "firstvalue",
+                         "lastvalue", "firstsortedvalue"}:
         inst.constructs.add("row_functions")
-        inst.warnings.append("Peek/Previous/RowNo : dépend de l'ordre des "
-                             "lignes -> Window avec orderBy explicite")
-    if inst.functions & {"exists"}:
-        inst.warnings.append("Exists() : dépend des valeurs déjà chargées "
-                             "AVANT cette instruction")
     inst.fields = extract_fields(body)
     for name in filter(None, (inst.label, inst.target, inst.resident)):
         if "$(" in name:
@@ -776,6 +844,21 @@ def build_graph(insts: list[Inst]):
             inst.resident = ref(inst.resident)
             for a in inst.applymaps:
                 a["map"] = ref(a["map"])
+            # Peek('f', n, 'T') / NoOfRows('T') : table lue à ce moment-là
+            inst.table_refs = {}
+            for tm in re.finditer(r"\b(?:Peek\s*\([^()]*?,[^()]*?|NoOfRows\s*\()"
+                                  r"\s*'([^']+)'\s*\)", inst.text, re.I):
+                if tm.group(1) in live:
+                    inst.table_refs[tm.group(1)] = live[tm.group(1)]
+            # Exists(champ) : tables vivantes qui contiennent déjà ce champ
+            inst.exists_tables = {}
+            for fm in re.finditer(r"\bExists\s*\(\s*(\[[^\]]+\]|\"[^\"]+\"|"
+                                  r"'[^']+'|[^\s,()]+)", inst.text, re.I):
+                fname = fm.group(1).strip("[]\"'")
+                inst.exists_tables[fname] = [
+                    key for key in live.values()
+                    if not tables[key]["dropped"] and not tables[key]["mapping"]
+                    and fname in schemas.get(key, [])]
             new = []
             for f in inst.fields:
                 if f == "*":
@@ -838,6 +921,9 @@ def build_graph(insts: list[Inst]):
             other = getattr(inst, "keep_other", None)
             if other and other != key:
                 t["deps"].add(other)
+            for keys in inst.exists_tables.values():
+                t["deps"].update(k_ for k_ in keys if k_ != key)
+            t["deps"].update(k_ for k_ in inst.table_refs.values() if k_ != key)
             if not explicit:
                 last = key
         elif inst.kind == "store" and inst.stored:
@@ -969,17 +1055,30 @@ def file_stem(path: str) -> str:
     return re.sub(r"\.(qvd|txt|csv|parquet|xlsx?)$", "", name, flags=re.I)
 
 
-def map_path(path: str, stored: dict) -> str:
-    """Chemin Qlik -> chemin Parquet du projet, par une règle fixe :
-    - fichier écrit par un STORE (ce script ou un autre, même chemin)
-      -> data/output/<nom> ;
-    - fichier de même NOM écrit par un AUTRE script du projet (connexions
-      différentes) -> data/output/<nom>, signalé dans le rapport ;
-    - sinon -> data/input/<nom>."""
-    name = file_stem(path)
-    out = norm_path(path) in stored.get("paths", ()) or \
-        name.lower() in stored.get("names", ())
-    return f"{OUTPUT_DIR if out else INPUT_DIR}/{name}"
+def is_output(path: str, stored: dict) -> bool:
+    """Fichier écrit par un STORE de ce script ou d'un autre script du projet."""
+    return norm_path(path) in stored.get("paths", ()) or \
+        file_stem(path).lower() in stored.get("names", ())
+
+
+def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
+    """Fichier Qlik -> (location, format, entrée de conf/io.yml ou None).
+
+    1. l'entrée de conf/io.yml de même nom (sorties pour un fichier écrit par
+       un STORE, entrées sinon) ;
+    2. à défaut, la règle fixe : data/output/<nom> pour un fichier écrit par
+       un STORE, data/input/<nom> sinon, en Parquet."""
+    output = store or is_output(path, stored)
+    entry = conf.find(path, "output" if output else "input") if conf else None
+    if entry:
+        return entry.location, entry.format, entry
+    return f"{OUTPUT_DIR if output else INPUT_DIR}/{file_stem(path)}", \
+        "parquet", None
+
+
+def map_path(path: str, stored: dict, conf: IoConf | None = None,
+             store=False) -> str:
+    return resolve_io(path, stored, conf, store)[0]
 
 
 def numbered(insts_of_section) -> str:
@@ -995,22 +1094,6 @@ def numbered(insts_of_section) -> str:
     return "\n".join(lines)
 
 
-def load_functions(path: Path) -> dict[str, str]:
-    """Indexe les lignes de tableau de la doc des fonctions par nom."""
-    index: dict[str, list[str]] = {}
-    if not path.exists():
-        return {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.startswith("|") or line.startswith("|---"):
-            continue
-        cells = line.split("|")
-        if len(cells) < 3:
-            continue
-        for name in re.findall(r"([A-Za-z_]\w*#?)\s*\(", cells[1]):
-            index.setdefault(name.lower(), []).append(line)
-    return {k: "\n".join(dict.fromkeys(v)) for k, v in index.items()}
-
-
 def load_skill(skills_dir: Path, name: str) -> str:
     f = skills_dir / name / "SKILL.md"
     if not f.exists():
@@ -1024,8 +1107,8 @@ Complete ONE Spark SQL query (Spark 3.5.8) translated from a Qlik Sense
 script. A parser already translated most of it: every part it could not
 translate safely is a CTE marked `TODO(model)`.
 
-Everything you need is in this message: do not look for documentation,
-skills or other files, and do not use any tool (they are all disabled).
+Everything you need is in this message: there is no need to read
+documentation, skills or other files, and you cannot write files.
 Answer ONLY with the complete query, every `TODO(model)` CTE replaced by its
 translation, in one single ```sql block.
 
@@ -1038,6 +1121,13 @@ translation, in one single ```sql block.
    column: missing information -> `-- TODO:` comment.
 5. Native Spark SQL only: no UDF, no CREATE, no INSERT, one single query.
 6. Keep one comment `-- l.<n> : <what Qlik does, in French>` per statement.
+7. Qlik doubles apostrophes ('l''été'); Spark SQL does NOT: `''` glues two
+   strings and the apostrophe disappears. Write "l'été" (double quotes).
+8. Qlik booleans are -1 (true) and 0 (false): a condition used as a value is
+   `CASE WHEN … THEN -1 ELSE 0 END`.
+9. Every view and CTE carries the technical column `_qlik_order`
+   (array<bigint>, Qlik load order). Keep it in every CTE you write; use
+   `ORDER BY _qlik_order` for Peek, Previous, FirstValue, LastValue.
 
 # Draft query (to complete)
 ```sql
@@ -1051,7 +1141,7 @@ translation, in one single ```sql block.
 
 # Facts (computed by the parser: trust them)
 {facts}
-{mappings}{functions}{skills}"""
+{mappings}{skills}"""
 
 
 def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
@@ -1064,6 +1154,10 @@ def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
         out.append("- Existing views: " + ", ".join(
             f"`{k}` (= {v.get('path') or 'table ' + v['table']})"
             for k, v in views.items()))
+        for k, v in views.items():
+            if v.get("types"):
+                out.append(f"- Column types of `{k}` (conf/schema): "
+                           + ", ".join(f"{c} {t}" for c, t in v["types"].items()))
     out.append(f"- Tables in this section, in script order: "
                f"{' -> '.join(sec['tables'])} (final: **{sec['table']}**)")
     for inst in insts:
@@ -1110,10 +1204,15 @@ def analyze_script(script: Path):
     """Tokenise, exécute à blanc et construit le graphe d'un script."""
     text = script.read_text(encoding="utf-8-sig", errors="replace") \
         .replace("\r\n", "\n")
-    stmts = merge_preceding_loads(tokenize(text))
+    stmts = merge_preceding_loads(drop_rem(tokenize(text)))
     tree, warnings = parse_blocks(stmts)
     env, insts, notes = Env(), [], list(warnings)
-    execute(tree, env, [], {}, insts, notes)
+    try:
+        execute(tree, env, [], {}, insts, notes)
+    except StopScript as stop:
+        rest = len(text.splitlines()) - stop.line
+        notes.append(f"l.{stop.line}: EXIT SCRIPT : fin du script, les "
+                     f"{rest} ligne(s) suivantes ne sont pas traduites")
     tables, schemas = build_graph(insts)
     return text, env, insts, notes, tables, schemas
 
@@ -1149,11 +1248,11 @@ def load_project_stores(path: Path, script_name: str) -> dict:
     return {"paths": paths, "names": names, "columns": columns}
 
 
-def prepare(script: Path, out_root: Path, functions_doc: Path,
-            skills_dir: Path, project_stores: dict | None = None) -> dict:
+def prepare(script: Path, out_root: Path, skills_dir: Path,
+            project_stores: dict | None = None,
+            conf: IoConf | None = None) -> dict:
     text, env, insts, notes, tables, schemas = analyze_script(script)
     order, groups, gdeps, sec_of, finals = build_sections(insts, tables, schemas)
-    func_index = load_functions(functions_doc)
     for i in insts:
         i.clean_text = strip_comments(i.text)
 
@@ -1173,8 +1272,6 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                                     None))
     for _, txt, _ in global_settings:
         notes.append(f"RÉGLAGE GLOBAL à reproduire : {txt}")
-    if not func_index:
-        notes.append(f"{functions_doc} introuvable ou sans tableau reconnu")
     for name in sorted(set(SKILL_BY_CONSTRUCT.values())):
         if not (skills_dir / name / "SKILL.md").exists():
             notes.append(f"skill {name} introuvable dans {skills_dir}")
@@ -1196,7 +1293,8 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
     by_name = {}
     for i in insts:
         for path in i.sources + ([i.stored[1]] if i.stored else []):
-            by_name.setdefault(map_path(path, stored), set()).add(norm_path(path))
+            by_name.setdefault(map_path(path, stored, conf, path in (
+                [i.stored[1]] if i.stored else [])), set()).add(norm_path(path))
     for dest, paths in by_name.items():
         if len(paths) > 1:
             notes.append(f"COLLISION : {sorted(paths)} -> même chemin {dest}")
@@ -1212,20 +1310,29 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
     ids = {g: f"{k:03d}_{slug('init' if g == '__init__' else g)}"
            for k, g in enumerate((["__init__"] if has_init else []) + order)}
     table_views = {g: view_name(g) for g in order}
-    inputs: dict[str, str] = {}          # vue d'entrée -> chemin Parquet
+    inputs: dict[str, dict] = {}         # vue d'entrée -> location, format
+    missing_conf: set[str] = set()       # fichiers absents de conf/io.yml
 
     def input_view(path: str) -> str:
-        target = map_path(path, stored)
-        view = view_name("in_" + target.rsplit("/", 1)[-1])
-        inputs[view] = target
+        location, fmt, entry = resolve_io(path, stored, conf)
+        if conf and conf.enabled and entry is None:
+            missing_conf.add(f"entrée {file_stem(path)}")
+        view = view_name("in_" + (entry.name if entry else file_stem(path)))
+        inputs[view] = {"path": location, "format": fmt}
+        if entry and entry.types:
+            inputs[view]["types"] = entry.types
         return view
 
     def file_schema(path: str):
-        # 1. Parquet déjà présent dans data/ ; 2. colonnes connues d'un STORE
-        return parquet_columns(map_path(path, stored)) or \
+        # 1. schéma de conf/schema ; 2. Parquet présent ; 3. STORE d'un script
+        entry = resolve_io(path, stored, conf)[2]
+        if entry and entry.columns:
+            return entry.columns
+        return parquet_columns(map_path(path, stored, conf)) or \
             project_stores["columns"].get(file_stem(path).lower())
 
     sections = []
+    produced: list[str] = []           # tables déjà calculées (vues SQL)
     for g in (["__init__"] if has_init else []) + order:
         ks = sorted(k for k, sg in sec_of.items() if sg == g)
         sec_insts = [insts[k] for k in ks]
@@ -1237,11 +1344,15 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
             if sec_insts else set()
         if len([n for n in names if not tables[n]["mapping"]]) > 1:
             constructs.add("resident_chain")
-        outputs, store_flags = {}, []
+        outputs, output_formats, store_flags = {}, {}, []
         for n in names:
             for (_, path, fmt, _fields) in tables[n]["stored"]:
                 if n == g:
-                    outputs[n] = map_path(path, stored)
+                    location, out_fmt, entry = resolve_io(path, stored, conf,
+                                                          store=True)
+                    if conf and conf.enabled and entry is None:
+                        missing_conf.add(f"sortie {file_stem(path)}")
+                    outputs[n], output_formats[n] = location, out_fmt
                 else:
                     store_flags.append(f"STORE de la table intermédiaire {n} "
                                        f"vers {path} : non géré, à traiter "
@@ -1265,6 +1376,7 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                          sec_insts[-1].stmt.last_line] if sec_insts else None,
                "depends_on_tables": deps_tables,
                "outputs": outputs,
+               "output_formats": output_formats,
                "constructs": sorted(c for c in constructs if ":" not in c),
                "statement_lines": sorted({i.stmt.first_line for i in sec_insts
                                           if i.kind in ("load", "drop_field",
@@ -1282,28 +1394,33 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
             sec["status"] = "skip"
             sections.append(sec)
             continue
+        produced_now = list(produced)
+        produced.append(g)
 
         # ---- traduction déterministe
         inputs.clear()
         ctx = SectionContext(
-            section_tables=names, final_table=g,
+            final_table=g,
             table_view=lambda t: table_views.get(t),
             input_view=input_view, file_schema=file_schema,
             mapping_insts=lambda m: [insts[k] for k in tables.get(m, {})
                                      .get("insts", [])],
             table_name=lambda t: tables.get(t, {}).get("name", t),
             graph_schema=lambda t: _known(schemas.get(t)),
+            tables_with_field=lambda f: [table_views[t] for t in produced_now
+                                         if f in (schemas.get(t) or [])],
             date_format=env.vars.get("DateFormat"),
             timestamp_format=env.vars.get("TimestampFormat"))
         header = (f"-- Section {sec['id']} : table {g}"
                   f" (lignes Qlik {sec['lines'][0]}-{sec['lines'][1]})\n"
                   "-- Traduit depuis Qlik par tools/prepare.py\n")
-        sql, todos, cols = translate_section(
+        sql, todos, cols, technical = translate_section(
             sec_insts, [i.clean_text for i in sec_insts], ctx, header)
+        sec["technical_columns"] = technical
         for gs in applicable:
             todos.append(f"réglage global à appliquer : {gs}")
         sec["columns"] = cols or schemas.get(g, [])
-        sec["views"] = {v: {"path": p} for v, p in inputs.items()}
+        sec["views"] = {v: dict(p) for v, p in inputs.items()}
         sec["views"].update({table_views[t]: {"table": t}
                              for t in deps_tables if t in table_views})
         sec["todos"] = todos
@@ -1324,11 +1441,6 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                 t.startswith(f"l.{i.stmt.first_line} ") for t in todos)] \
                 or sec_insts
             tc = set().union(*(i.constructs for i in todo_insts))
-            funcs = sorted({f for i in todo_insts for f in i.functions}
-                           & func_index.keys())
-            func_txt = ("\n# Function translations (only those involved)\n"
-                        + "\n".join(func_index[f] for f in funcs) + "\n") \
-                if funcs else ""
             skill_names = sorted({SKILL_BY_CONSTRUCT[c] for c in tc
                                   if c in SKILL_BY_CONSTRUCT})
             skill_txt = "".join(
@@ -1346,12 +1458,15 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                 facts=facts_block(sec, sec_insts, schemas, env, sec["views"],
                                   applicable),
                 mappings=("\n# Mappings used\n" + map_txt) if map_txt else "",
-                functions=func_txt, skills=skill_txt)
+                skills=skill_txt)
             (d / "prompt.md").write_text(prompt, encoding="utf-8")
             sec["prompt_tokens"] = len(prompt) // 4
             sec["status"] = "todo"
         sections.append(sec)
 
+    if missing_conf:
+        notes.append("absents de conf/io.yml (règle par défaut data/input, "
+                     "data/output, Parquet) : " + ", ".join(sorted(missing_conf)))
     unresolved = sorted({m for i in insts for m in re.findall(
         r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))} - SYSTEM_VARS)
     manifest = {"script": script.name, "notes": notes,
@@ -1426,7 +1541,6 @@ def main(argv=None) -> int:
     p.add_argument("--collect", action="store_true",
                    help="seulement recenser les fichiers lus/écrits de chaque "
                         "script dans work/stores.json")
-    p.add_argument("--functions", type=Path, default=FUNCTIONS_DOC)
     p.add_argument("--skills", type=Path, default=Path(".opencode/skills"))
     args = p.parse_args(argv)
     out_root = args.out or Path("work")
@@ -1441,9 +1555,12 @@ def main(argv=None) -> int:
                                encoding="utf-8")
         print(f"{len(data)} script(s) recensé(s) -> {stores_path}")
         return 0
+    conf = IoConf()
+    for p_ in conf.problems:
+        print(f"⚠ conf : {p_}")
     for script in args.scripts:
-        m = prepare(script, out_root, args.functions, args.skills,
-                    load_project_stores(stores_path, script.name))
+        m = prepare(script, out_root, args.skills,
+                    load_project_stores(stores_path, script.name), conf)
         st = {}
         for s_ in m["sections"]:
             st[s_["status"]] = st.get(s_["status"], 0) + 1

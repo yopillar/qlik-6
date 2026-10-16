@@ -55,10 +55,10 @@ def main(argv=None) -> int:
         shutil.copyfile(args.workdir / s["id"] / "query.sql", out / name)
         for view, src in s.get("views", {}).items():
             if "path" in src:
-                inputs[view] = src["path"]
-        outputs = s.get("outputs", {})
-        output = outputs.get(s["table"])
-        steps.append(f"    ({name!r}, {s['view']!r}, {output!r}),")
+                inputs[view] = (src["path"], src.get("format", "parquet"))
+        output = s.get("outputs", {}).get(s["table"])
+        fmt = s.get("output_formats", {}).get(s["table"], "parquet")
+        steps.append(f"    ({name!r}, {s['view']!r}, {output!r}, {fmt!r}),")
 
     (out / "job.py").write_text(JOB.format(
         stem=stem, script=manifest["script"],

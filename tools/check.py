@@ -82,6 +82,11 @@ def check_section(section: dict, query_path: Path,
             errors.append(f"instruction interdite : {kw}")
     if re.search(r"```", raw):
         errors.append("balises ``` dans le fichier : SQL seul attendu")
+    # habitude Qlik : 'l''été'. En Spark SQL, '' colle deux chaînes et
+    # l'apostrophe disparaît (« lété ») : écrire "l'été" ou 'l\'été'
+    if re.search(r"\w''\w", strip_sql_comments(raw)):
+        errors.append("apostrophe doublée '' dans une chaîne : en Spark SQL elle "
+                      "disparaît ; écrire \"l'été\" (guillemets doubles)")
 
     # vues et CTE lues
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents,

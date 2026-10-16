@@ -55,7 +55,7 @@ def main(argv=None) -> int:
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, sorted(folder.glob("*.qvs"))))
 
-    summary = []
+    summary, stopped = [], False
     for script in scripts:
         print(f"\n{'#' * 70}\n# {script.name}\n{'#' * 70}")
         if run("prepare.py", str(script)):
@@ -68,8 +68,12 @@ def main(argv=None) -> int:
         if args.pilot:
             extra += ["--limit", str(args.pilot)]
         if run("translate.py", str(workdir), *extra):
-            print("Arrêt : la traduction n'a pas pu démarrer (opencode ?)")
-            return 1
+            # modèle injoignable ou qui ne répond pas : inutile de continuer
+            # avec les autres scripts, mais run_all.py est quand même généré
+            summary.append((script.name, "traduction arrêtée : le modèle ne "
+                            "répond pas (voir le test ci-dessus)", []))
+            stopped = True
+            break
 
         manifest = json.loads((workdir / "manifest.json").read_text(
             encoding="utf-8"))
@@ -101,13 +105,17 @@ def main(argv=None) -> int:
         print(f"- {name} : {state}")
         for sid in to_fix[:15]:
             print(f"    à corriger : {WORK / Path(name).stem / sid}/query.sql")
-    print("\nJob principal : python src/run_all.py")
+    ready = sum("assemblé" in state for _, state, _ in summary)
+    print(f"\nJob principal : python src/run_all.py "
+          f"({'contient les scripts assemblés' if ready else 'aucun script assemblé pour l’instant'})")
     print(f"Journal : {WORK / 'journal.csv'}")
     if not compare:
         print("Pas de dossier qlik_outputs/ : comparaison des données non faite.")
     if args.pilot:
-        print("Pilote terminé : relis les query.sql, puis relance sans --pilot.")
-    return 0
+        print("Pilote terminé : relis les query.sql, puis relance sans --pilot "
+              "(le script n'est assemblé, et ajouté à run_all.py, qu'une fois "
+              "toutes ses tables validées).")
+    return 1 if stopped else 0
 
 
 if __name__ == "__main__":

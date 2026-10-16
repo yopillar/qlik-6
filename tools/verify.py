@@ -79,8 +79,15 @@ def main(argv=None) -> int:
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1
             else:
+                # clés AutoNumber / Hash : valeurs différentes de Qlik par
+                # construction, exclues de la comparaison
+                tech = sec.get("technical_columns", [])
                 ok, detail = compare_files(ref, Path(out_path),
-                                           ignore=args.ignore)
+                                           ignore=list(args.ignore) + tech
+                                           + ["_qlik_order"])
+                if tech:
+                    detail = (f"Colonnes techniques exclues (AutoNumber/Hash) : "
+                              f"{', '.join(tech)}\n\n") + detail
                 verdict = "identique" if ok else "différent"
                 n_ok += ok
                 n_ko += not ok
