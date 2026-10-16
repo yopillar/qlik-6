@@ -1,8 +1,8 @@
 # Qlik Sense -> Spark SQL 3.5.8 migration
 
-Each request points to a self-contained `prompt.md`. Follow it. Think and
-answer in English; code comments in French. Read only the files named in the
-request; write only the file asked.
+Each request contains everything needed: the draft query, the Qlik code and
+the facts. Do not look for documentation or files and do not use tools.
+Think in English; SQL comments in French. Answer with one ```sql block.
 
 ## Qlik in short
 - A script runs top to bottom and builds in-memory tables. `NAME:` names the table.

@@ -1024,8 +1024,10 @@ Complete ONE Spark SQL query (Spark 3.5.8) translated from a Qlik Sense
 script. A parser already translated most of it: every part it could not
 translate safely is a CTE marked `TODO(model)`.
 
-Write the complete query to `{out}`, with every `TODO(model)` CTE replaced
-by its translation. Do not read other files.
+Everything you need is in this message: do not look for documentation,
+skills or other files, and do not use any tool (they are all disabled).
+Answer ONLY with the complete query, every `TODO(model)` CTE replaced by its
+translation, in one single ```sql block.
 
 # Rules
 1. Keep every part that is already translated EXACTLY as it is.
@@ -1339,7 +1341,7 @@ def prepare(script: Path, out_root: Path, functions_doc: Path,
                 f"{mapping_code([insts[k] for k in tables[m]['insts']])}\n```\n"
                 for m in sorted(maps) if m in tables)
             prompt = PROMPT.format(
-                out=(d / "query.sql").as_posix(), draft=sql.rstrip(),
+                draft=sql.rstrip(),
                 code=numbered(sec_insts),
                 facts=facts_block(sec, sec_insts, schemas, env, sec["views"],
                                   applicable),

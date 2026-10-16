@@ -75,21 +75,30 @@ Les dossiers Qlik et l'extension sont retirés, seul le nom du fichier reste :
 - tout autre fichier lu → `data/input/<nom>/` (vue SQL `in_<nom>`) ;
 - table de base lue par `SQL SELECT ... FROM dbo.clients` → `data/input/clients`.
 
+## Le modèle n'a besoin d'aucun outil
+
+Le prompt complet (brouillon SQL, code Qlik, faits, fonctions, skills) est
+envoyé **dans le message**, et le modèle répond par la requête dans un bloc
+```` ```sql ````. C'est `translate.py` qui l'écrit dans `query.sql`.
+L'agent `translator` a donc **tous ses outils coupés** (lecture, écriture,
+recherche, web…) : plus de demande de permission refusée, plus de temps
+perdu à chercher de la doc.
+
 ## Voir ce que le modèle a fait
 
 Pour chaque table envoyée au modèle, dans `work/<script>/<table>/` :
 
 | Fichier | Contenu |
 |---|---|
-| `prompt.md` | ce que le modèle a reçu (brouillon SQL, code Qlik, faits) |
-| `model_1.log`, `model_2.log` | commande, message, durée et **réponse brute** du modèle, par tentative |
-| `query.attempt1.sql`, `query.attempt2.sql` | la requête après chaque tentative |
-| `retry.md` | les erreurs renvoyées au modèle pour sa 2e tentative |
+| `prompt.md` | le prompt de la table |
+| `model_1.log`, `model_2.log` | commande, **message envoyé**, durée et **réponse brute** (stdout puis stderr), par tentative |
+| `query.attempt1.sql`, `query.attempt2.sql` | la requête extraite de chaque réponse |
 
-La console signale aussi les deux comportements classiques d'un modèle
-faible : « n'a PAS modifié query.sql » (il n'a rien écrit), ou « a AFFICHÉ
-la requête sans écrire le fichier » (récupérée automatiquement depuis sa
-réponse).
+En tête de chaque log, une ligne `# Note` résume ce qui s'est passé :
+« réponse VIDE du modèle », « aucune requête SQL trouvée dans la réponse »
+ou « opencode a échoué (code retour non nul) ». Dans les trois cas, la
+tentative est relancée une fois ; si aucun appel n'aboutit, la table passe
+en `erreur_modele` (relancée au prochain `migrate.py`).
 
 ## Quand une table est à corriger
 
