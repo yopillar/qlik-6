@@ -303,6 +303,11 @@ class ExprParser:
                 raw.append(self.t[start:self.i])
                 if self.peek() == ("op", ","):
                     self.take()
+                    if self.peek() == ("op", ")"):
+                        # argument vide toléré par Qlik : If(c, x, ) -> NULL
+                        args.append("NULL")
+                        raw.append([])
+                        break
                     continue
                 break
         self.expect(")")
@@ -890,6 +895,7 @@ class SectionTranslator:
         self.cols: dict[str, list[str] | None] = {}
         self.notes: list[str] = []
         self.todos: list[str] = []
+        self.holes: list[dict] = []        # expressions laissées au modèle
         self.counter: dict[str, int] = {}
         self.technical: list[str] = []         # colonnes AutoNumber / Hash
         self.autogen_bottom = None             # "recno" | "fieldvalue" | None
@@ -938,6 +944,25 @@ class SectionTranslator:
         except Untranslatable as exc:
             self.placeholder(inst, line, str(exc))
 
+    # une expression non traduite ne bloque pas toute l'instruction : seul
+    # son emplacement est laissé au modèle (question minuscule, cache possible)
+    HOLE_EXCLUDED = ("Exists", "expression sans alias", "dans un WHERE")
+
+    def hole(self, qlik: str, kind: str, reason: str, ectx, alias=None,
+             columns=None, group=False):
+        if any(x in reason for x in self.HOLE_EXCLUDED):
+            raise Untranslatable(reason)
+        hid = f"h{len(self.holes) + 1}"
+        line = self.current_inst.stmt.first_line
+        self.holes.append({"id": hid, "line": line, "qlik": qlik.strip(),
+                           "kind": kind, "reason": reason, "alias": alias,
+                           "qualifier": ectx.qualifier, "columns": columns,
+                           "order_by": ectx.order_by, "aggregate": group})
+        self.todos.append(f"l.{line} : {reason} (expression {hid})")
+        if kind == "condition":
+            return Bool(f"(/*TODO(model):{hid}*/ true)")
+        return f"(/*TODO(model):{hid}*/ NULL)"
+
     def placeholder(self, inst, line, reason):
         table = inst.target or self.ctx.final_table
         if table in self.cur:
@@ -952,13 +977,14 @@ class SectionTranslator:
         else:
             src = None
         self.todos.append(f"l.{line} : {reason}")
-        body = (f"-- TODO(model): l.{line} : {reason}\n"
-                f"-- (code Qlik complet dans le prompt)\n"
-                + (f"SELECT * FROM {src}" if src else "SELECT NULL AS todo"))
         # colonnes attendues si le graphe les connaît : la requête finale
         # reste explicite et check.py peut les contrôler
         cols = None if {"join", "keep", "concatenate"} & inst.constructs \
             else self.ctx.graph_schema(table)
+        body = (f"-- TODO(model): l.{line} : {reason}\n"
+                f"-- (code Qlik complet dans le prompt)\n"
+                + (f"-- must produce: {', '.join(cols + [ORD])}\n" if cols else "")
+                + (f"SELECT * FROM {src}" if src else "SELECT NULL AS todo"))
         self.add(table, body, f"l.{line} : à traduire par le modèle", cols)
 
     def segment_sql(self, seg: Segment, src: str, src_cols, line: int,
@@ -1039,7 +1065,11 @@ class SectionTranslator:
                     out_cols += src_cols
                 continue
             ectx.technical = False
-            sql = expr(e, ectx)
+            try:
+                sql = expr(e, ectx)
+            except Untranslatable as exc:
+                sql = self.hole(e, "value", str(exc), ectx, alias or e,
+                                src_cols, bool(seg.group_by))
             values.append(sql)
             if ectx.technical and (alias or e):
                 self.technical.append(alias or e.strip("[]\""))
@@ -1057,7 +1087,11 @@ class SectionTranslator:
         if seg.where:
             ectx.in_where = self.in_where = True
             self.current_where = seg.where
-            where_sql = cond(seg.where, ectx)
+            try:
+                where_sql = cond(seg.where, ectx)
+            except Untranslatable as exc:
+                where_sql = self.hole(seg.where, "condition", str(exc), ectx,
+                                      None, src_cols)
             ectx.in_where = self.in_where = False
         # colonne d'ordre du résultat
         group_sql = [expr(g, ectx) for g in seg.group_by]
@@ -1414,19 +1448,19 @@ class SectionTranslator:
         keys = [c for c in right_cols if c in left_cols]
         sql_how = {"outer": "FULL OUTER JOIN", "left": "LEFT JOIN",
                    "right": "RIGHT JOIN", "inner": "INNER JOIN"}[how]
-        select = []
-        for c in left_cols:
-            if c in keys and how in ("outer", "right"):
-                select.append(f"COALESCE(a.{ident(c)}, b.{ident(c)}) AS {ident(c)}")
-            else:
-                select.append(f"a.{ident(c)}")
-        select += [f"b.{ident(c)}" for c in right_cols if c not in keys]
-        if how in ("outer", "right"):
+        added = [f"b.{ident(c)}" for c in right_cols if c not in keys]
+        if how in ("left", "inner"):
+            # « a.* » : colonnes de gauche (ordre et _qlik_order compris), puis
+            # les nouvelles colonnes ; évite de relister toute la table à
+            # chaque jointure (requêtes énormes sur les tables très enrichies)
+            select = ["a.*"] + added
+        else:
+            select = [f"COALESCE(a.{ident(c)}, b.{ident(c)}) AS {ident(c)}"
+                      if c in keys else f"a.{ident(c)}" for c in left_cols]
+            select += added
             # lignes de gauche dans leur ordre, puis lignes seulement à droite
             select.append(f"CASE WHEN a.{ORD} IS NULL THEN concat(array(1L), "
                           f"b.{ORD}) ELSE concat(array(0L), a.{ORD}) END AS {ORD}")
-        else:
-            select.append(f"a.{ORD}")
         cols = left_cols + [c for c in right_cols if c not in keys]
         if keys:
             on = " AND ".join(f"a.{ident(k)} = b.{ident(k)}" for k in keys)
@@ -1516,14 +1550,32 @@ class SectionTranslator:
                      f"l.{line} : DROP FIELD {', '.join(inst.fields)}", keep)
 
     # -- assemblage
-    def render(self, header: str) -> tuple[str, list[str] | None]:
+    def render(self, header: str, condensed: bool = False
+               ) -> tuple[str, list[str] | None]:
+        """Requête complète ; condensed : version pour le prompt, où les CTE
+        déjà traduites sont résumées à leurs colonnes (le modèle ne renvoie
+        que les CTE TODO, il n'a besoin que de savoir ce qu'il peut lire)."""
         final = self.cur.get(self.ctx.final_table)
         if final is None:
             raise Untranslatable("table finale non produite")
         cols = self.cols[final]
         out = [header, "WITH"]
+        # version pour le prompt : en entier seulement ce que le modèle doit
+        # écrire ; ce qu'il lit, avec ses colonnes ; le reste, son nom seul
+        statement = [c for c in self.ctes if "TODO(model): l." in c.sql]
+        todo = statement or [c for c in self.ctes if "TODO(model)" in c.sql]
+        todo_text = "\n".join(c.sql for c in todo)
+        read = {c.name for c in self.ctes
+                if re.search(rf"\b{re.escape(c.name)}\b", todo_text)}
         for k, c in enumerate(self.ctes):
             body = _indent(c.sql, 2)
+            if condensed and c not in todo:
+                if c.name in read:
+                    known = ", ".join(c.columns + [ORD]) if c.columns is not None \
+                        else "unknown (see the Qlik code)"
+                    body = f"  -- already translated; columns: {known}\n  ..."
+                else:
+                    body = "  -- already translated, not read by your CTEs\n  ..."
             sep = "," if k < len(self.ctes) - 1 else ""
             out.append(f"-- {c.comment}\n{c.name} AS (\n{body}\n){sep}")
         out += self.notes
@@ -1538,13 +1590,17 @@ def _indent(text: str, n: int) -> str:
 
 
 def translate_section(insts, texts, ctx: SectionContext, header: str):
-    """-> (sql, todos, colonnes finales, colonnes techniques)."""
+    """-> (sql, todos, colonnes finales, colonnes techniques, version courte
+    pour le prompt, expressions laissées au modèle)."""
     tr = SectionTranslator(ctx)
     for inst, text in zip(insts, texts):
         tr.translate(inst, text)
     try:
         sql, cols = tr.render(header)
+        short = tr.render(header, condensed=True)[0]
     except Untranslatable as exc:
         tr.todos.append(str(exc))
         sql, cols = header + f"-- TODO(model): {exc}\n", None
-    return sql, tr.todos, cols, list(dict.fromkeys(tr.technical))
+        short = sql
+    return sql, tr.todos, cols, list(dict.fromkeys(tr.technical)), short, \
+        tr.holes

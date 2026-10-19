@@ -110,7 +110,7 @@ def check_section(section: dict, query_path: Path,
         return ["query.sql absent ou vide"], []
     raw = query_path.read_text(encoding="utf-8")
     if "TODO(model)" in raw:
-        left = re.findall(r"TODO\(model\):\s*(l\.\d+)", raw)
+        left = re.findall(r"TODO\(model\):\s*(l\.\d+|h\d+)", raw)
         errors.append(f"{raw.count('TODO(model)')} bloc(s) TODO(model) "
                       f"restant(s) : {', '.join(left) or '?'}")
     code = strip_sql_strings(strip_sql_comments(raw))
@@ -161,7 +161,8 @@ def check_section(section: dict, query_path: Path,
                       f"commentaire « -- l.<n> » : {unref[:10]}")
     elif unref:
         warnings.append(f"instructions sans commentaire « -- l.<n> » : {unref}")
-    if parser is not None and not errors:
+    # les blocs TODO(model) restants n'empêchent pas d'analyser le reste
+    if parser is not None and not [e for e in errors if "TODO(model)" not in e]:
         problem = parser.parse(raw) or parser.analyze(section, raw)
         if problem:
             errors.append(problem)

@@ -66,6 +66,7 @@ def main(argv=None) -> int:
             print("Le job a échoué : voir la trace ci-dessus.")
             return 2
 
+    verified: dict = {}
     report, n_ok, n_ko, n_none = [f"# Comparaison des sorties de `{stem}`", ""], 0, 0, 0
     for sec in manifest["sections"]:
         for table, out_path in sec.get("outputs", {}).items():
@@ -92,6 +93,8 @@ def main(argv=None) -> int:
                 n_ok += ok
                 n_ko += not ok
             sec["compare"] = verdict
+            if verdict == "identique":
+                verified.update(sec.get("hole_answers", {}))
             print(f"  {sec['id']:<35} {table:<25} {verdict}")
             report += [f"## {sec['id']} — {table} : {verdict}", "", detail, ""]
             journal.update(args.workdir.parent / "journal.csv", {
@@ -99,6 +102,17 @@ def main(argv=None) -> int:
                 "script": manifest["script"], "section": sec["id"],
                 "status": sec["status"], "compare": verdict})
 
+    if verified:
+        # expressions traduites par le modèle, désormais prouvées par les
+        # données : réutilisables sans modèle dans les autres scripts
+        cache_path = args.workdir.parent / "expressions.json"
+        cache = json.loads(cache_path.read_text(encoding="utf-8")) \
+            if cache_path.exists() else {}
+        for key, sql in verified.items():
+            if key in cache and cache[key]["sql"] == sql:
+                cache[key]["verified"] = True
+        cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False),
+                              encoding="utf-8")
     (args.workdir / "comparaison.md").write_text("\n".join(report),
                                                  encoding="utf-8")
     mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),

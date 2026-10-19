@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from check import check_section, get_parser  # noqa: E402
+from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 
 # Le prompt est envoyé DANS le message et le modèle répond par un bloc
 # ```sql``` : aucun outil, aucune lecture de fichier, aucune permission à
@@ -273,43 +274,21 @@ def run_opencode(message: str, args) -> tuple[bool, str, dict]:
     return res.returncode == 0, raw, events
 
 
-def translate_section(workdir: Path, sec: dict, args,
-                      parser=None) -> tuple[str, int, str]:
-    """Le modèle complète les TODO(model) de query.sql (une relance).
+class Calls:
+    """Appels au modèle d'une table : un log numéroté par appel."""
 
-    Le prompt est envoyé dans le message ; la requête est lue dans la réponse
-    du modèle (bloc ```sql```) puis écrite dans query.sql par ce script.
-    Chaque tentative laisse une trace dans le dossier de la table :
-      model_<n>.log         commande, message, durée, réponse brute du modèle
-      query.attempt<n>.sql  la requête extraite de la réponse
-    """
-    d = workdir / sec["id"]
-    out, prompt_path = d / "query.sql", d / "prompt.md"
-    prompt = prompt_path.read_text(encoding="utf-8")
-    draft = out.read_text(encoding="utf-8") if out.exists() else ""
-    for old in list(d.glob("model_*.log")) + list(d.glob("query.attempt*.sql")) \
-            + [d / "retry.md"]:
-        old.unlink(missing_ok=True)
-    errors: list[str] = []
-    previous = draft
-    failures, last_note = 0, ""
-    for attempt in range(1, args.retries + 2):
-        msg = prompt
-        if attempt > 1:
-            msg += RETRY_TEXT.format(
-                previous=(previous if previous is not draft else "(no SQL in your answer)"),
-                errors="\n".join(f"- {e}" for e in errors),
-                allowed=", ".join(sorted(sec.get("views", {}))) or "none")
-        msg = shrink(msg)
-        if len(msg.encode("utf-8")) > MAX_INLINE:
-            # trop long pour la ligne de commande, même allégé : le modèle n'a
-            # pas le droit de lire un fichier, la table est à faire à la main
-            return "escalade", attempt, ("prompt trop long pour être envoyé "
-                                         "dans le message")
+    def __init__(self, d: Path, sec: dict, args):
+        self.d, self.sec, self.args, self.n = d, sec, args, 0
+        self.failures, self.last_note = 0, ""
+
+    def call(self, msg: str, holes: bool = False):
+        """-> (ok, texte, sql extrait, réponse coupée, note).
+        holes : la réponse attendue est « hN: expression », pas une requête."""
+        self.n += 1
         t0 = time.perf_counter()
-        ok, log, events = run_opencode(msg, args)
-        if args.dry_run:
-            return "dry-run", attempt, ""
+        ok, log, events = run_opencode(msg, self.args)
+        if self.args.dry_run:
+            return True, "", None, False, ""
         answer, sql, from_tool = answer_sql(ok, log, events)
         tools = events.get("tools", [])
         cut = (events.get("finish") or "").lower() in ("length", "max_tokens",
@@ -331,31 +310,146 @@ def translate_section(workdir: Path, sec: dict, args,
                     "(limite de tokens ?)")
         elif not answer:
             note = "réponse VIDE du modèle (rien sur stdout, voir stderr)"
-        elif not sql:
+        elif holes and not parse_holes(answer):
+            note = "aucune ligne « hN: expression » dans la réponse du modèle"
+        elif not holes and not sql:
             note = "aucune requête SQL trouvée dans la réponse du modèle"
         else:
             note = ""
-        last_note = note or last_note
+        self.last_note = note or self.last_note
         if events.get("errors"):
             note += " | erreurs : " + " ; ".join(events["errors"][:3])
-        (d / f"model_{attempt}.log").write_text(
-            f"# Tentative {attempt} — {round(time.perf_counter() - t0)}s, "
+        (self.d / f"model_{self.n}.log").write_text(
+            f"# Appel {self.n} — {round(time.perf_counter() - t0)}s, "
             f"code retour {'0' if ok else 'erreur'}\n"
-            f"# Commande : {args.opencode_bin} run --agent {args.agent}"
-            f"{' --model ' + args.model if args.model else ''} <message>\n"
+            f"# Commande : {self.args.opencode_bin} run --agent {self.args.agent}"
+            f"{' --model ' + self.args.model if self.args.model else ''} <message>\n"
             + (f"# Note     : {note}\n" if note else "")
             + "\n## Message envoyé\n\n" + msg
             + (f"\n\n## Outils tentés\n\n{', '.join(tools)}" if tools else "")
             + "\n\n## Texte de la réponse\n\n" + (answer or "(aucun)")
             + "\n\n## Sortie brute d'opencode\n\n" + log, encoding="utf-8")
+        if note:
+            print(f"    {self.sec['id']} : {note}")
         if not ok:
-            failures += 1
-            errors = ["the previous call failed: answer with the complete query "
-                      "in one ```sql block, without writing any file"]
-            print(f"    {sec['id']} ✗ tentative {attempt} : {note}")
+            self.failures += 1
+        return ok, answer or "", sql, cut, note
+
+
+HOLE_RETRY = """
+
+# Your previous answer
+```sql
+{previous}
+```
+
+Problems found:
+{errors}
+
+Answer again for: {pending} (one line each, `hN: <expression>`)."""
+
+MORE_CONTEXT = """
+
+# More context: the whole table, already translated parts summarised
+```sql
+{draft}
+```"""
+
+
+def parse_holes(text: str) -> dict[str, str]:
+    """Réponse « h1: expr » (une ligne, ou plusieurs jusqu'au trou suivant)."""
+    block = extract_sql(text) or text
+    out, cur = {}, None
+    for line in block.splitlines():
+        m = re.match(r"\s*(h\d+)\s*[:=]\s*(.*)$", line)
+        if m:
+            cur = m.group(1)
+            out[cur] = m.group(2)
+        elif cur and line.strip() and not line.strip().startswith("```"):
+            out[cur] += "\n" + line
+    return {k: v.strip().rstrip(";,").strip() for k, v in out.items()
+            if v.strip()}
+
+
+def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
+                statement_left: bool) -> tuple[dict, list[str]]:
+    """Le modèle traduit les expressions laissées par le traducteur.
+    -> (réponses acceptées {id: sql}, problèmes restants)."""
+    out = d / "query.sql"
+    base = out.read_text(encoding="utf-8")
+    prompt = (d / "holes_prompt.md").read_text(encoding="utf-8")
+    condensed = (d / "draft_condensed.sql").read_text(encoding="utf-8") \
+        if (d / "draft_condensed.sql").exists() else ""
+    pending = [h["id"] for h in sec.get("holes", [])]
+    answers, errors, previous, more = {}, [], "", False
+    for _ in range(args.retries + 2):         # +1 : niveau de contexte
+        msg = prompt + (MORE_CONTEXT.format(draft=condensed) if more else "")
+        if previous or errors:
+            msg += HOLE_RETRY.format(previous=previous or "(nothing)",
+                                     errors="\n".join(f"- {e}" for e in errors)
+                                     or "- missing answers",
+                                     pending=", ".join(pending))
+        ok, text, _, _, _ = calls.call(msg, holes=True)
+        if args.dry_run:
+            return {}, []
+        if not ok:
+            errors = ["the previous call failed: answer with plain text"]
+            continue
+        given = parse_holes(text)
+        previous = "\n".join(f"{k}: {v}" for k, v in given.items())
+        unknown = [k for k in pending if given.get(k) == "?"]
+        tentative = {k: v for k, v in given.items() if k in pending and v != "?"}
+        candidate = fill_holes(base, {**answers, **tentative})
+        out.write_text(candidate, encoding="utf-8")
+        problems, _ = check_section(sec, out, parser)
+        # les trous encore sans réponse (et les blocs d'instruction) sont
+        # attendus ici : seules les erreurs de syntaxe / d'analyse comptent
+        problems = [p for p in problems if "TODO(model)" not in p
+                    and not (statement_left and p.startswith("colonnes de sortie"))]
+        if problems:
+            out.write_text(fill_holes(base, answers), encoding="utf-8")
+            errors = problems
+            print(f"    {sec['id']} ✗ expressions : {problems[0][:110]}")
+        else:
+            answers.update(tentative)
+            errors = []
+        pending = [k for k in pending if k not in answers]
+        if unknown and not more:
+            more = True                      # le modèle demande plus de contexte
+            print(f"    {sec['id']} : le modèle demande plus de contexte "
+                  f"({', '.join(unknown)})")
+        if not pending:
+            break
+    left = [f"expression {k} non traduite" for k in pending] + errors
+    return answers, left
+
+
+def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
+    """Le modèle complète les CTE TODO(model) (instructions entières)."""
+    out, prompt_path = d / "query.sql", d / "prompt.md"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    draft = out.read_text(encoding="utf-8")
+    errors: list[str] = []
+    previous = draft
+    for attempt in range(1, args.retries + 2):
+        msg = prompt
+        if attempt > 1:
+            msg += RETRY_TEXT.format(
+                previous=(previous if previous is not draft
+                          else "(no SQL in your answer)"),
+                errors="\n".join(f"- {e}" for e in errors),
+                allowed=", ".join(sorted(sec.get("views", {}))) or "none")
+        msg = shrink(msg)
+        if len(msg.encode("utf-8")) > MAX_INLINE:
+            return ["prompt trop long pour être envoyé dans le message"]
+        ok, _, sql, cut, _ = calls.call(msg)
+        if args.dry_run:
+            return []
+        if not ok:
+            errors = ["the previous call failed: answer with the TODO(model) "
+                      "CTEs in one ```sql block, without writing any file"]
             continue
         if sql:
-            # les CTE du modèle sont greffées dans le brouillon d'origine
             full, missing = splice(draft, sql)
             out.write_text(full, encoding="utf-8")
             (d / f"query.attempt{attempt}.sql").write_text(full, encoding="utf-8")
@@ -372,27 +466,46 @@ def translate_section(workdir: Path, sec: dict, args,
             errors = ["your previous answer contained no SQL. Do not try to "
                       "write files (disabled): reply with plain text, the "
                       "TODO(model) CTEs in one ```sql block"]
-        if note:
-            print(f"    {sec['id']} : {note}")
         if not errors:
-            return "ok", attempt, ""
+            return []
         if sql:
             shown = errors[0]
             if shown.startswith("CTE missing"):
                 shown = "CTE absente ou incomplète dans la réponse : " + \
                     shown.split(": ", 1)[1]
             print(f"    {sec['id']} ✗ tentative {attempt} : {shown[:120]}")
-    if previous is not draft:
-        out.write_text(splice(draft, previous)[0], encoding="utf-8")
-    else:
-        out.write_text(draft, encoding="utf-8")
-    if failures == args.retries + 1:      # aucun appel n'a abouti
-        return "erreur_modele", failures, "opencode en échec : voir model_*.log"
-    problem = " | ".join(errors)
+    out.write_text(splice(draft, previous)[0] if previous is not draft else draft,
+                   encoding="utf-8")
     if errors and errors[0].startswith(("your previous answer contained no SQL",
                                         "your previous answer was cut")):
-        problem = last_note or "le modèle n'a renvoyé aucune requête"
-    return "escalade", args.retries + 1, problem[:500]
+        return [calls.last_note or "le modèle n'a renvoyé aucune requête"]
+    return errors
+
+
+def translate_section(workdir: Path, sec: dict, args, parser=None):
+    """Complète une table : d'abord les expressions isolées (holes_prompt.md),
+    puis les instructions entières (prompt.md), s'il y en a.
+    -> (statut, nombre d'appels, problème, réponses aux expressions)."""
+    d = workdir / sec["id"]
+    for old in list(d.glob("model_*.log")) + list(d.glob("query.attempt*.sql")):
+        old.unlink(missing_ok=True)
+    calls = Calls(d, sec, args)
+    statement_left = bool(sec.get("statement_todos"))
+    answers, problems = {}, []
+    if sec.get("holes") and (d / "holes_prompt.md").exists():
+        answers, problems = holes_phase(calls, d, sec, args, parser,
+                                        statement_left)
+    if not args.dry_run and todo_ctes((d / "query.sql").read_text(encoding="utf-8")):
+        if (d / "prompt.md").exists():
+            problems = statement_phase(calls, d, sec, args, parser)
+    if args.dry_run:
+        return "dry-run", calls.n, "", {}
+    final, _ = check_section(sec, d / "query.sql", parser)
+    if not final:
+        return "ok", calls.n, "", answers
+    if calls.failures == calls.n:
+        return "erreur_modele", calls.n, "opencode en échec : voir model_*.log", {}
+    return "escalade", calls.n, " | ".join(problems or final)[:500], answers
 
 
 def selftest(args, quiet: bool = False) -> int:
@@ -475,6 +588,9 @@ def main(argv=None) -> int:
     # parseur Spark partagé : une erreur de syntaxe déclenche la relance
     parser = None if args.dry_run or not todo else get_parser()
 
+    cache_path = args.workdir.parent / "expressions.json"
+    cache = load_cache(args.workdir.parent)
+
     def work(sec):
         t0 = time.perf_counter()
         result = translate_section(args.workdir, sec, args, parser)
@@ -487,11 +603,28 @@ def main(argv=None) -> int:
             print(f"-> {sec['id']} (~{sec.get('prompt_tokens', '?')} tokens)")
             futures.append(pool.submit(work, sec))
         for fut in as_completed(futures):
-            sec, (status, attempts, problem), secs = fut.result()
+            sec, (status, attempts, problem, answers), secs = fut.result()
             print(f"   {sec['id']} : {status} en {secs}s")
             if args.dry_run:
                 continue
             sec["status"] = status
+            if status == "ok" and answers:
+                # réponses du modèle aux expressions : en cache, NON vérifiées
+                # tant que la comparaison avec Qlik n'a pas été identique
+                by_id = {h["id"]: h for h in sec.get("holes", [])}
+                sec["hole_answers"] = {hole_key(by_id[k]): v
+                                       for k, v in answers.items() if k in by_id}
+                for key, sql in sec["hole_answers"].items():
+                    entry = cache.setdefault(key, {"sql": sql, "verified": False,
+                                                   "tables": []})
+                    if entry["sql"] != sql and not entry["verified"]:
+                        entry["sql"] = sql
+                    ref = f"{manifest['script']}/{sec['id']}"
+                    if ref not in entry["tables"]:
+                        entry["tables"].append(ref)
+                cache_path.write_text(json.dumps(cache, indent=2,
+                                                 ensure_ascii=False),
+                                      encoding="utf-8")
             mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
                              encoding="utf-8")
             journal.update(journal_path, {

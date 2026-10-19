@@ -121,18 +121,35 @@ Un fichier absent de `conf/io.yml` suit la règle par défaut : écrit par un
 `STORE` → `data/output/<nom>`, sinon `data/input/<nom>`, en Parquet. Le
 rapport liste ces fichiers.
 
-## Le modèle n'écrit que ce qui manque
+## Le modèle ne traduit que des petits morceaux
 
-Le prompt complet (brouillon SQL, code Qlik, faits, skills utiles) est
-envoyé **dans le message**, et le modèle répond **seulement par les CTE
-`TODO(model)` complétées**, dans un bloc ```` ```sql ````. `translate.py` les
-greffe dans le brouillon : le reste de la requête n'est jamais réécrit, et
-la réponse reste courte (pas de coupure par la limite de tokens de sortie).
-Une réponse coupée (`reason: length`) est détectée et relancée en demandant
-plus court.
-L'agent `translator` peut **lire** le projet (`.opencode/` compris) s'il y
-tient, mais ne peut ni écrire, ni exécuter, ni aller sur le web : aucune
-demande de permission ne peut le bloquer.
+Quand le traducteur bute, c'est presque toujours sur **une expression** d'un
+LOAD (`ConvertToLocalTime`, `Peek` récursif, fonction inconnue). Il écrit
+alors toute l'instruction et ne laisse qu'un **trou** à la place de cette
+expression. Pour chaque table, dans l'ordre :
+
+1. **expressions isolées** (`holes_prompt.md`) : le modèle reçoit chaque
+   expression, l'instruction Qlik qui la contient, les colonnes disponibles
+   avec leur type (`conf/schema`) et l'ordre de chargement ; il répond
+   `h1: <expression>`. Quelques centaines de tokens en entrée, quelques
+   dizaines en sortie. S'il répond `h1: ?`, il est relancé avec plus de
+   contexte (la table résumée) ;
+2. **instructions entières** (`prompt.md`) : seulement pour ce qui bloque
+   toute une instruction (colonnes inconnues, `KEEP` entre tables…), ou en
+   dernier recours si les expressions isolées échouent. Le modèle ne renvoie
+   que les CTE à compléter, greffées dans le brouillon ; le brouillon ne
+   montre en entier que ce que ces CTE lisent.
+
+Aucune valeur de donnée n'est envoyée au modèle : seulement des noms et des
+types de colonnes, et les messages d'erreur de Spark.
+
+## Le cache d'expressions : `work/expressions.json`
+
+Chaque expression traduite par le modèle y est enregistrée **non vérifiée**.
+Elle devient **vérifiée** quand la comparaison de sa table avec Qlik est
+identique : elle est alors appliquée sans modèle dans tous les scripts
+suivants. Non vérifiée, elle n'est proposée au modèle que comme piste.
+Le fichier se corrige à la main ; ne le supprime pas en vidant `work/`.
 
 ## Vérifier que le modèle répond
 

@@ -1,8 +1,8 @@
 # Qlik Sense -> Spark SQL 3.5.8 migration
 
-Each request contains everything needed: the draft query, the Qlik code and
-the facts. No need to read documentation; never write files.
-Think in English; SQL comments in French. Answer with one ```sql block.
+Each request contains everything needed. No need to read documentation;
+never write files. Think in English; SQL comments in French. Answer with one
+```sql block, in the exact format the request asks, and nothing else.
 
 ## Qlik in short
 - A script runs top to bottom and builds in-memory tables. `NAME:` names the table.

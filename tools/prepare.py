@@ -1139,11 +1139,13 @@ helper CTEs before them if needed (new names). Be concise.
    `ORDER BY _qlik_order` for Peek, Previous, FirstValue, LastValue.
 
 # Draft query (to complete)
+Already translated CTEs are summarised by their columns (`...`): you can
+read them, never rewrite them.
 ```sql
 {draft}
 ```
 
-# Qlik code (variables already substituted, original line numbers)
+# Qlik code of the parts to translate (variables substituted, original line numbers)
 ```qlik
 {code}
 ```
@@ -1151,6 +1153,65 @@ helper CTEs before them if needed (new names). Be concise.
 # Facts (computed by the parser: trust them)
 {facts}
 {mappings}{skills}"""
+
+
+HOLE_PROMPT = """# Task
+Translate Qlik Sense expressions into Spark SQL 3.5.8 EXPRESSIONS.
+A parser already translated everything else; only these expressions remain.
+
+Answer ONLY with one line per expression, in one ```sql block:
+```sql
+h1: <Spark SQL expression>
+```
+No explanation, no SELECT, no CTE, no comment. Be short.
+If information is missing to translate an expression safely, answer
+`h1: ?` for it: you will get more context. Never guess.
+
+# Rules
+- Native Spark SQL functions only (no UDF).
+- Qlik booleans are -1 (true) and 0 (false); any non-zero number is true.
+- A string with an apostrophe uses double quotes: "l'été" (never '').
+- `_qlik_order` is the Qlik load order (array<bigint>): use it in
+  `OVER (ORDER BY …)` for Peek, Previous, RowNo and running totals.
+- Use only the columns listed for each expression; types in parentheses
+  come from conf/schema (a column without type: see the Qlik statement).
+
+# Expressions
+{holes}
+{skills}"""
+
+
+def hole_block(h: dict) -> str:
+    types = h.get("types") or {}
+    cols = ", ".join(f"{c} ({types[c]})" if c in types else c
+                     for c in h["columns"]) if h.get("columns") else \
+        "unknown (see the Qlik statement)"
+    pre = f" (prefix them with `{h['qualifier']}.`)" if h.get("qualifier") else ""
+    lines = [f"### {h['id']} — l.{h['line']}, "
+             + (f"column `{h['alias']}`" if h.get("alias") else "WHERE condition")
+             + f", {'condition (boolean)' if h['kind'] == 'condition' else 'value'}"
+             + (", inside a GROUP BY (aggregate)" if h.get("aggregate") else ""),
+             f"Qlik: `{h['qlik']}`",
+             f"Why the parser stopped: {h['reason']}",
+             f"Columns available{pre}: {cols}, _qlik_order",
+             f"Load order: ORDER BY {h.get('order_by') or '_qlik_order'}"]
+    if h.get("hint"):
+        lines.append(f"A previous, not yet verified, translation of this exact "
+                     f"expression: `{h['hint']}` (check it, do not trust it)")
+    return "\n".join(lines)
+
+
+def hole_key(h: dict) -> str:
+    """Clé du cache d'expressions : même expression Qlik, même contexte."""
+    return f"{h['kind']}|{h.get('qualifier') or ''}|{' '.join(h['qlik'].split())}"
+
+
+def fill_holes(sql: str, answers: dict[str, str]) -> str:
+    """Remplace chaque trou /*TODO(model):hN*/ par son expression."""
+    for hid, expr_sql in answers.items():
+        sql = re.sub(r"\(/\*TODO\(model\):" + re.escape(hid)
+                     + r"\*/ (?:NULL|true)\)", lambda m: f"({expr_sql})", sql)
+    return sql
 
 
 def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
@@ -1257,9 +1318,17 @@ def load_project_stores(path: Path, script_name: str) -> dict:
     return {"paths": paths, "names": names, "columns": columns}
 
 
+def load_cache(out_root: Path) -> dict:
+    """Expressions déjà traduites par le modèle et validées (work/
+    expressions.json) : réutilisées sans modèle, modifiables à la main."""
+    f = out_root / "expressions.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+
 def prepare(script: Path, out_root: Path, skills_dir: Path,
             project_stores: dict | None = None,
             conf: IoConf | None = None) -> dict:
+    cache = load_cache(out_root)
     text, env, insts, notes, tables, schemas = analyze_script(script)
     order, groups, gdeps, sec_of, finals = build_sections(insts, tables, schemas)
     for i in insts:
@@ -1425,8 +1494,28 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         header = (f"-- Section {sec['id']} : table {g}"
                   f" (lignes Qlik {sec['lines'][0]}-{sec['lines'][1]})\n"
                   "-- Traduit depuis Qlik par tools/prepare.py\n")
-        sql, todos, cols, technical = translate_section(
+        sql, todos, cols, technical, short_sql, holes = translate_section(
             sec_insts, [i.clean_text for i in sec_insts], ctx, header)
+        # expressions déjà traduites et validées ailleurs : sans modèle
+        known = {h["id"]: cache[hole_key(h)]["sql"] for h in holes
+                 if cache.get(hole_key(h), {}).get("verified")}
+        for h in holes:
+            if hole_key(h) in cache and h["id"] not in known:
+                h["hint"] = cache[hole_key(h)]["sql"]    # piste non vérifiée
+        if known:
+            sql = fill_holes(sql, known)
+            short_sql = fill_holes(short_sql, known)
+            todos = [t for t in todos
+                     if not any(t.endswith(f"(expression {k})") for k in known)]
+            holes = [h for h in holes if h["id"] not in known]
+            sec["from_cache"] = len(known)
+        col_types = {}
+        for v in inputs.values():
+            col_types.update(v.get("types") or {})
+        for h in holes:
+            h["types"] = {c: col_types[c] for c in (h.get("columns") or [])
+                          if c in col_types}
+        sec["holes"] = holes
         sec["technical_columns"] = technical
         for gs in applicable:
             todos.append(f"réglage global à appliquer : {gs}")
@@ -1450,8 +1539,9 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             sec["status"] = old["status"]      # déjà complété, inchangé
         else:
             (d / "query.sql").write_text(sql, encoding="utf-8")
+            statement_todos = [t for t in todos if "(expression h" not in t]
             todo_insts = [i for i in sec_insts if any(
-                t.startswith(f"l.{i.stmt.first_line} ") for t in todos)] \
+                t.startswith(f"l.{i.stmt.first_line} ") for t in statement_todos)] \
                 or sec_insts
             tc = set().union(*(i.constructs for i in todo_insts))
             skill_names = sorted({SKILL_BY_CONSTRUCT[c] for c in tc
@@ -1466,14 +1556,52 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                 f"{mapping_code([insts[k] for k in tables[m]['insts']])}\n```\n"
                 for m in sorted(maps) if m in tables)
             prompt = PROMPT.format(
-                draft=sql.rstrip(),
-                code=numbered(sec_insts),
-                facts=facts_block(sec, sec_insts, schemas, env, sec["views"],
+                draft=short_sql.rstrip(),
+                code=numbered(todo_insts),
+                facts=facts_block(sec, todo_insts, schemas, env, sec["views"],
                                   applicable),
                 mappings=("\n# Mappings used\n" + map_txt) if map_txt else "",
                 skills=skill_txt)
+            # prompt.md : instructions entières à compléter ; pour une table
+            # qui n'a que des trous d'expression, dernier recours si le modèle
+            # n'arrive pas à les traduire isolément
             (d / "prompt.md").write_text(prompt, encoding="utf-8")
-            sec["prompt_tokens"] = len(prompt) // 4
+            sec["statement_todos"] = bool(statement_todos)
+            sec["prompt_tokens"] = len(prompt) // 4 if statement_todos else 0
+            (d / "draft_condensed.sql").write_text(short_sql, encoding="utf-8")
+            if holes:
+                by_line = {i.stmt.first_line: i for i in sec_insts}
+                hole_groups = {}
+                for h in holes:
+                    hole_groups.setdefault(h["line"], []).append(h)
+                blocks = []
+                for line, hs in hole_groups.items():
+                    code = numbered([by_line[line]]) if line in by_line else ""
+                    if len(code) > 3000 and not any(re.search(
+                            r"\b(peek|previous|above)\b", h["qlik"], re.I)
+                            for h in hs):
+                        # très gros LOAD : seules les lignes des expressions
+                        first = code.splitlines()[:2]
+                        keep = [ln for ln in code.splitlines()
+                                if any(h["qlik"].splitlines()[0].strip()[:40]
+                                       in ln for h in hs)]
+                        code = "\n".join(first + ["  …"] + keep)
+                    blocks.append(f"## Qlik statement l.{line}\n```qlik\n{code}"
+                                  "\n```\n\n" + "\n\n".join(hole_block(h)
+                                                             for h in hs))
+                hole_txt = "\n\n".join(blocks)
+                row = any(re.search(r"\b(peek|previous|above|firstsortedvalue)\b",
+                                    h["qlik"], re.I) for h in holes)
+                skill = load_skill(skills_dir, "qlik-row-functions-sql") if row \
+                    else ""
+                hprompt = HOLE_PROMPT.format(
+                    holes=hole_txt,
+                    skills=f"\n# Skill: qlik-row-functions-sql\n{skill}\n"
+                    if skill else "")
+                (d / "holes_prompt.md").write_text(hprompt, encoding="utf-8")
+                sec["prompt_tokens"] += len(hprompt) // 4
+            else:
+                (d / "holes_prompt.md").unlink(missing_ok=True)
             sec["status"] = "todo"
         sections.append(sec)
 
@@ -1528,10 +1656,14 @@ def write_report(base: Path, m: dict, n_lines: int) -> None:
         count[s_["status"]] = count.get(s_["status"], 0) + 1
     tables = [s_ for s_ in secs if s_["status"] != "skip"]
     auto = sum(s_["status"] == "deterministic" for s_ in tables)
+    cached = sum(1 for s_ in tables if s_["status"] == "deterministic"
+                 and s_.get("from_cache"))
     lines = [f"# Préparation de `{m['script']}`", "",
              f"- {n_lines} lignes, {len(tables)} tables à produire",
-             f"- **{auto}/{len(tables)} traduites entièrement sans modèle**, "
-             f"{len(tables) - auto} avec des parties à compléter",
+             f"- **{auto}/{len(tables)} traduites entièrement sans modèle**"
+             + (f" (dont {cached} grâce au cache d'expressions vérifiées)"
+                if cached else "")
+             + f", {len(tables) - auto} avec des parties à compléter",
              f"- Variables non résolues : "
              f"{', '.join(m['unresolved_variables']) or 'aucune'}",
              "", "| Table | Statut à la préparation | Lignes Qlik | "
