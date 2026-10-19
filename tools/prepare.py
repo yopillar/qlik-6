@@ -1475,6 +1475,14 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             sections.append(sec)
             continue
         produced_now = list(produced)
+        extra_views: dict[str, str] = {}      # vues lues par FieldValue()
+
+        def fieldvalue_views(field_name, produced_tables):
+            found = [t for t in produced_tables
+                     if field_name in (schemas.get(t) or [])]
+            for t in found:
+                extra_views[table_views[t]] = t
+            return [table_views[t] for t in found]
         produced.append(g)
 
         # ---- traduction déterministe
@@ -1487,8 +1495,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                                      .get("insts", [])],
             table_name=lambda t: tables.get(t, {}).get("name", t),
             graph_schema=lambda t: _known(schemas.get(t)),
-            tables_with_field=lambda f: [table_views[t] for t in produced_now
-                                         if f in (schemas.get(t) or [])],
+            tables_with_field=lambda f: fieldvalue_views(f, produced_now),
             date_format=env.vars.get("DateFormat"),
             timestamp_format=env.vars.get("TimestampFormat"))
         header = (f"-- Section {sec['id']} : table {g}"
@@ -1525,6 +1532,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         sec["views"].update({table_views[t]: {"table": t,
                                               "columns": final_columns.get(t)}
                              for t in deps_tables if t in table_views})
+        sec["views"].update({v: {"table": t, "columns": final_columns.get(t)}
+                             for v, t in extra_views.items()})
         sec["todos"] = todos
         draft_hash = hashlib.sha1(sql.encode()).hexdigest()[:12]
         sec["draft_hash"] = draft_hash

@@ -133,6 +133,7 @@ class ExprCtx:
     output_field: object = None               # champ du LOAD en cours (Peek)
     peek_table: object = None                 # Peek('f', n, 'T')
     noofrows: object = None                   # NoOfRows('T')
+    aggregate_used: bool = False              # Sum/Min/Max… dans le LOAD
     fieldvalue: str | None = None             # champ lu par FieldValue()
     technical: bool = False                   # AutoNumber/Hash utilisés
 
@@ -389,8 +390,14 @@ def translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
     return sql
 
 
+AGGREGATES = {"sum", "min", "max", "avg", "count", "maxstring", "minstring",
+              "only", "concat", "firstvalue", "lastvalue", "firstsortedvalue"}
+
+
 def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
     n = name.lower()
+    if n in AGGREGATES:
+        ctx.aggregate_used = True
     k = len(a)
 
     def need(*counts):
@@ -1094,11 +1101,17 @@ class SectionTranslator:
                                       None, src_cols)
             ectx.in_where = self.in_where = False
         # colonne d'ordre du résultat
-        group_sql = [expr(g, ectx) for g in seg.group_by]
-        if seg.group_by:
-            select.append(f"min({ord_src}) AS {ORD}")      # 1re occurrence
+        group_sql = [g_ for g_ in (expr(g, ectx) for g in seg.group_by)
+                     if not re.fullmatch(r"-?\d+(\.\d+)?", g_.strip("() "))]
+        if seg.group_by or ectx.aggregate_used:
+            # agrégat (avec ou sans GROUP BY) : ordre de la 1re ligne agrégée
+            select.append(f"min({ord_src}) AS {ORD}")
         elif seg.distinct:
-            group_sql = values                       # DISTINCT : 1re occurrence
+            # DISTINCT : 1re occurrence ; une constante ne se groupe pas (un
+            # entier dans un GROUP BY Spark est un numéro de colonne)
+            group_sql = [v for v in values
+                         if not re.fullmatch(r"-?\d+(\.\d+)?|'[^']*'|\"[^\"]*\"|NULL",
+                                             v.strip("() "))]
             select.append(f"min({ord_src}) AS {ORD}")
         elif order_items:
             select.append(f"array(row_number() OVER (ORDER BY {ectx.order_by})) "
@@ -1579,6 +1592,8 @@ class SectionTranslator:
             sep = "," if k < len(self.ctes) - 1 else ""
             out.append(f"-- {c.comment}\n{c.name} AS (\n{body}\n){sep}")
         out += self.notes
+        if cols:
+            cols = list(dict.fromkeys(cols))
         sel = ",\n       ".join([ident(c) for c in cols] + [ORD]) if cols else "*"
         out.append(f"SELECT {sel}\nFROM {final}")
         return "\n".join(out) + "\n", cols

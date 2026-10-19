@@ -22,10 +22,14 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import journal  # noqa: E402
 
 FORBIDDEN = ("CREATE", "INSERT", "DELETE", "UPDATE", "MERGE", "DROP",
              "ALTER", "TRUNCATE", "CACHE", "REFRESH")
@@ -38,7 +42,7 @@ def strip_sql_comments(sql: str) -> str:
     return re.sub(r"--[^\n]*", " ", sql)
 
 
-TOKENS = re.compile(r"'(?:\\.|[^'\\])*'|`(?:``|[^`])*`")
+TOKENS = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:``|[^`])*`")
 
 
 def strip_sql_strings(sql: str, idents: bool = False) -> str:
@@ -46,10 +50,36 @@ def strip_sql_strings(sql: str, idents: bool = False) -> str:
     ensemble : un nom `Payment's type` ne doit pas ouvrir une chaîne."""
     def repl(m):
         tok = m.group()
-        if tok.startswith("'"):
+        if tok[0] in "'\"":
             return "''"
         return "``" if idents else tok
     return TOKENS.sub(repl, sql)
+
+
+SPARK_TYPES = {"int": "INT", "integer": "INT", "bigint": "BIGINT", "long": "BIGINT",
+               "smallint": "SMALLINT", "double": "DOUBLE", "float": "DOUBLE",
+               "decimal": "DECIMAL(38,10)", "numeric": "DECIMAL(38,10)",
+               "number": "DOUBLE", "string": "STRING", "str": "STRING",
+               "text": "STRING", "varchar": "STRING", "date": "DATE",
+               "timestamp": "TIMESTAMP", "datetime": "TIMESTAMP",
+               "boolean": "BOOLEAN", "bool": "BOOLEAN"}
+
+
+def spark_type(t) -> str:
+    """Type de conf/schema -> type Spark (inconnu : STRING)."""
+    if not t:
+        return "STRING"
+    t = str(t).lower().split("(")[0].strip()
+    return SPARK_TYPES.get(t, "STRING")
+
+
+# erreurs d'analyse qui dépendent des types : non fiables tant que les types
+# des colonnes ne sont pas tous connus (une colonne sans type est STRING)
+TYPE_ERRORS = ("DATATYPE_MISMATCH", "CAST_WITHOUT_SUGGESTION",
+               "UNEXPECTED_INPUT_TYPE", "BINARY_OP_DIFF_TYPES")
+# erreurs qui dépendent de la connaissance des colonnes amont (déduites du
+# script quand il n'y a pas de schéma) : à signaler sans bloquer
+KNOWLEDGE_ERRORS = ("UNRESOLVED_COLUMN",)
 
 
 class SparkChecker:
@@ -77,8 +107,11 @@ class SparkChecker:
         with self.lock:
             try:
                 for name, v in views.items():
-                    cols = [f"CAST(NULL AS STRING) AS `{c.replace('`', '``')}`"
-                            for c in v["columns"] if c != "_qlik_order"]
+                    types = v.get("types") or {}
+                    cols = [f"CAST(NULL AS {spark_type(types.get(c))}) AS "
+                            f"`{c.replace('`', '``')}`"
+                            for c in dict.fromkeys(v["columns"])
+                            if c != "_qlik_order"]
                     cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
                     self.spark.sql(f"SELECT {', '.join(cols)} WHERE false") \
                         .createOrReplaceTempView(name)
@@ -86,6 +119,10 @@ class SparkChecker:
                 return None
             except Exception as exc:
                 msg = str(exc).splitlines()[0]
+                all_typed = all(set(v["columns"]) - {"_qlik_order"}
+                                <= set(v.get("types") or {}) for v in views.values())
+                if any(k in msg for k in TYPE_ERRORS) and not all_typed:
+                    return None                  # types inconnus : non fiable
                 return "analyse Spark : " + msg[:300]
 
 
@@ -98,6 +135,7 @@ def get_parser():
     spark = (SparkSession.builder.master("local[1]")
              .config("spark.ui.enabled", "false")
              .config("spark.sql.ansi.enabled", "false")      # comme Spark 3.5
+             .config("spark.sql.caseSensitive", "true")      # comme Qlik
              .getOrCreate())
     spark.sparkContext.setLogLevel("ERROR")
     return SparkChecker(spark)
@@ -133,8 +171,10 @@ def check_section(section: dict, query_path: Path,
                                           re.I)}
     allowed = ctes | {v.lower() for v in section.get("views", {})}
     unknown = []
-    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)", code_no_idents,
-                         re.I):
+    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)(\s*\()?",
+                         code_no_idents, re.I):
+        if m.group(2):
+            continue          # fonction-table (range(…), explode…), pas une vue
         name = m.group(1).lower()
         if name not in allowed and name not in ("values", "lateral") \
                 and m.group(1) not in unknown:
@@ -177,6 +217,9 @@ def main(argv=None) -> int:
     p.add_argument("--only", help="id d'une table")
     p.add_argument("--parse", action="store_true",
                    help="valider aussi la syntaxe avec le parseur Spark")
+    p.add_argument("--mark", action="store_true",
+                   help="passer en escalade les tables validées que le contrôle "
+                        "refuse (utilisé par migrate.py avant l'assemblage)")
     args = p.parse_args(argv)
     parser = get_parser() if args.parse else None
     mpath = args.workdir / "manifest.json"
@@ -191,6 +234,25 @@ def main(argv=None) -> int:
                                             "todo") and args.only:
             sec["status"] = "ok"         # corrigée à la main puis validée
             changed = True
+        sure = [e for e in errors if not any(k in e for k in KNOWLEDGE_ERRORS)]
+        if errors and not sure and args.mark:
+            print(f"⚠ {sec['id']} : {errors[0][:160]} (colonnes amont déduites "
+                  "du script : à confirmer, non bloquant)")
+            continue
+        if sure and args.mark and sec["status"] in ("deterministic", "ok"):
+            # traduction acceptée mais refusée par l'analyse Spark : souvent un
+            # cas que le traducteur gère mal ; on bloque avant l'exécution
+            sec["status"] = "escalade"
+            sec.setdefault("todos", []).append("contrôle : " + errors[0][:200])
+            changed = True
+            journal.update(args.workdir.parent / "journal.csv", {
+                "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "script": manifest["script"], "section": sec["id"],
+                "status": "escalade",
+                "problem": "contrôle refusé (traduction à vérifier) : "
+                           + " | ".join(errors)[:400]})
+        if args.mark and not errors:
+            continue
         print(f"{'✗' if errors else '✓'} {sec['id']} ({sec['status']})")
         for e in errors:
             print(f"    ERREUR  {e}")

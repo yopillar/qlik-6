@@ -3,20 +3,35 @@ description: Translates the few Qlik expressions or CTEs that tools/prepare.py c
 mode: all
 temperature: 0
 # model: <provider>/<ornith>
+# Aucun outil n'est nécessaire : tout est dans le message. Les outils sont
+# retirés de la liste proposée au modèle (tools) ET refusés (permission) :
+# un modèle faible qui voit un outil « read » tente de s'en servir, perd du
+# temps (plusieurs minutes) ou l'appelle avec des arguments invalides.
+tools:
+  read: false
+  write: false
+  edit: false
+  bash: false
+  glob: false
+  grep: false
+  list: false
+  webfetch: false
+  websearch: false
+  task: false
+  skill: false
+  todowrite: false
+  todoread: false
 permission:
-  # lecture seule autorisée (projet, .opencode/ : skills, agents…) : inutile
-  # en principe, mais un modèle qui tient à lire ne reste pas bloqué
-  read: allow
-  glob: allow
-  grep: allow
-  list: allow
-  skill: allow
-  # jamais d'écriture ni d'exécution : translate.py écrit query.sql
+  read: deny
   edit: deny
   bash: deny
+  glob: deny
+  grep: deny
+  list: deny
   webfetch: deny
   websearch: deny
   task: deny
+  skill: deny
   todowrite: deny
 ---
 A parser already translated the Qlik script into Spark SQL. Each request asks
@@ -25,8 +40,7 @@ you for the few pieces it could not translate: either single expressions
 
 Everything you need is in the message: the draft query, the Qlik code, the
 facts computed by the parser and the relevant skills. Trust the facts.
-Reading other files is allowed but not needed: do not search for
-documentation.
+You have no tools and need none: never try to read, list or write files.
 
 - Never write or edit files: answer in one ```sql block, in the exact format
   the request asks; translate.py inserts it into the query.

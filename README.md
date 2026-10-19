@@ -143,6 +143,18 @@ expression. Pour chaque table, dans l'ordre :
 Aucune valeur de donnée n'est envoyée au modèle : seulement des noms et des
 types de colonnes, et les messages d'erreur de Spark.
 
+## Le contrôle avant l'assemblage
+
+Avant d'assembler un script, `migrate.py` analyse **toutes** ses requêtes avec
+Spark (`check.py --parse --mark`), sans données : vues vides aux colonnes
+connues, typées par `conf/schema`, sensibles à la casse comme Qlik. Une
+erreur sûre (syntaxe, `GROUP BY`, référence ambiguë…) bloque la table avant
+l'exécution du job. Une colonne introuvable dans une table amont dont les
+colonnes ont été déduites du script (pas de schéma) est seulement signalée.
+
+Les erreurs déjà présentes dans le brouillon, avant toute réponse du modèle,
+viennent du traducteur : elles ne sont jamais reprochées au modèle.
+
 ## Le cache d'expressions : `work/expressions.json`
 
 Chaque expression traduite par le modèle y est enregistrée **non vérifiée**.

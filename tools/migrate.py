@@ -79,6 +79,9 @@ def main(argv=None) -> int:
             stopped = True
             break
 
+        # analyse Spark de TOUTES les requêtes avant d'assembler : un cas mal
+        # traduit est bloqué ici plutôt qu'à l'exécution du job
+        run("check.py", str(workdir), "--parse", "--mark")
         manifest = json.loads((workdir / "manifest.json").read_text(
             encoding="utf-8"))
         todo = sum(s["status"] == "todo" for s in manifest["sections"])

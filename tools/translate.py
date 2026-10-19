@@ -371,6 +371,13 @@ def parse_holes(text: str) -> dict[str, str]:
             if v.strip()}
 
 
+def translator_errors(sec: dict, path: Path, parser) -> list[str]:
+    """Erreurs du brouillon AVANT toute réponse du modèle : elles viennent du
+    traducteur, on ne les reproche pas au modèle (sinon il s'égare)."""
+    errors, _ = check_section(sec, path, parser)
+    return [e for e in errors if "TODO(model)" not in e]
+
+
 def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
                 statement_left: bool) -> tuple[dict, list[str]]:
     """Le modèle traduit les expressions laissées par le traducteur.
@@ -382,6 +389,7 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
         if (d / "draft_condensed.sql").exists() else ""
     pending = [h["id"] for h in sec.get("holes", [])]
     answers, errors, previous, more = {}, [], "", False
+    baseline = set(translator_errors(sec, out, parser))
     for _ in range(args.retries + 2):         # +1 : niveau de contexte
         msg = prompt + (MORE_CONTEXT.format(draft=condensed) if more else "")
         if previous or errors:
@@ -405,6 +413,7 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
         # les trous encore sans réponse (et les blocs d'instruction) sont
         # attendus ici : seules les erreurs de syntaxe / d'analyse comptent
         problems = [p for p in problems if "TODO(model)" not in p
+                    and p not in baseline
                     and not (statement_left and p.startswith("colonnes de sortie"))]
         if problems:
             out.write_text(fill_holes(base, answers), encoding="utf-8")
@@ -429,6 +438,7 @@ def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
     out, prompt_path = d / "query.sql", d / "prompt.md"
     prompt = prompt_path.read_text(encoding="utf-8")
     draft = out.read_text(encoding="utf-8")
+    baseline = set(translator_errors(sec, out, parser))
     errors: list[str] = []
     previous = draft
     for attempt in range(1, args.retries + 2):
@@ -455,6 +465,7 @@ def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
             (d / f"query.attempt{attempt}.sql").write_text(full, encoding="utf-8")
             previous = sql
             errors, _ = check_section(sec, out, parser)
+            errors = [e for e in errors if e not in baseline]
             if missing:
                 errors.insert(0, "CTE missing or incomplete in your answer: "
                               + ", ".join(missing)
@@ -505,6 +516,10 @@ def translate_section(workdir: Path, sec: dict, args, parser=None):
         return "ok", calls.n, "", answers
     if calls.failures == calls.n:
         return "erreur_modele", calls.n, "opencode en échec : voir model_*.log", {}
+    if not [e for e in final if "TODO(model)" in e]:
+        # tout est complété mais le contrôle refuse : souvent le traducteur
+        return "escalade", calls.n, ("contrôle refusé (à vérifier, peut venir du "
+                                     "traducteur) : " + " | ".join(final))[:500], answers
     return "escalade", calls.n, " | ".join(problems or final)[:500], answers
 
 

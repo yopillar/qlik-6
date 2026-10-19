@@ -57,6 +57,8 @@ def with_order(df):
 
 def main(spark: SparkSession) -> None:
     """Exécute le script {stem}."""
+    # Qlik distingue les majuscules dans les noms de champs (IDBid ≠ IdBid)
+    spark.conf.set("spark.sql.caseSensitive", "true")
     read_paths = {{path for path, _ in INPUTS.values()}}
     for view, (path, fmt) in INPUTS.items():
         with_order(read(spark, path, fmt)).createOrReplaceTempView(view)
