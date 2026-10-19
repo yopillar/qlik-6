@@ -6,8 +6,9 @@ Vérifie work/<script>/<table>/query.sql contre les faits du manifest :
   - seules les vues et CTE existantes sont lues ;
   - chaque colonne de sortie attendue apparaît ;
   - chaque instruction Qlik est référencée par un commentaire « l.<n> » ;
-  - avec --parse (ou depuis translate.py) : la syntaxe est validée par le
-    parseur de Spark, sans exécuter la requête.
+  - avec --parse (ou depuis translate.py) : syntaxe validée par le parseur
+    de Spark, puis requête analysée contre des vues vides quand toutes leurs
+    colonnes sont connues (colonnes inexistantes, fonctions inconnues…).
 
 Ces contrôles ne prouvent pas que le résultat est juste (c'est le rôle de
 verify.py sur les données), mais ils rattrapent en une seconde les oublis
@@ -51,16 +52,55 @@ def strip_sql_strings(sql: str, idents: bool = False) -> str:
     return TOKENS.sub(repl, sql)
 
 
+class SparkChecker:
+    """Parseur et analyseur de Spark, sans données : la requête est analysée
+    contre des vues vides aux colonnes connues (noms de colonnes et de vues,
+    fonctions, types de base). Rien n'est exécuté."""
+
+    def __init__(self, spark):
+        import threading
+        self.spark = spark
+        self.parser = spark._jsparkSession.sessionState().sqlParser()
+        self.lock = threading.Lock()       # vues partagées entre threads
+
+    def parse(self, sql: str) -> str | None:
+        try:
+            self.parser.parsePlan(sql)
+            return None
+        except Exception as exc:
+            return "syntaxe SQL : " + str(exc).splitlines()[0][:300]
+
+    def analyze(self, section: dict, sql: str) -> str | None:
+        views = section.get("views", {})
+        if not views or any(not v.get("columns") for v in views.values()):
+            return None                    # colonnes inconnues : pas d'analyse
+        with self.lock:
+            try:
+                for name, v in views.items():
+                    cols = [f"CAST(NULL AS STRING) AS `{c.replace('`', '``')}`"
+                            for c in v["columns"] if c != "_qlik_order"]
+                    cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
+                    self.spark.sql(f"SELECT {', '.join(cols)} WHERE false") \
+                        .createOrReplaceTempView(name)
+                self.spark.sql(sql).schema       # analyse seulement
+                return None
+            except Exception as exc:
+                msg = str(exc).splitlines()[0]
+                return "analyse Spark : " + msg[:300]
+
+
 def get_parser():
-    """Parseur SQL de Spark (None si pyspark n'est pas installé)."""
+    """Vérificateur Spark (None si pyspark n'est pas installé)."""
     try:
         from pyspark.sql import SparkSession
     except ImportError:
         return None
     spark = (SparkSession.builder.master("local[1]")
-             .config("spark.ui.enabled", "false").getOrCreate())
+             .config("spark.ui.enabled", "false")
+             .config("spark.sql.ansi.enabled", "false")      # comme Spark 3.5
+             .getOrCreate())
     spark.sparkContext.setLogLevel("ERROR")
-    return spark._jsparkSession.sessionState().sqlParser()
+    return SparkChecker(spark)
 
 
 def check_section(section: dict, query_path: Path,
@@ -122,10 +162,9 @@ def check_section(section: dict, query_path: Path,
     elif unref:
         warnings.append(f"instructions sans commentaire « -- l.<n> » : {unref}")
     if parser is not None and not errors:
-        try:
-            parser.parsePlan(raw)
-        except Exception as exc:          # erreur de syntaxe Spark SQL
-            errors.append("syntaxe SQL : " + str(exc).splitlines()[0][:300])
+        problem = parser.parse(raw) or parser.analyze(section, raw)
+        if problem:
+            errors.append(problem)
     if "TODO" in raw.replace("TODO(model)", ""):
         warnings.append("TODO laissé dans la requête : à relire")
     return sorted(set(errors), key=errors.index), warnings

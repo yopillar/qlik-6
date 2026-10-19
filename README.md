@@ -121,11 +121,15 @@ Un fichier absent de `conf/io.yml` suit la règle par défaut : écrit par un
 `STORE` → `data/output/<nom>`, sinon `data/input/<nom>`, en Parquet. Le
 rapport liste ces fichiers.
 
-## Le modèle n'écrit rien
+## Le modèle n'écrit que ce qui manque
 
 Le prompt complet (brouillon SQL, code Qlik, faits, skills utiles) est
-envoyé **dans le message**, et le modèle répond par la requête dans un bloc
-```` ```sql ````. C'est `translate.py` qui l'écrit dans `query.sql`.
+envoyé **dans le message**, et le modèle répond **seulement par les CTE
+`TODO(model)` complétées**, dans un bloc ```` ```sql ````. `translate.py` les
+greffe dans le brouillon : le reste de la requête n'est jamais réécrit, et
+la réponse reste courte (pas de coupure par la limite de tokens de sortie).
+Une réponse coupée (`reason: length`) est détectée et relancée en demandant
+plus court.
 L'agent `translator` peut **lire** le projet (`.opencode/` compris) s'il y
 tient, mais ne peut ni écrire, ni exécuter, ni aller sur le web : aucune
 demande de permission ne peut le bloquer.

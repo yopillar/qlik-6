@@ -95,7 +95,8 @@ def parse_events(stdout: str) -> dict:
     JSON par événement) : texte final, outils tentés, raisonnement, erreurs.
     Le schéma varie selon les versions : lecture volontairement tolérante."""
     found = {"text": [], "tools": [], "reasoning": False, "errors": [],
-             "json": False}
+             "json": False, "tool_inputs": [], "finish": None,
+             "output_tokens": None}
 
     def walk(obj):
         if isinstance(obj, dict):
@@ -104,10 +105,22 @@ def parse_events(stdout: str) -> dict:
                 found["text"].append(obj["text"])
             if "reasoning" in kind or "thinking" in kind:
                 found["reasoning"] = True
+            if isinstance(obj.get("reason"), str) and "finish" in kind:
+                found["finish"] = obj["reason"]
+            tokens = obj.get("tokens")
+            if isinstance(tokens, dict) and isinstance(tokens.get("output"), int):
+                found["output_tokens"] = tokens["output"]
             if isinstance(obj.get("tool"), str):
                 state = obj.get("state")
                 status = state.get("status") if isinstance(state, dict) else ""
                 found["tools"].append(f"{obj.get('tool', '?')} {status}".strip())
+                # contenu que le modèle voulait écrire (write / edit refusés)
+                inp = state.get("input") if isinstance(state, dict) else None
+                if isinstance(inp, dict):
+                    for key in ("content", "newString", "new_string", "text",
+                                "patch", "code"):
+                        if isinstance(inp.get(key), str):
+                            found["tool_inputs"].append(inp[key])
             if "error" in kind or (kind == "" and "error" in obj):
                 found["errors"].append(str(obj.get("error") or obj)[:300])
             for v in obj.values():
@@ -129,6 +142,107 @@ def parse_events(stdout: str) -> dict:
     found["text"] = "\n".join(dict.fromkeys(found["text"]))
     found["tools"] = list(dict.fromkeys(found["tools"]))
     return found
+
+
+# ---------------------------------------------------------------------------
+# Greffe des CTE du modèle dans le brouillon : le modèle ne renvoie que les
+# CTE à compléter (sortie courte), le reste de la requête n'est jamais réécrit.
+# ---------------------------------------------------------------------------
+
+def _scan_parens(sql: str, start: int) -> int:
+    """Position de la parenthèse fermante associée à sql[start] == '('.
+    Ignore chaînes, noms `…` et commentaires -- ."""
+    depth, i, n = 0, start, len(sql)
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if ch in "'\"`":
+            j = i + 1
+            while j < n and sql[j] != ch:
+                j += 2 if sql[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def ctes_of(sql: str) -> list[tuple[str, int, int]]:
+    """CTE d'une requête ou d'une réponse : (nom, début du corps, fin)."""
+    out, pos = [], 0
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s+AS\s*\(", sql, re.I):
+        if m.start() < pos or m.group(1).upper() in ("CAST", "TRY_CAST"):
+            continue
+        open_ = m.end() - 1
+        close = _scan_parens(sql, open_)
+        if close == -1:
+            break
+        # une CTE est suivie de « , » ou du SELECT final, pas d'un autre AS
+        out.append((m.group(1), open_ + 1, close))
+        pos = close
+    return out
+
+
+def todo_ctes(draft: str) -> list[str]:
+    return [name for name, a, b in ctes_of(draft)
+            if "TODO(model)" in draft[a:b]]
+
+
+def splice(draft: str, answer: str) -> tuple[str, list[str]]:
+    """Remplace le corps des CTE TODO(model) du brouillon par ceux de la
+    réponse ; les CTE nouvelles sont insérées avant la première CTE TODO.
+    Renvoie (requête, CTE TODO restées sans réponse)."""
+    todos = todo_ctes(draft)
+    given = {name.lower(): answer[a:b] for name, a, b in ctes_of(answer)}
+    existing = {name.lower() for name, _, _ in ctes_of(draft)}
+    helpers = [(name, answer[a:b]) for name, a, b in ctes_of(answer)
+               if name.lower() not in existing]
+    sql, missing = draft, []
+    for name in todos:
+        body = given.get(name.lower())
+        if body is None:
+            missing.append(name)
+            continue
+        for n_, a, b in ctes_of(sql):
+            if n_ == name:
+                sql = sql[:a] + "\n" + body.strip("\n") + "\n" + sql[b:]
+                break
+    if helpers and todos:
+        first = next(a for n_, a, b in ctes_of(sql) if n_ == todos[0])
+        head = sql.rfind("\n", 0, sql.rfind(todos[0], 0, first)) + 1
+        prev = sql.rfind("\n", 0, head - 1) + 1
+        if sql[prev:head].lstrip().startswith("-- l."):
+            head = prev                    # garder le commentaire avec sa CTE
+        block = "".join(f"-- CTE ajoutée par le modèle\n{n_} AS (\n"
+                        f"{body.strip(chr(10))}\n),\n" for n_, body in helpers)
+        sql = sql[:head] + block + sql[head:]
+    sql = sql.replace("à traduire par le modèle", "traduit par le modèle")
+    return sql, missing
+
+
+def answer_sql(ok: bool, log: str, events: dict):
+    """Texte de la réponse, requête extraite, et si elle vient d'une
+    tentative d'écriture (outil refusé) plutôt que du texte."""
+    answer = events.get("text") if events.get("json") else \
+        log.split("\n--- stderr ---\n")[0].strip()
+    if not ok:
+        return answer, None, False
+    sql = extract_sql(answer or "")
+    if sql:
+        return answer, sql, False
+    for content in sorted(events.get("tool_inputs", []), key=len, reverse=True):
+        sql = extract_sql(content)
+        if sql:
+            return answer, sql, True
+    return answer, None, False
 
 
 def run_opencode(message: str, args) -> tuple[bool, str, dict]:
@@ -178,12 +292,12 @@ def translate_section(workdir: Path, sec: dict, args,
         old.unlink(missing_ok=True)
     errors: list[str] = []
     previous = draft
-    failures = 0
+    failures, last_note = 0, ""
     for attempt in range(1, args.retries + 2):
         msg = prompt
         if attempt > 1:
             msg += RETRY_TEXT.format(
-                previous=previous.rstrip(),
+                previous=(previous if previous is not draft else "(no SQL in your answer)"),
                 errors="\n".join(f"- {e}" for e in errors),
                 allowed=", ".join(sorted(sec.get("views", {}))) or "none")
         msg = shrink(msg)
@@ -196,11 +310,17 @@ def translate_section(workdir: Path, sec: dict, args,
         ok, log, events = run_opencode(msg, args)
         if args.dry_run:
             return "dry-run", attempt, ""
-        answer = events.get("text") if events.get("json") else \
-            log.split("\n--- stderr ---\n")[0].strip()
-        sql = extract_sql(answer or "") if ok else None
+        answer, sql, from_tool = answer_sql(ok, log, events)
         tools = events.get("tools", [])
-        if not ok:
+        cut = (events.get("finish") or "").lower() in ("length", "max_tokens",
+                                                         "max-tokens")
+        if cut:
+            note = (f"réponse COUPÉE : limite de tokens de sortie atteinte "
+                    f"({events.get('output_tokens') or '?'} tokens)")
+        elif from_tool:
+            note = ("requête récupérée dans la tentative d'écriture du modèle "
+                    f"({', '.join(tools)}) : il n'a pas répondu en texte")
+        elif not ok:
             note = ("opencode a échoué (code retour non nul) : voir la fin "
                     "du log, partie stderr")
         elif not answer and tools:
@@ -215,6 +335,7 @@ def translate_section(workdir: Path, sec: dict, args,
             note = "aucune requête SQL trouvée dans la réponse du modèle"
         else:
             note = ""
+        last_note = note or last_note
         if events.get("errors"):
             note += " | erreurs : " + " ; ".join(events["errors"][:3])
         (d / f"model_{attempt}.log").write_text(
@@ -234,22 +355,44 @@ def translate_section(workdir: Path, sec: dict, args,
             print(f"    {sec['id']} ✗ tentative {attempt} : {note}")
             continue
         if sql:
-            out.write_text(sql, encoding="utf-8")
-            (d / f"query.attempt{attempt}.sql").write_text(sql, encoding="utf-8")
+            # les CTE du modèle sont greffées dans le brouillon d'origine
+            full, missing = splice(draft, sql)
+            out.write_text(full, encoding="utf-8")
+            (d / f"query.attempt{attempt}.sql").write_text(full, encoding="utf-8")
             previous = sql
             errors, _ = check_section(sec, out, parser)
+            if missing:
+                errors.insert(0, "CTE missing or incomplete in your answer: "
+                              + ", ".join(missing)
+                              + (" (your answer was cut: be shorter)" if cut else ""))
+        elif cut:
+            errors = ["your previous answer was cut by the output limit: answer "
+                      "ONLY with the TODO(model) CTEs, concisely, no explanation"]
         else:
             errors = ["your previous answer contained no SQL. Do not try to "
                       "write files (disabled): reply with plain text, the "
-                      "complete query in one ```sql block"]
+                      "TODO(model) CTEs in one ```sql block"]
+        if note:
             print(f"    {sec['id']} : {note}")
         if not errors:
             return "ok", attempt, ""
-        print(f"    {sec['id']} ✗ tentative {attempt} : {errors[0][:120]}")
-    out.write_text(previous, encoding="utf-8")
+        if sql:
+            shown = errors[0]
+            if shown.startswith("CTE missing"):
+                shown = "CTE absente ou incomplète dans la réponse : " + \
+                    shown.split(": ", 1)[1]
+            print(f"    {sec['id']} ✗ tentative {attempt} : {shown[:120]}")
+    if previous is not draft:
+        out.write_text(splice(draft, previous)[0], encoding="utf-8")
+    else:
+        out.write_text(draft, encoding="utf-8")
     if failures == args.retries + 1:      # aucun appel n'a abouti
         return "erreur_modele", failures, "opencode en échec : voir model_*.log"
-    return "escalade", args.retries + 1, " | ".join(errors)[:500]
+    problem = " | ".join(errors)
+    if errors and errors[0].startswith(("your previous answer contained no SQL",
+                                        "your previous answer was cut")):
+        problem = last_note or "le modèle n'a renvoyé aucune requête"
+    return "escalade", args.retries + 1, problem[:500]
 
 
 def selftest(args, quiet: bool = False) -> int:
@@ -260,9 +403,8 @@ def selftest(args, quiet: bool = False) -> int:
     t0 = time.perf_counter()
     ok, raw, events = run_opencode(msg, args)
     sec = round(time.perf_counter() - t0)
-    answer = events.get("text") if events.get("json") else \
-        raw.split("\n--- stderr ---\n")[0].strip()
-    if quiet and extract_sql(answer or ""):
+    answer, sql, from_tool = answer_sql(ok, raw, events)
+    if quiet and sql:
         return 0
     if quiet:
         print("\n⚠ Le modèle ne répond pas correctement à une question simple :")
@@ -271,10 +413,11 @@ def selftest(args, quiet: bool = False) -> int:
     print(f"outils tentés    : {', '.join(events.get('tools', [])) or 'aucun'}")
     print(f"raisonnement seul: {'oui' if events.get('reasoning') and not answer else 'non'}")
     print(f"texte reçu       : {answer[:300] if answer else '(aucun)'}")
-    print(f"SQL extrait      : {extract_sql(answer or '') or '(aucun)'}")
-    if not answer:
+    print(f"SQL extrait      : {sql or '(aucun)'}"
+          + ("  (repris de sa tentative d'écriture)" if from_tool else ""))
+    if not sql:
         print("\n--- sortie brute ---\n" + raw[-3000:])
-    return 0 if extract_sql(answer or "") else 1
+    return 0 if sql else 1
 
 
 def main(argv=None) -> int:

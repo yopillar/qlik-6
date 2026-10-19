@@ -41,6 +41,8 @@ def main(argv=None) -> int:
                    help="tables traduites en parallèle")
     p.add_argument("--model", help="provider/model")
     p.add_argument("--opencode-bin", default="opencode")
+    p.add_argument("--skip-selftest", action="store_true",
+                   help="ne pas tester le modèle avant de traduire")
     args = p.parse_args(argv)
 
     scripts = sorted(args.path.glob("*.qvs")) if args.path.is_dir() \
@@ -63,6 +65,8 @@ def main(argv=None) -> int:
             continue
         workdir = WORK / script.stem
         extra = ["--opencode-bin", args.opencode_bin, "--jobs", str(args.jobs)]
+        if args.skip_selftest:
+            extra.append("--skip-selftest")
         if args.model:
             extra += ["--model", args.model]
         if args.pilot:

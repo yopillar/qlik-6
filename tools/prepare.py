@@ -1109,12 +1109,21 @@ translate safely is a CTE marked `TODO(model)`.
 
 Everything you need is in this message: there is no need to read
 documentation, skills or other files, and you cannot write files.
-Answer ONLY with the complete query, every `TODO(model)` CTE replaced by its
-translation, in one single ```sql block.
+
+Answer ONLY with the CTEs that replace the `TODO(model)` CTEs, with the SAME
+names, in one single ```sql block, for example:
+```sql
+cumul_1 AS (
+  -- l.40 : cumul des montants par client
+  SELECT ...
+)
+```
+Do NOT repeat the rest of the query: it is kept as it is. You may add
+helper CTEs before them if needed (new names). Be concise.
 
 # Rules
-1. Keep every part that is already translated EXACTLY as it is.
-2. A `TODO(model)` CTE must keep its name and produce the columns the next
+1. Never rewrite the parts that are already translated.
+2. A `TODO(model)` CTE keeps its name and produces the columns the next
    steps use. Translate the Qlik lines it names (see Qlik code below).
 3. Faithful translation: same column names, same order, same logic.
 4. Use only the views and CTEs that exist (listed in Facts). Never invent a
@@ -1311,6 +1320,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
            for k, g in enumerate((["__init__"] if has_init else []) + order)}
     table_views = {g: view_name(g) for g in order}
     inputs: dict[str, dict] = {}         # vue d'entrée -> location, format
+    final_columns: dict[str, list] = {}  # colonnes produites par chaque section
     missing_conf: set[str] = set()       # fichiers absents de conf/io.yml
 
     def input_view(path: str) -> str:
@@ -1318,7 +1328,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         if conf and conf.enabled and entry is None:
             missing_conf.add(f"entrée {file_stem(path)}")
         view = view_name("in_" + (entry.name if entry else file_stem(path)))
-        inputs[view] = {"path": location, "format": fmt}
+        inputs[view] = {"path": location, "format": fmt,
+                        "columns": file_schema(path)}
         if entry and entry.types:
             inputs[view]["types"] = entry.types
         return view
@@ -1420,8 +1431,10 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         for gs in applicable:
             todos.append(f"réglage global à appliquer : {gs}")
         sec["columns"] = cols or schemas.get(g, [])
+        final_columns[g] = _known(sec["columns"])
         sec["views"] = {v: dict(p) for v, p in inputs.items()}
-        sec["views"].update({table_views[t]: {"table": t}
+        sec["views"].update({table_views[t]: {"table": t,
+                                              "columns": final_columns.get(t)}
                              for t in deps_tables if t in table_views})
         sec["todos"] = todos
         draft_hash = hashlib.sha1(sql.encode()).hexdigest()[:12]
