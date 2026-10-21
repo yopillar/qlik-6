@@ -928,10 +928,21 @@ def build_graph(insts: list[Inst]):
                 last = key
         elif inst.kind == "store" and inst.stored:
             key = ref(inst.stored[0])
+            if key not in tables:
+                # même table écrite avec une autre casse (STORE commandes /
+                # table Commandes) : on la rattache quand même
+                same = [v for n_, v in live.items()
+                        if n_.lower() == inst.stored[0].lower()]
+                key = same[0] if len(same) == 1 else key
             inst.target = key
             if key in tables:
                 tables[key]["stored"].append(inst.stored)
                 tables[key]["insts"].append(k)
+            else:
+                inst.warnings.append(
+                    f"STORE {inst.stored[0]} : table introuvable"
+                    + (" (nom dynamique non résolu)" if "$(" in inst.stored[0]
+                       else "") + " : aucune sortie écrite")
         elif inst.kind == "drop":
             for name in inst.dropped:
                 key = ref(name)
@@ -1388,6 +1399,11 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
     ids = {g: f"{k:03d}_{slug('init' if g == '__init__' else g)}"
            for k, g in enumerate((["__init__"] if has_init else []) + order)}
     table_views = {g: view_name(g) for g in order}
+    # types de colonnes déclarés dans conf/schema (par nom de colonne)
+    conf_types: dict[str, str] = {}
+    if conf:
+        for e in conf.inputs + conf.outputs:
+            conf_types.update(e.types or {})
     inputs: dict[str, dict] = {}         # vue d'entrée -> location, format
     final_columns: dict[str, list] = {}  # colonnes produites par chaque section
     missing_conf: set[str] = set()       # fichiers absents de conf/io.yml
@@ -1496,13 +1512,18 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             table_name=lambda t: tables.get(t, {}).get("name", t),
             graph_schema=lambda t: _known(schemas.get(t)),
             tables_with_field=lambda f: fieldvalue_views(f, produced_now),
+            column_types=conf_types,
             date_format=env.vars.get("DateFormat"),
             timestamp_format=env.vars.get("TimestampFormat"))
         header = (f"-- Section {sec['id']} : table {g}"
                   f" (lignes Qlik {sec['lines'][0]}-{sec['lines'][1]})\n"
                   "-- Traduit depuis Qlik par tools/prepare.py\n")
-        sql, todos, cols, technical, short_sql, holes = translate_section(
+        sql, todos, cols, technical, short_sql, holes, derived = translate_section(
             sec_insts, [i.clean_text for i in sec_insts], ctx, header)
+        # colonnes calculées en date : connues des tables suivantes (un même
+        # nom de champ désigne la même donnée dans le modèle associatif Qlik)
+        for c_, t_ in derived.items():
+            conf_types.setdefault(c_, t_)
         # expressions déjà traduites et validées ailleurs : sans modèle
         known = {h["id"]: cache[hole_key(h)]["sql"] for h in holes
                  if cache.get(hole_key(h), {}).get("verified")}
@@ -1614,6 +1635,10 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             sec["status"] = "todo"
         sections.append(sec)
 
+    for i in insts:
+        for w in i.warnings:
+            if w.startswith("STORE "):
+                notes.append(f"l.{i.stmt.first_line}: {w}")
     if missing_conf:
         notes.append("absents de conf/io.yml (règle par défaut data/input, "
                      "data/output, Parquet) : " + ", ".join(sorted(missing_conf)))

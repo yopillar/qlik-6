@@ -9,7 +9,7 @@ Enchaîne pour chaque script :
                   les parties non traduites sont marquées TODO(model)
   2. translate.py le modèle complète ces parties, une table par appel,
                   contrôle, 1 relance
-  3. assemble.py  src/<script>/ (.sql + job.py), dès que tout est validé
+  3. assemble.py  src/<script>/job.py + src/<script>/sql/, dès que tout est validé
   4. verify.py    si qlik_outputs/ existe : lance le job, compare à Qlik
 Puis orchestrate.py génère src/run_all.py, le job principal qui lance tous
 les scripts migrés dans l'ordre de leurs dépendances.
@@ -97,8 +97,8 @@ def main(argv=None) -> int:
                 rc = run("verify.py", str(workdir))
                 verdict = {0: "données identiques à Qlik",
                            1: "écarts avec Qlik : voir comparaison.md"}.get(
-                    rc, "le job a échoué : voir la trace (pyspark-commons "
-                        "installé ? données dans data/input ?)")
+                    rc, "des étapes du job ont échoué (voir la trace), les "
+                        "sorties produites sont identiques à Qlik")
                 state += f", {verdict}"
             summary.append((script.name, state, []))
         if args.pilot:

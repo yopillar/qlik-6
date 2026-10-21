@@ -28,7 +28,8 @@ TEMPLATE = '''"""Job principal — généré par tools/orchestrate.py, ne pas é
 
 Lance les scripts migrés dans l'ordre de leurs dépendances (un script qui
 lit le fichier écrit par un autre passe après lui), dans une seule session
-Spark. S'arrête au premier échec.
+Spark. Un script en échec n'arrête pas les autres ; ceux qui en dépendent ne
+sont pas lancés. Code retour 1 s'il y a eu un échec.
 """
 
 import argparse
@@ -75,16 +76,33 @@ def main(argv=None) -> int:
 
     spark = SparkSession.builder.appName("run_all").getOrCreate()
     t_all = time.perf_counter()
+    deps = dict(ORDER)
+    failed, skipped = [], []
     for name in names:
+        blocked = [d for d in deps.get(name, []) if d in failed + skipped]
+        if blocked:
+            # il lirait des données absentes ou anciennes : on ne le lance pas
+            logger.error("%s non lancé : dépend de %s en échec", name,
+                         ", ".join(blocked))
+            skipped.append(name)
+            continue
         logger.info("=== %s", name)
         t0 = time.perf_counter()
         try:
-            _load(name).main(spark)
+            steps_failed = _load(name).main(spark)
         except Exception:
-            logger.exception("Échec de %s : arrêt. Reprendre avec "
-                             "--from %s", name, name)
-            return 1
-        logger.info("%s terminé en %.0fs", name, time.perf_counter() - t0)
+            logger.exception("Échec de %s", name)
+            steps_failed = ["job"]
+        if steps_failed:
+            failed.append(name)
+            logger.error("%s : %d étape(s) en échec", name, len(steps_failed))
+        else:
+            logger.info("%s terminé en %.0fs", name, time.perf_counter() - t0)
+    if failed or skipped:
+        logger.error("En échec : %s ; non lancés : %s. Reprendre avec --from "
+                     "<script> une fois corrigé.", ", ".join(failed) or "aucun",
+                     ", ".join(skipped) or "aucun")
+        return 1
     logger.info("Terminé : %d script(s) en %.0fs", len(names),
                 time.perf_counter() - t_all)
     return 0

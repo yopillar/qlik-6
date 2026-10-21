@@ -56,6 +56,7 @@ def main(argv=None) -> int:
     stem = Path(manifest["script"]).stem
     job = Path("src") / stem / "job.py"
 
+    job_failed = False
     if not args.no_run:
         if not job.exists():
             print(f"{job} absent : lance d'abord l'assemblage.")
@@ -63,8 +64,10 @@ def main(argv=None) -> int:
         print(f"Exécution de {job} …")
         res = subprocess.run([sys.executable, str(job)])
         if res.returncode:
-            print("Le job a échoué : voir la trace ci-dessus.")
-            return 2
+            # étapes isolées : on compare quand même ce qui a été produit
+            print("⚠ Une ou plusieurs étapes du job ont échoué (voir la trace "
+                  "ci-dessus) : comparaison de ce qui a été produit.")
+            job_failed = True
 
     verified: dict = {}
     report, n_ok, n_ko, n_none = [f"# Comparaison des sorties de `{stem}`", ""], 0, 0, 0
@@ -119,6 +122,8 @@ def main(argv=None) -> int:
                      encoding="utf-8")
     print(f"\n{n_ok} identique(s), {n_ko} différente(s), {n_none} sans "
           f"référence -> {args.workdir / 'comparaison.md'}")
+    if job_failed and not n_ko:
+        return 2
     return 1 if n_ko else 0
 
 

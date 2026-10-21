@@ -1,12 +1,13 @@
-"""Assemble un script traduit dans src/<script>/ : les .sql + job.py.
+"""Assemble un script traduit : src/<script>/job.py + src/<script>/sql/*.sql.
 
-Chaque section validée (ok ou deterministic) devient src/<script>/NN_<table>.sql,
-dans l'ordre du script. job.py (gabarit : tools/job_template.py) expose les
+Chaque section validée (ok ou deterministic) devient
+src/<script>/sql/NN_<table>.sql, dans l'ordre du script. Le job
+src/<script>/job.py (gabarit : tools/job_template.py) expose les
 fichiers lus comme vues, exécute les requêtes dans l'ordre et écrit les
 sorties. Mécanique pure : aucune décision n'est laissée au modèle.
 
 Usage :
-    python tools/assemble.py work/ventes             # -> src/ventes/
+    python tools/assemble.py work/ventes   # -> src/ventes/job.py + src/ventes/sql/
     python tools/assemble.py work/ventes --partial   # ignore les tables non validées
 """
 
@@ -40,7 +41,7 @@ def main(argv=None) -> int:
         return 1
 
     stem = Path(manifest["script"]).stem
-    out = Path("src") / stem
+    out = Path("src") / stem / "sql"
     if out.exists():
         for old in out.glob("*.sql"):
             old.unlink()
@@ -60,11 +61,14 @@ def main(argv=None) -> int:
         fmt = s.get("output_formats", {}).get(s["table"], "parquet")
         steps.append(f"    ({name!r}, {s['view']!r}, {output!r}, {fmt!r}),")
 
-    (out / "job.py").write_text(JOB.format(
+    if not any(s.get("outputs") for s in secs if s["id"] not in pending):
+        print("⚠ aucune sortie : aucun STORE du script n'a été rattaché à une "
+              "table (voir les notes de work/<script>/rapport.md)")
+    (Path("src") / stem / "job.py").write_text(JOB.format(
         stem=stem, script=manifest["script"],
         inputs="\n".join(f"    {v!r}: {p!r}," for v, p in sorted(inputs.items())),
         steps="\n".join(steps)), encoding="utf-8")
-    print(f"{out}/ : {len(steps)} requête(s) + job.py"
+    print(f"src/{stem}/job.py + {out}/ : {len(steps)} requête(s)"
           + (f", {len(pending)} ignorée(s)" if pending else ""))
     return 0
 

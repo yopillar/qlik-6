@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 
 # Colonne technique portée par TOUTES les tables : l'ordre de chargement Qlik.
-# Créée à la lecture (job.py), propagée par chaque étape selon les règles de
+# Créée à la lecture (job du script), propagée par chaque étape selon les règles de
 # Qlik, écrite dans les sorties : le script suivant hérite de l'ordre exact.
 # Type array<bigint>, comparé élément par élément : une concaténation préfixe
 # 0 (lignes existantes) ou 1 (lignes ajoutées) sans renuméroter la table.
@@ -129,6 +129,7 @@ class ExprCtx:
     order_by: str | None = None               # ORDER BY du LOAD (RowNo/RecNo)
     in_where: bool = False
     exists: object = None                     # callback Exists(champ, valeur)
+    column_types: dict = field(default_factory=dict)   # types de conf/schema
     order_key: str | None = None              # clé d'ordre (FirstValue…)
     output_field: object = None               # champ du LOAD en cours (Peek)
     peek_table: object = None                 # Peek('f', n, 'T')
@@ -144,6 +145,39 @@ class Bool(str):
 
 class DateSql(str):
     """Expression SQL de type DATE (Date(), MakeDate(), Today()…)."""
+
+
+class TsSql(DateSql):
+    """Expression SQL de type TIMESTAMP (Timestamp(), Now()…)."""
+
+
+class StrField(str):
+    """Colonne déclarée texte dans conf/schema. Qlik interprète au chargement
+    un texte au format DateFormat comme une date : Spark non."""
+
+
+DATE_TYPES = ("date",)
+TS_TYPES = ("timestamp", "datetime")
+STR_TYPES = ("string", "str", "text", "varchar", "char")
+
+
+def parse_date(sql: str, ctx) -> DateSql:
+    """Texte -> date, au format DateFormat du script (sinon ISO)."""
+    fmt = None
+    if ctx.date_format:
+        try:
+            fmt = qlik_format_to_spark(ctx.date_format)
+        except Untranslatable:
+            fmt = None
+    if not fmt or fmt == "yyyy-MM-dd":
+        return DateSql(f"try_cast({sql} AS DATE)")
+    return DateSql(f"COALESCE(CAST(try_to_timestamp(CAST({sql} AS STRING), "
+                   f"{sql_string(fmt)}) AS DATE), try_cast({sql} AS DATE))")
+
+
+def as_date(sql: str, ctx) -> str:
+    """Argument d'une fonction de date : un texte est d'abord interprété."""
+    return parse_date(sql, ctx) if isinstance(sql, StrField) else sql
 
 
 def as_value(sql: str) -> str:
@@ -214,7 +248,13 @@ class ExprParser:
         kind, v = self.peek()
         if kind == "op" and v in ("=", "<>", "<", ">", "<=", ">="):
             self.take()
-            return Bool(f"({as_value(left)} {v} {as_value(self.p_concat())})")
+            right = self.p_concat()
+            # date comparée à un texte : Qlik l'interprète comme une date
+            if isinstance(left, DateSql) and isinstance(right, StrField):
+                right = parse_date(right, self.ctx)
+            elif isinstance(right, DateSql) and isinstance(left, StrField):
+                left = parse_date(left, self.ctx)
+            return Bool(f"({as_value(left)} {v} {as_value(right)})")
         if (kind, v) == ("kw", "LIKE"):
             self.take()
             pk, pv = self.take()
@@ -245,9 +285,17 @@ class ExprParser:
         while self.peek() in (("op", "+"), ("op", "-")):
             op = self.take()[1]
             right = self.p_mul()
+            if op == "-" and isinstance(left, DateSql) and isinstance(right, StrField):
+                right = parse_date(right, self.ctx)
+            if op == "-" and isinstance(left, StrField) and isinstance(right, DateSql):
+                left = parse_date(left, self.ctx)
             if op == "-" and isinstance(left, DateSql) and isinstance(right, DateSql):
                 # Qlik : une date est un nombre de jours, date - date = jours
-                left = f"datediff({left}, {right})"
+                if isinstance(left, TsSql) or isinstance(right, TsSql):
+                    left = (f"((unix_timestamp({left}) - unix_timestamp({right}))"
+                            " / 86400.0)")
+                else:
+                    left = f"datediff({left}, {right})"
             elif isinstance(left, DateSql) and not isinstance(right, DateSql):
                 left = DateSql(f"({left} {op} {as_value(right)})")   # date ± jours
             else:
@@ -289,7 +337,15 @@ class ExprParser:
 
     def field(self, name: str) -> str:
         q = f"{self.ctx.qualifier}." if self.ctx.qualifier else ""
-        return q + ident(name)
+        sql = q + ident(name)
+        t = str(self.ctx.column_types.get(name, "")).lower().split("(")[0]
+        if t in TS_TYPES:
+            return TsSql(sql)
+        if t in DATE_TYPES:
+            return DateSql(sql)
+        if t in STR_TYPES:
+            return StrField(sql)
+        return sql
 
     def call(self, name: str) -> str:
         self.expect("(")
@@ -382,10 +438,36 @@ def qlik_format_to_spark(fmt: str) -> str:
     return "".join(out)
 
 
+DATE_ARG_FUNCTIONS = {"year", "month", "day", "weekday", "week", "weekyear",
+                      "monthstart", "yearstart", "monthend", "addmonths",
+                      "addyears"}
+
+
 def translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
+    n = name.lower()
+    if n in DATE_ARG_FUNCTIONS and a:
+        a = [as_date(a[0], ctx)] + a[1:]
+    if n in ("floor", "ceil") and len(a) == 1 and isinstance(a[0], DateSql):
+        # Qlik : une date est un nombre, Floor garde le jour ; Spark refuse
+        # floor() sur une date
+        x = a[0]
+        if not isinstance(x, TsSql):
+            return DateSql(x)
+        if n == "floor":
+            return DateSql(f"CAST({x} AS DATE)")
+        return DateSql(f"CASE WHEN {x} = CAST(CAST({x} AS DATE) AS TIMESTAMP) "
+                       f"THEN CAST({x} AS DATE) ELSE date_add(CAST({x} AS DATE), "
+                       f"1) END")
+    if n == "date" and a and isinstance(a[0], StrField):
+        return parse_date(a[0], ctx)
+    if n == "date" and a and isinstance(a[0], DateSql):
+        return DateSql(a[0] if not isinstance(a[0], TsSql)
+                       else f"CAST({a[0]} AS DATE)")
     sql = _translate_function(name, a, raw, distinct, ctx)
-    if name.lower() in ("date", "date#", "makedate", "today", "addmonths",
-                        "addyears", "monthstart", "yearstart", "monthend"):
+    if n in ("timestamp", "timestamp#", "now"):
+        return TsSql(sql)
+    if n in ("date", "date#", "makedate", "today", "addmonths",
+             "addyears", "monthstart", "yearstart", "monthend"):
         return DateSql(sql)
     return sql
 
@@ -890,6 +972,7 @@ class SectionContext:
     table_name: object          # clé -> nom Qlik (pour KEEP)
     graph_schema: object        # clé -> colonnes calculées par le graphe
     tables_with_field: object = lambda f: []   # vues amont contenant le champ
+    column_types: dict = field(default_factory=dict)  # conf/schema, par colonne
     date_format: str | None = None
     timestamp_format: str | None = None
 
@@ -903,6 +986,7 @@ class SectionTranslator:
         self.notes: list[str] = []
         self.todos: list[str] = []
         self.holes: list[dict] = []        # expressions laissées au modèle
+        self.derived_types: dict[str, str] = {}   # colonnes calculées en date
         self.counter: dict[str, int] = {}
         self.technical: list[str] = []         # colonnes AutoNumber / Hash
         self.autogen_bottom = None             # "recno" | "fieldvalue" | None
@@ -1080,6 +1164,9 @@ class SectionTranslator:
             values.append(sql)
             if ectx.technical and (alias or e):
                 self.technical.append(alias or e.strip("[]\""))
+            if alias and isinstance(sql, DateSql):
+                self.derived_types[alias] = "timestamp" if isinstance(sql, TsSql) \
+                    else "date"
             if alias is None:
                 if not re.fullmatch(r"\[[^\]]+\]|\"[^\"]+\"|[^\W\d][\w.#%@$]*", e):
                     raise Untranslatable(f"expression sans alias : {e[:40]}")
@@ -1150,6 +1237,7 @@ class SectionTranslator:
                        self.ctx.timestamp_format)
         ectx.peek_table = self.peek_table_sql
         ectx.noofrows = self.noofrows_sql
+        ectx.column_types = {**self.derived_types, **self.ctx.column_types}
         return ectx
 
     def table_ref(self, name: str) -> str:
@@ -1618,4 +1706,4 @@ def translate_section(insts, texts, ctx: SectionContext, header: str):
         sql, cols = header + f"-- TODO(model): {exc}\n", None
         short = sql
     return sql, tr.todos, cols, list(dict.fromkeys(tr.technical)), short, \
-        tr.holes
+        tr.holes, tr.derived_types

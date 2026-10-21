@@ -1,7 +1,8 @@
 # Migration Qlik → Spark SQL
 
-Un script Qlik devient **des requêtes Spark SQL** (une par table) et **un
-`job.py` court** qui les enchaîne en n'appelant que `pyspark-commons`.
+Un script Qlik devient un dossier `src/<script>/` : **des requêtes Spark SQL**
+(une par table, dans `src/<script>/sql/`) et **un job court**
+(`src/<script>/job.py`) qui les enchaîne en n'appelant que `pyspark-commons`.
 
 Le Python traduit lui-même la majorité du code Qlik (sans modèle). Le
 modèle n'est appelé que pour les parties qu'il ne sait pas traduire avec
@@ -17,7 +18,8 @@ mon-projet/
 ├── data/input/          données lues (si absentes de conf/io.yml)    (toi)
 ├── qlik_outputs/        sorties Qlik pour comparer, optionnel        (toi)
 ├── data/output/         données écrites par les jobs                 (généré)
-├── src/<script>/        01_<table>.sql, 02_<table>.sql…, job.py      (généré)
+├── src/<script>/job.py  job du script                                (généré)
+├── src/<script>/sql/    01_<table>.sql, 02_<table>.sql…              (généré)
 ├── src/run_all.py       job principal : tous les scripts, dans l'ordre (généré)
 ├── work/                travail intermédiaire + journal.csv          (généré)
 ├── .opencode/agents/translator.md
@@ -30,7 +32,7 @@ mon-projet/
 
 - `spark-foundation-core` (interne, PySpark) : jamais appelée directement
   par le code généré.
-- `pyspark-commons` (pour les gens de Qlik) : le `job.py` généré n'utilise
+- `pyspark-commons` (pour les gens de Qlik) : le job généré n'utilise
   que `read`, `write`, `timer` et `setup_logging`. Ces appels sont tous dans
   `tools/job_template.py` : si une signature change, on corrige ce seul
   fichier et on relance `migrate.py`.
@@ -45,7 +47,7 @@ python src/run_all.py                                     # exécuter le résult
 
 Pour chaque script : traduction sans modèle, complétion des `TODO(model)`
 par le modèle (une table par appel, syntaxe validée par le parseur Spark,
-une relance si erreur), assemblage dans `src/<script>/`, puis, si
+une relance si erreur), assemblage dans `src/`, puis, si
 `qlik_outputs/` existe, exécution et comparaison avec Qlik.
 Relançable à volonté : ce qui est fait et inchangé n'est pas refait.
 
@@ -61,9 +63,8 @@ modèle et ce qui reste à compléter, avec la raison.
 - **Booléens à la Qlik** : vrai vaut -1, faux 0, et tout nombre non nul est
   vrai dans une condition.
 - `WHERE`, `GROUP BY`, `ORDER BY`, `DISTINCT`, `FIRST n`, LOAD empilés.
-- Sources : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple,
-  `AUTOGENERATE n`, `AUTOGENERATE 1 WHILE … IterNo()` (calendriers),
-  `AUTOGENERATE FieldValueCount()`.
+- Sources : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple, et
+  `AUTOGENERATE` (voir ci-dessous).
 - **Ordre de chargement Qlik** (voir plus bas) : `RowNo`, `RecNo`, `Previous`,
   `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre table),
   `FirstValue`, `LastValue`, `NoOfRows`, `FIRST n`, `DISTINCT` et mappings
@@ -72,7 +73,12 @@ modèle et ce qui reste à compléter, avec la raison.
   quand le LOAD charge lui-même le champ.
 - Variables `LET` calculées (`Peek`, `NoOfRows`, `Today()`…) : remplacées par
   leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
-- Dates à la Qlik : `date - date` donne un nombre de jours.
+- Dates à la Qlik : `date - date` donne un nombre de jours ; `Floor`/`Ceil`
+  d'une date ou d'un horodatage gardent le jour ; une colonne texte
+  (`conf/schema`) au format `DateFormat` du script (`DD/MM/YYYY`…) est
+  interprétée comme une date dans les calculs, comparaisons et fonctions de
+  date, comme Qlik le fait au chargement.
+- Noms de champs sensibles à la casse, comme dans Qlik.
 - `Dual(texte, nombre)` : le texte est gardé (Parquet n'a qu'un type).
 - `JOIN` (clés implicites, ordre des colonnes de Qlik), `KEEP`,
   `CONCATENATE`, auto-concaténation, `DROP FIELD`.
@@ -85,6 +91,20 @@ modèle et ce qui reste à compléter, avec la raison.
   `EXIT SCRIPT;` est ignoré.
 - Apostrophes : `'l''été'` (Qlik) devient `"l'été"`. En Spark SQL, `''` colle
   deux chaînes (« lété ») : `check.py` le refuse dans une requête.
+
+## `AUTOGENERATE` : toujours traduit sans modèle
+
+| Forme Qlik | Spark SQL généré |
+|---|---|
+| `AUTOGENERATE 10` | `range(1, 11)` |
+| `AUTOGENERATE vMax - vMin + 1` (variables, même `LET` calculées par `Peek`) | `explode(sequence(1, <expression>))` |
+| `AUTOGENERATE 1 WHILE <condition sur IterNo()>` (calendriers) | une ligne par itération, jusqu'à la première fausse, comme Qlik (au plus 100 000) |
+| `AUTOGENERATE FieldValueCount('F')` avec `FieldValue('F', RecNo())` | valeurs distinctes du champ `F` dans toutes les tables déjà chargées |
+
+`RecNo()`, `RowNo()` et `IterNo()` y sont exacts. Le modèle n'est appelé dans
+une table qui contient un `AUTOGENERATE` que pour **une autre expression**
+de cette table qu'il faut compléter, ou si la borne dépend d'une variable
+introuvable (boucle, include) : le rapport l'indique alors.
 
 ## L'ordre des lignes, comme dans Qlik
 
@@ -110,7 +130,7 @@ le bon.
 
 Chaque fichier Qlik est rattaché à l'entrée (ou la sortie) de `conf/io.yml`
 de même nom, ou dont la `location` porte ce nom. Sa `location` et son
-`format` sont utilisés par `job.py` ; son `schema_file` donne les colonnes
+`format` sont utilisés par le job ; son `schema_file` donne les colonnes
 (les `LOAD *` deviennent traduisibles sans aucune donnée) et leurs types.
 
 ```bash
@@ -217,8 +237,8 @@ Une table en `escalade` n'est jamais retraduite automatiquement.
 | `translate.py` | le modèle complète les `TODO(model)` |
 | `check.py` | contrôles, syntaxe Spark avec `--parse` |
 | `conf.py` | lecture de `conf/io.yml` et des schémas |
-| `assemble.py` | `src/<script>/` : les `.sql` + `job.py` |
-| `job_template.py` | gabarit du `job.py`, seuls appels à `pyspark-commons` |
+| `assemble.py` | `src/<script>/job.py` + `src/<script>/sql/*.sql` |
+| `job_template.py` | gabarit du job, seuls appels à `pyspark-commons` |
 | `verify.py` | lance le job, compare avec `qlik_outputs/` |
 | `compare.py` | comparaison de deux tables |
 | `orchestrate.py` | `src/run_all.py`, ordre des scripts entre eux |
@@ -233,7 +253,6 @@ Une table en `escalade` n'est jamais retraduite automatiquement.
 - `JOIN` (ordre des lignes) : Qlik ne documente pas l'ordre après une
   jointure ; la règle « gauche puis lignes sans correspondance » est à
   confirmer par la comparaison.
-- `AUTOGENERATE 1 WHILE` : au plus 100 000 itérations.
 - `ApplyMap` : en cas de clés en double, Qlik garde la première valeur, la
   traduction prend la plus petite.
 - `Date(x)` sur un nombre (date Qlik en jours) n'est pas converti.
