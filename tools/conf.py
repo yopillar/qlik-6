@@ -14,6 +14,7 @@ l'une des deux rangée sous une clé columns, fields ou schema.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -21,6 +22,22 @@ from pathlib import Path
 
 CONF = Path("conf")
 IO_FILE = CONF / "io.yml"
+
+
+def resolve_location(location: str, variables: dict | None = None) -> str:
+    """Remplace les ${var} d'une location (${entrees}, ${sorties}…).
+
+    C'est le socle qui les résout quand le job tourne. Le kit n'en a besoin
+    que pour aller voir les fichiers lui-même (comparaison avec Qlik,
+    colonnes d'un Parquet) : on prend les valeurs passées en paramètre,
+    sinon les variables d'environnement. Une variable inconnue reste telle
+    quelle, et le chemin n'existera simplement pas."""
+    def repl(m):
+        name = m.group(1)
+        if variables and name in variables:
+            return variables[name]
+        return os.environ.get(name, m.group(0))
+    return re.sub(r"\$\{(\w+)\}", repl, location)
 
 
 @dataclass

@@ -49,6 +49,9 @@ def main(argv=None) -> int:
     p.add_argument("--opencode-bin", default="opencode")
     p.add_argument("--skip-selftest", action="store_true",
                    help="ne pas tester le modèle avant de traduire")
+    p.add_argument("--var", action="append", default=[], metavar="NOM=VALEUR",
+                   help="variable des locations de conf/io.yml, pour la "
+                        "comparaison (ex. --var sorties=data/output)")
     args = p.parse_args(argv)
 
     scripts = sorted(args.path.glob("*.qvs")) if args.path.is_dir() \
@@ -98,12 +101,15 @@ def main(argv=None) -> int:
         if todo or to_fix:
             summary.append((script.name, f"{todo} à traduire, {len(to_fix)} "
                             "à corriger à la main", to_fix))
+        elif run("assemble.py", str(workdir)):
+            summary.append((script.name, "non assemblé : entrées ou sorties "
+                            "absentes de conf/io.yml (voir ci-dessus)", []))
         else:
-            run("assemble.py", str(workdir))
             run("orchestrate.py")      # ajoute ce script au job
             state = "assemblé dans src/"
             if compare:
-                rc = run("verify.py", str(workdir))
+                rc = run("verify.py", str(workdir),
+                         *[f"--var={v}" for v in args.var])
                 verdict = {0: "données identiques à Qlik",
                            1: "écarts avec Qlik : voir comparaison.md"}.get(
                     rc, "des étapes du job ont échoué (voir la trace), les "

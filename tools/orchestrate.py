@@ -71,8 +71,8 @@ def main(argv=None) -> int:
     blocks = []
     for s, d in ready:
         a = json.loads(assembled[s].read_text(encoding="utf-8"))
-        inputs = "\n".join(f"            {v!r}: {tuple(p)!r},"
-                           for v, p in a["inputs"].items())
+        inputs = "\n".join(f"            {v!r}: {io_name!r},"
+                           for v, io_name in a["inputs"].items())
         steps = "\n".join(f"            {tuple(st)!r}," for st in a["steps"])
         blocks.append(f"    {stem[s]!r}: {{\n"
                       f"        \"depends_on\": {[stem[x] for x in d]!r},\n"
@@ -80,6 +80,12 @@ def main(argv=None) -> int:
                       f"        \"steps\": [\n{steps}\n        ],\n    }},")
     out = project_dir()
     out.mkdir(parents=True, exist_ok=True)
+    # src/<nom-projet>/ est un package Python, comme dp_test. On ne crée le
+    # __init__.py que s'il manque, pour ne pas écraser ce qu'on y aurait mis.
+    if not (out / "__init__.py").exists():
+        (out / "__init__.py").write_text(
+            f'"""Projet {project_name()} migré depuis Qlik."""\n',
+            encoding="utf-8")
     code = JOB.format(project=project_name(), scripts="\n".join(blocks))
     # on s'assure que le job compile avant de l'écrire
     compile(code, str(out / "job.py"), "exec")

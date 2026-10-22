@@ -13,6 +13,11 @@ n'a pas pu tourner.
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
     python tools/verify.py work/ventes --no-run   # compare seulement
+    python tools/verify.py work/ventes --var sorties=data/output
+
+Les locations de conf/io.yml contiennent des variables (${sorties}…) que
+le socle résout à l'exécution. Pour retrouver les fichiers, on les prend
+dans --var, sinon dans l'environnement.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
+from conf import resolve_location  # noqa: E402
 from job_template import project_dir  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
@@ -52,7 +58,12 @@ def main(argv=None) -> int:
                    help="ne pas relancer le job (sorties déjà produites)")
     p.add_argument("--ignore", nargs="*", default=[],
                    help="colonnes à exclure (ex. date de chargement)")
+    p.add_argument("--var", action="append", default=[], metavar="NOM=VALEUR",
+                   help="valeur d'une variable des locations de conf/io.yml "
+                        "(ex. --var sorties=data/output), sinon "
+                        "l'environnement")
     args = p.parse_args(argv)
+    variables = dict(v.split("=", 1) for v in args.var if "=" in v)
 
     mpath = args.workdir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
@@ -77,13 +88,22 @@ def main(argv=None) -> int:
     verified: dict = {}
     report, n_ok, n_ko, n_none = [f"# Comparaison des sorties de `{stem}`", ""], 0, 0, 0
     for sec in manifest["sections"]:
-        for table, out_path in sec.get("outputs", {}).items():
-            name = Path(out_path).name
-            ref = find_reference(name)
+        for table, location in sec.get("outputs", {}).items():
+            out_path = resolve_location(location, variables)
+            # L'export Qlik peut porter le nom de la sortie dans io.yml ou
+            # celui du fichier de sa location (ils diffèrent parfois).
+            names = list(dict.fromkeys(filter(None, (
+                sec.get("output_io", {}).get(table), Path(out_path).name))))
+            ref = next(filter(None, map(find_reference, names)), None)
             if ref is None:
                 verdict, detail = "pas de référence", \
-                    f"aucun fichier {name}.* dans {QLIK_DIR}/"
+                    f"aucun fichier {' ou '.join(names)}.* dans {QLIK_DIR}/"
                 n_none += 1
+            elif "${" in out_path:
+                verdict, detail = "sortie introuvable", (
+                    f"{location} : variable inconnue, la passer avec "
+                    "--var nom=chemin")
+                n_ko += 1
             elif not Path(out_path).exists():
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1

@@ -2,7 +2,8 @@
 
 Chaque script Qlik est traduit en requêtes Spark SQL, une par table, rangées
 dans `src/<nom-projet>/sql/`. Un job unique, `src/<nom-projet>/job.py`, les
-enchaîne pour tout le projet et ne passe que par `pyspark-commons`.
+enchaîne pour tout le projet en s'appuyant sur le socle technique
+`spark-foundation-core`.
 
 L'essentiel de la traduction est fait en Python, sans modèle. On n'appelle
 le modèle que pour les morceaux qu'on ne sait pas traduire à coup sûr. Ils
@@ -28,20 +29,27 @@ mon-projet/
 ```
 
 `<nom-projet>` est le nom du dossier du projet, ou la valeur de la variable
-`QLIK_PROJECT` si elle est définie. Tous les scripts partagent le même
+`QLIK_PROJECT` si elle est définie. Comme `src/<nom-projet>/` est un package
+Python (le kit y crée un `__init__.py` s'il manque) et que ce nom est aussi
+celui du traitement passé à `@pipeline`, il est ramené à un identifiant
+Python : `mon-projet` devient `mon_projet`. Tous les scripts partagent le même
 dossier `sql/`, d'où le préfixe `<script>__` dans les noms de fichiers : deux
 scripts peuvent avoir une table du même nom. Le numéro suit l'ordre des
 tables dans le script.
 
 ## Les deux bibliothèques
 
-- `spark-foundation-core` (interne, PySpark) : le code généré ne l'appelle
-  jamais directement.
-- `pyspark-commons` (pensée pour les gens qui viennent de Qlik) : le job
-  n'utilise que `get_local_spark_session`, `read`, `write`, `timer` et
-  `setup_logging`. Tous ces appels sont regroupés dans
-  `tools/job_template.py`. Si une signature change, on corrige ce fichier
-  et on relance `migrate.py`, rien d'autre à toucher.
+- `spark-foundation-core` (importé `spark_foundation`) : le socle
+  technique. Il crée la session, configure les logs, et lit ou écrit chaque
+  entrée et sortie à partir de son nom dans `conf/io.yml`. Le job utilise
+  `pipeline`, `read_input` et `write_output`, comme n'importe quel job du
+  socle.
+- `pyspark-commons` : ne garde plus que des fonctions de transformation. Le
+  SQL généré n'en a pas besoin, donc le job ne l'importe pas.
+
+Tous les appels au socle sont regroupés dans `tools/job_template.py`. Si
+son API change, on corrige ce fichier et on relance `migrate.py`, rien
+d'autre à toucher.
 
 ## La commande
 
@@ -75,14 +83,17 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
   un fichier écrit par un autre passe après lui, comme avec l'enchaînement
   des tâches de rechargement dans Qlik. L'ordre est calculé à partir de
   `work/stores.json`, qui recense ce que chaque script lit et écrit.
-- La session Spark est créée par
-  `pyspark_commons.session.get_local_spark_session()`.
-- Les chemins relatifs partent de la racine du projet, peu importe le
-  dossier d'où on lance le job. Les `s3a://…` et les chemins absolus sont
-  pris tels quels.
+- Le job a la forme habituelle du socle : une fonction
+  `run(spark, args)` décorée par `@pipeline("<nom-projet>")`, lancée par
+  `raise SystemExit(run())`. C'est le socle qui fournit la session.
+- Les lectures et écritures passent par `read_input("<nom>")` et
+  `write_output(df, "<nom>")`, avec les noms de `conf/io.yml`. La location,
+  le format et la résolution des chemins relatifs sont donc l'affaire du
+  socle.
 - Une lecture ou une étape SQL qui plante est loggée, et les suivantes
-  continuent. Un script qui dépend d'un script en échec n'est pas lancé, et
-  le job sort avec le code 1 s'il y a eu le moindre échec.
+  continuent. Un script qui dépend d'un script en échec n'est pas lancé. À
+  la fin, s'il y a eu le moindre échec, le job lève une erreur qui liste les
+  scripts concernés.
 - Les vues d'un script sont supprimées quand il a fini, pour que deux
   scripts puissent avoir une table du même nom.
 - Chaque `STORE` du script Qlik devient une écriture. Un `STORE` qu'on
@@ -176,18 +187,48 @@ défaut, l'ordre de lecture d'un fichier Parquet unique convient.
 
 Chaque fichier lu ou écrit par le script Qlik est rattaché à l'entrée (ou la
 sortie) de `conf/io.yml` qui porte le même nom, ou dont la `location` porte
-ce nom. Le job utilise sa `location` et son `format`. Son `schema_file`
-donne les colonnes et leurs types, ce qui permet de traduire les `LOAD *`
-sans avoir les données.
+ce nom. Le job passe ce nom à `read_input()` ou `write_output()`. Le
+`schema_file` donne les colonnes et leurs types, ce qui permet de traduire
+les `LOAD *` sans avoir les données.
 
 ```bash
 python tools/conf.py      # pour voir ce qui a été compris de conf/io.yml
 ```
 
-Un fichier absent de `conf/io.yml` suit la règle par défaut : s'il est écrit
-par un `STORE`, il va dans `data/output/<nom>`, sinon il est lu dans
-`data/input/<nom>`, en Parquet dans les deux cas. Le rapport liste ces
-fichiers.
+```yaml
+input:
+  sites:
+    format: csv
+    schema_file: schemas/sites.yml
+    location: ${entrees}/sites.csv
+outputs:
+  disponibilite_equipement:
+    location: ${sorties}/disponibilite_equipement
+```
+
+Comme le socle ne lit et n'écrit que par nom, tout fichier lu ou écrit par
+un script doit être déclaré dans `conf/io.yml`. Une lecture se cherche dans
+`input`, une écriture dans `outputs`. Un fichier produit par un script et lu
+par un autre doit donc apparaître dans les deux sections, avec la même
+location : `read_input()` ne lit que ce qui est déclaré en entrée. Le rapport liste ceux qui
+manquent, et `assemble.py` refuse d'assembler un script tant qu'il en reste.
+`migrate.py` l'indique alors dans son résumé. Pour la traduction elle-même,
+un fichier non déclaré est cherché par défaut dans `data/input/<nom>` (ou
+`data/output/<nom>` s'il est écrit par un `STORE`), ce qui permet d'avancer
+sur les requêtes en attendant de compléter `conf/io.yml`.
+
+Les variables des locations (`${entrees}`, `${sorties}`…) sont résolues par
+le socle quand le job tourne. Le kit, lui, en a besoin pour aller lire les
+sorties au moment de la comparaison avec Qlik : on les lui donne avec
+`--var` (ou par des variables d'environnement du même nom).
+
+```bash
+python tools/migrate.py script_qvd/ --var sorties=data/output
+python tools/verify.py work/ventes --no-run --var sorties=data/output
+```
+
+Pour la comparaison, l'export Qlik de `data/qlik_outputs/` peut porter le
+nom de la sortie dans `io.yml` ou celui du fichier de sa location.
 
 ## Le modèle ne traduit que des petits morceaux
 
@@ -296,7 +337,7 @@ veut la refaire exprès).
 | `check.py` | contrôles, et syntaxe Spark avec `--parse` |
 | `conf.py` | lecture de `conf/io.yml` et des schémas |
 | `assemble.py` | copie des requêtes d'un script dans `src/<nom-projet>/sql/` |
-| `job_template.py` | gabarit du job, le seul endroit qui appelle `pyspark-commons` |
+| `job_template.py` | gabarit du job, le seul endroit qui appelle `spark-foundation-core` |
 | `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
 | `compare.py` | comparaison de deux tables |
 | `orchestrate.py` | génère `src/<nom-projet>/job.py` et ordonne les scripts |
@@ -319,5 +360,9 @@ veut la refaire exprès).
 - L'ordre entre scripts ne tient compte que des fichiers, pas des tables en
   base de données.
 - Testé avec Spark 4.0 en local (la cible est la 3.5.8) et une version
-  bouchonnée de `pyspark-commons` qui reproduit son API. Pas encore testé
-  avec un vrai opencode.
+  bouchonnée de `spark-foundation-core` qui reproduit l'API vue dans le job
+  `dp_test`. Pas encore testé avec le vrai socle ni avec un vrai opencode.
+- Ce qu'on suppose du socle sans l'avoir vérifié : `@pipeline` passe à
+  `run()` les arguments de la ligne de commande (pour `--from` et
+  `--only`), et une exception levée dans `run()` donne un code retour non
+  nul (`verify.py` s'en sert pour savoir si le job a planté).

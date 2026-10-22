@@ -1,16 +1,23 @@
 """Gabarit de src/<nom-projet>/job.py, le job du projet.
 
-Tout le code généré passe par ici pour appeler pyspark-commons, et nulle
-part ailleurs. Si une signature change dans la lib, on corrige ce fichier
-et on relance python tools/orchestrate.py (ou migrate.py).
+Le job s'appuie sur spark-foundation-core, le socle technique : c'est lui
+qui crée la session Spark, configure les logs et sait où lire et écrire
+chaque entrée et sortie déclarée dans conf/io.yml. pyspark-commons ne garde
+que les fonctions de transformation, dont le SQL généré n'a pas besoin : le
+job ne l'importe donc plus.
 
-Fonctions de pyspark-commons utilisées (signatures supposées, pas encore
-vérifiées sur le vrai code) :
-    pyspark_commons.session.get_local_spark_session()
-    pyspark_commons.io.read(spark, path, fmt) -> DataFrame
-    pyspark_commons.io.write(df, path, fmt, mode)
-    pyspark_commons.monitoring.timer(label)      (context manager)
-    pyspark_commons.logger.setup_logging()
+Tout le code généré passe par ici pour appeler le socle, et nulle part
+ailleurs. Si son API change, on corrige ce fichier et on relance
+python tools/orchestrate.py (ou migrate.py).
+
+API du socle utilisée, d'après un job existant (dp_test) :
+    @spark_foundation.pipeline(nom)    décore run(spark, args) ; le job se
+                                       lance par raise SystemExit(run())
+    spark_foundation.read_input(nom) -> DataFrame
+    spark_foundation.write_output(df, nom)
+Appelé sans argument, le traitement reçoit les arguments de la ligne de
+commande, d'où --from et --only. Ce qu'on suppose sans l'avoir vérifié :
+une exception levée dans run() donne un code retour non nul.
 """
 
 import os
@@ -20,9 +27,16 @@ from pathlib import Path
 
 def project_name() -> str:
     """Nom du projet : la variable QLIK_PROJECT si elle existe, sinon le
-    nom du dossier courant."""
+    nom du dossier courant.
+
+    Il sert à la fois de nom de package Python (src/<nom>/, comme dp_test)
+    et de nom de traitement pour @pipeline. On le ramène donc à un
+    identifiant Python : minuscules, ASCII, et « _ » à la place de tout le
+    reste (mon-projet devient mon_projet)."""
     name = os.environ.get("QLIK_PROJECT") or Path.cwd().name
-    return re.sub(r"[^\w.-]", "_", name)
+    name = re.sub(r"\W", "_", name.strip().lower(), flags=re.ASCII)
+    # un identifiant ne peut pas commencer par un chiffre
+    return name if name and not name[0].isdigit() else f"p_{name}"
 
 
 def project_dir() -> Path:
@@ -39,13 +53,19 @@ Il enchaîne les scripts Qlik migrés depuis script_qvd/, dans l'ordre de
 leurs dépendances (un script qui lit un fichier écrit par un autre passe
 après lui). Les requêtes sont dans sql/, une par table Qlik. Pour chaque
 script :
-  1. chaque fichier lu devient une vue SQL (in_<nom>)
+  1. chaque entrée qu'il lit est chargée avec read_input() et devient une
+     vue SQL (in_<nom>)
   2. les requêtes tournent dans l'ordre du script, et chaque résultat devient
      une vue au nom de la table Qlik, que les requêtes suivantes peuvent lire
-  3. les tables qui avaient un STORE dans Qlik sont écrites
+  3. les tables qui avaient un STORE dans Qlik sont écrites avec
+     write_output()
+Les noms passés à read_input() et write_output() sont ceux de conf/io.yml,
+où spark-foundation-core trouve la location et le format.
+
 Une étape qui plante est loggée mais n'empêche pas les autres de tourner. En
-revanche, un script qui dépend d'un script en échec n'est pas lancé. Le code
-retour vaut 1 dès qu'il y a eu un échec.
+revanche, un script qui dépend d'un script en échec n'est pas lancé. S'il y
+a eu le moindre échec, le job se termine par une erreur qui liste les
+scripts concernés.
 
     python src/{project}/job.py                  # tout
     python src/{project}/job.py --from ventes    # reprendre à un script
@@ -54,38 +74,25 @@ retour vaut 1 dès qu'il y a eu un échec.
 
 import argparse
 import logging
-import sys
 import time
 from pathlib import Path
 
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from pyspark_commons.io import read, write
-from pyspark_commons.logger import setup_logging
-from pyspark_commons.monitoring import timer
-from pyspark_commons.session import get_local_spark_session
+from spark_foundation import pipeline, read_input, write_output
 
-HERE = Path(__file__).resolve().parent           # src/{project}/
-ROOT = HERE.parents[1]                           # racine du projet
-SQL_DIR = HERE / "sql"
+SQL_DIR = Path(__file__).resolve().parent / "sql"
 ORDER = "_qlik_order"     # ordre de chargement Qlik, écrit dans les sorties
 logger = logging.getLogger("{project}")
 
 # Les scripts, dans l'ordre où ils tournent.
-#   inputs : vue SQL -> (location, format), pris dans conf/io.yml si déclaré
-#   steps  : (fichier SQL, vue produite, sortie ou None, format)
+#   inputs : vue SQL -> nom de l'entrée dans conf/io.yml
+#   steps  : (fichier SQL, vue produite, nom de la sortie dans conf/io.yml
+#             ou None, True si le script relit ce qu'il écrit)
 SCRIPTS = {{
 {scripts}
 }}
-
-
-def location(path: str) -> str:
-    """Résout un chemin relatif depuis la racine du projet, et pas depuis
-    le dossier d'où on lance le job. Les URI (s3a://…) et les chemins
-    absolus sont renvoyés tels quels."""
-    if "://" in path or Path(path).is_absolute():
-        return path
-    return str(ROOT / path)
 
 
 def with_order(df):
@@ -101,29 +108,31 @@ def with_order(df):
     return df
 
 
-def run_script(spark, name: str, script: dict) -> list[str]:
+def run_script(spark: SparkSession, name: str, script: dict) -> list[str]:
     """Fait tourner un script et renvoie la liste des étapes en échec."""
     failures = []
-    read_paths = {{location(path) for path, _ in script["inputs"].values()}}
-    for view, (path, fmt) in script["inputs"].items():
+    for view, io_name in script["inputs"].items():
         try:
-            df = with_order(read(spark, location(path), fmt))
-            df.createOrReplaceTempView(view)
+            with_order(read_input(io_name)).createOrReplaceTempView(view)
         except Exception as exc:                 # fichier absent, illisible…
-            logger.error("%s : lecture de %s (%s) impossible : %s", name, path,
-                         view, exc)
-            failures.append(f"lecture {{path}}")
-    for sql_file, view, output, fmt in script["steps"]:
+            logger.error("%s : lecture de %s (%s) impossible : %s", name,
+                         io_name, view, exc)
+            failures.append(f"lecture {{io_name}}")
+    for sql_file, view, output, rereads in script["steps"]:
+        t0 = time.perf_counter()
         try:
-            with timer(f"{{name}} / {{view}}"):
-                df = spark.sql((SQL_DIR / sql_file).read_text(encoding="utf-8"))
-                if output and location(output) in read_paths:
-                    # Le script relit le fichier qu'il va écraser : on coupe
-                    # la lignée, sinon Spark lirait le fichier en l'écrivant.
-                    df = df.localCheckpoint()
-                df.createOrReplaceTempView(view)
-                if output:
-                    write(df, location(output), fmt, "overwrite")
+            df = spark.sql((SQL_DIR / sql_file).read_text(encoding="utf-8"))
+            if rereads:
+                # Le script écrase un fichier qu'il a lu : on coupe la
+                # lignée, sinon Spark relirait le fichier en l'écrivant.
+                df = df.localCheckpoint()
+            df.createOrReplaceTempView(view)
+            if output:
+                write_output(df, output)
+                # Spark est paresseux : c'est l'écriture qui déclenche le
+                # calcul, donc on ne chronomètre que les étapes qui écrivent.
+                logger.info("%s / %s écrit en %.1fs", name, output,
+                            time.perf_counter() - t0)
         except Exception as exc:
             # On ne s'arrête pas : les étapes qui dépendent de celle-ci
             # planteront à leur tour (vue absente), les autres iront au bout.
@@ -136,22 +145,22 @@ def run_script(spark, name: str, script: dict) -> list[str]:
     return failures
 
 
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Job du projet {project}.")
+@pipeline("{project}")
+def run(spark: SparkSession, args: list[str]) -> None:
+    p = argparse.ArgumentParser(prog="job.py",
+                                description="Job du projet {project}.")
     p.add_argument("--from", dest="start", help="reprendre à ce script")
     p.add_argument("--only", help="ne lancer que ce script")
-    args = p.parse_args(argv)
+    opts = p.parse_args(args)
     names = list(SCRIPTS)
-    for opt in (args.start, args.only):
+    for opt in (opts.start, opts.only):
         if opt and opt not in names:
-            logger.error("Script inconnu : %s (connus : %s)", opt, names)
-            return 1
-    if args.only:
-        names = [args.only]
-    elif args.start:
-        names = names[names.index(args.start):]
+            raise ValueError(f"Script inconnu : {{opt}} (connus : {{names}})")
+    if opts.only:
+        names = [opts.only]
+    elif opts.start:
+        names = names[names.index(opts.start):]
 
-    spark = get_local_spark_session()
     # Qlik est sensible à la casse des noms de champs (IDBid ≠ IdBid)
     spark.conf.set("spark.sql.caseSensitive", "true")
     t_all = time.perf_counter()
@@ -175,16 +184,17 @@ def main(argv=None) -> int:
         else:
             logger.info("%s terminé en %.0fs", name, time.perf_counter() - t0)
     if failed or skipped:
-        logger.error("En échec : %s ; non lancés : %s. Reprendre avec --from "
-                     "<script> une fois corrigé.", ", ".join(failed) or "aucun",
-                     ", ".join(skipped) or "aucun")
-        return 1
+        # On lève une erreur plutôt que de renvoyer un code : run() est
+        # typé -> None par le socle, et une exception donne de toute façon
+        # un code retour non nul.
+        raise RuntimeError(
+            f"En échec : {{', '.join(failed) or 'aucun'}} ; non lancés : "
+            f"{{', '.join(skipped) or 'aucun'}}. Reprendre avec --from "
+            "<script> une fois corrigé.")
     logger.info("Terminé : %d script(s) en %.0fs", len(names),
                 time.perf_counter() - t_all)
-    return 0
 
 
 if __name__ == "__main__":
-    setup_logging()
-    sys.exit(main())
+    raise SystemExit(run())
 '''

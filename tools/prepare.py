@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import IoConf  # noqa: E402
+from conf import IoConf, resolve_location  # noqa: E402
 from qlik2sql import (SectionContext, translate_section,  # noqa: E402
                       view_name)
 
@@ -1116,9 +1116,19 @@ def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
     S'il n'y en a pas, règle fixe : data/output/<nom> pour un fichier écrit
     par un STORE, data/input/<nom> sinon, en Parquet."""
     output = store or is_output(path, stored)
-    entry = conf.find(path, "output" if output else "input") if conf else None
+    # Une lecture se cherche dans la section input, une écriture dans
+    # outputs : read_input() ne lit que ce qui est déclaré en entrée, même
+    # si le fichier est produit par un autre script du projet.
+    entry = conf.find(path, "output" if store else "input") if conf else None
     if entry:
         return entry.location, entry.format, entry
+    if conf and not store and output:
+        written = conf.find(path, "output")
+        if written:
+            # Déclaré seulement en sortie : on garde sa location pour la
+            # traduction, mais sans entrée, le script ne pourra pas
+            # s'assembler.
+            return written.location, written.format, None
     return f"{OUTPUT_DIR if output else INPUT_DIR}/{file_stem(path)}", \
         "parquet", None
 
@@ -1453,9 +1463,15 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
     def input_view(path: str) -> str:
         location, fmt, entry = resolve_io(path, stored, conf)
         if conf and conf.enabled and entry is None:
-            missing_conf.add(f"entrée {file_stem(path)}")
+            only_out = conf.find(path, "output") is not None
+            missing_conf.add(f"entrée {file_stem(path)}" + (
+                " (déclarée en sortie seulement, à déclarer aussi en "
+                "entrée)" if only_out else ""))
         view = view_name("in_" + (entry.name if entry else file_stem(path)))
+        # "io" : le nom de l'entrée dans conf/io.yml, celui que le job passe
+        # à read_input(). None si le fichier n'y est pas déclaré.
         inputs[view] = {"path": location, "format": fmt,
+                        "io": entry.name if entry else None,
                         "columns": file_schema(path)}
         if entry and entry.types:
             inputs[view]["types"] = entry.types
@@ -1467,7 +1483,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         entry = resolve_io(path, stored, conf)[2]
         if entry and entry.columns:
             return entry.columns
-        return parquet_columns(map_path(path, stored, conf)) or \
+        return parquet_columns(resolve_location(map_path(path, stored,
+                                                         conf))) or \
             project_stores["columns"].get(file_stem(path).lower())
 
     sections = []
@@ -1483,7 +1500,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             if sec_insts else set()
         if len([n for n in names if not tables[n]["mapping"]]) > 1:
             constructs.add("resident_chain")
-        outputs, output_formats, store_flags = {}, {}, []
+        outputs, output_formats, output_io, store_flags = {}, {}, {}, []
         for n in names:
             for (_, path, fmt, _fields) in tables[n]["stored"]:
                 if n == g:
@@ -1492,6 +1509,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                     if conf and conf.enabled and entry is None:
                         missing_conf.add(f"sortie {file_stem(path)}")
                     outputs[n], output_formats[n] = location, out_fmt
+                    # nom de la sortie dans conf/io.yml, pour write_output()
+                    output_io[n] = entry.name if entry else None
                 else:
                     store_flags.append(f"STORE de la table intermédiaire {n} "
                                        f"vers {path} : non géré, à traiter "
@@ -1516,6 +1535,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                "depends_on_tables": deps_tables,
                "outputs": outputs,
                "output_formats": output_formats,
+               "output_io": output_io,
                "constructs": sorted(c for c in constructs if ":" not in c),
                "statement_lines": sorted({i.stmt.first_line for i in sec_insts
                                           if i.kind in ("load", "drop_field",
@@ -1687,8 +1707,9 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             if w.startswith("STORE "):
                 notes.append(f"l.{i.stmt.first_line}: {w}")
     if missing_conf:
-        notes.append("absents de conf/io.yml (règle par défaut data/input, "
-                     "data/output, Parquet) : " + ", ".join(sorted(missing_conf)))
+        notes.append("absents de conf/io.yml, à y déclarer avant d'assembler "
+                     "(le job lit et écrit par nom via spark-foundation-core) : "
+                     + ", ".join(sorted(missing_conf)))
     unresolved = sorted({m for i in insts for m in re.findall(
         r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))} - SYSTEM_VARS)
     manifest = {"script": script.name, "notes": notes,

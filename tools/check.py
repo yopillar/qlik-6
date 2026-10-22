@@ -138,18 +138,14 @@ class SparkChecker:
 def get_parser():
     """Renvoie le vérificateur Spark, ou None si pyspark n'est pas installé.
 
-    On prend la session de pyspark-commons, comme le job. Si la lib n'est pas
-    là, on se rabat sur une session locale minimale."""
+    Pas besoin du socle ici : on ne lit ni n'écrit rien, une session locale
+    minimale suffit pour parser et analyser."""
     try:
-        from pyspark_commons.session import get_local_spark_session
-        spark = get_local_spark_session()
+        from pyspark.sql import SparkSession
     except ImportError:
-        try:
-            from pyspark.sql import SparkSession
-        except ImportError:
-            return None
-        spark = (SparkSession.builder.master("local[1]")
-                 .config("spark.ui.enabled", "false").getOrCreate())
+        return None
+    spark = (SparkSession.builder.master("local[1]")
+             .config("spark.ui.enabled", "false").getOrCreate())
     # même comportement que Spark 3.5
     spark.conf.set("spark.sql.ansi.enabled", "false")
     # Qlik est sensible à la casse

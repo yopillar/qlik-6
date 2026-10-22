@@ -4,6 +4,11 @@ Les requêtes vont dans src/<nom-projet>/sql/, et la description du script
 (entrées, étapes, sorties) dans work/<script>/assembly.json, qu'orchestrate.py
 relit ensuite pour écrire le job.
 
+Le job lit et écrit par nom, avec read_input() et write_output() de
+spark-foundation-core : chaque fichier lu ou écrit par le script doit donc
+être déclaré dans conf/io.yml. Sinon on refuse d'assembler, plutôt que de
+produire un job qui plantera au premier read_input().
+
 Chaque section validée (statut ok ou deterministic) donne un fichier
 src/<nom-projet>/sql/<script>__NN_<table>.sql, numéroté dans l'ordre du
 script. Le préfixe <script>__ est là parce que tous les scripts partagent le
@@ -46,23 +51,46 @@ def main(argv=None) -> int:
 
     stem = Path(manifest["script"]).stem
     out = project_dir() / "sql"
+
+    # On vérifie tout avant de copier quoi que ce soit, pour ne pas laisser
+    # un script à moitié assemblé dans sql/.
+    inputs, read_paths, undeclared = {}, set(), []
+    for s in secs:
+        if s["id"] in pending:
+            continue
+        for view, src in s.get("views", {}).items():
+            if "path" in src:
+                read_paths.add(src["path"])
+                if src.get("io"):
+                    inputs[view] = src["io"]
+                else:
+                    undeclared.append(f"entrée {Path(src['path']).name}")
+        if s.get("outputs", {}).get(s["table"]) and \
+                not s.get("output_io", {}).get(s["table"]):
+            undeclared.append(f"sortie {Path(s['outputs'][s['table']]).name}")
+    if undeclared:
+        print(f"{stem} : pas déclarés dans conf/io.yml, assemblage annulé : "
+              f"{', '.join(sorted(set(undeclared)))}")
+        # un ancien assembly.json ferait entrer une version périmée du script
+        # dans le job
+        (args.workdir / "assembly.json").unlink(missing_ok=True)
+        return 1
+
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob(f"{stem}__*.sql"):
         old.unlink()
-
-    inputs, steps, k = {}, [], 0
+    steps, k = [], 0
     for s in secs:
         if s["id"] in pending:
             continue
         k += 1
         name = f"{stem}__{k:02d}_{s['id'].split('_', 1)[1]}.sql"
         shutil.copyfile(args.workdir / s["id"] / "query.sql", out / name)
-        for view, src in s.get("views", {}).items():
-            if "path" in src:
-                inputs[view] = [src["path"], src.get("format", "parquet")]
         output = s.get("outputs", {}).get(s["table"])
-        fmt = s.get("output_formats", {}).get(s["table"], "parquet")
-        steps.append([name, s["view"], output, fmt])
+        # Le script relit-il le fichier qu'il écrit ? Le job devra alors
+        # couper la lignée avant d'écrire.
+        steps.append([name, s["view"], s.get("output_io", {}).get(s["table"]),
+                      output in read_paths])
 
     if not any(st[2] for st in steps):
         print("⚠ aucune sortie : aucun STORE du script n'a été rattaché à une "
