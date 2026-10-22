@@ -154,6 +154,28 @@ def get_parser():
     return SparkChecker(spark)
 
 
+def is_table_from(code: str, pos: int) -> bool:
+    """Dit si le FROM / JOIN trouvé à pos introduit vraiment une table.
+
+    En Spark SQL, FROM sert aussi à l'intérieur de certaines fonctions :
+    extract(YEAROFWEEK FROM col), trim(BOTH FROM col), substring(s FROM 2)…
+    Le nom qui suit est alors une colonne, pas une vue. On regarde la
+    parenthèse ouvrante la plus proche : s'il n'y a pas de SELECT entre elle
+    et le FROM, on est dans les arguments d'une fonction. Un FROM au premier
+    niveau, ou un JOIN, introduit toujours une table."""
+    if not re.match(r"FROM\b", code[pos:], re.I):
+        return True
+    depth = 0
+    for k in range(pos - 1, -1, -1):
+        if code[k] == ")":
+            depth += 1
+        elif code[k] == "(":
+            if depth == 0:
+                return bool(re.search(r"\bSELECT\b", code[k:pos], re.I))
+            depth -= 1
+    return True
+
+
 def check_section(section: dict, query_path: Path,
                   parser=None) -> tuple[list[str], list[str]]:
     errors, warnings = [], []
@@ -189,6 +211,8 @@ def check_section(section: dict, query_path: Path,
                          code_no_idents, re.I):
         if m.group(2):
             continue          # fonction-table (range(…), explode…)
+        if not is_table_from(code_no_idents, m.start()):
+            continue          # FROM d'une fonction : extract(… FROM col)…
         name = m.group(1).lower()
         if name not in allowed and name not in ("values", "lateral") \
                 and m.group(1) not in unknown:

@@ -124,7 +124,10 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
 - Les variables `LET` calculées (`Peek`, `NoOfRows`, `Today()`…), remplacées
   par leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
 - Les dates à la Qlik : `date - date` donne un nombre de jours, `Floor` et
-  `Ceil` sur une date ou un horodatage gardent le jour. Une colonne déclarée
+  `Ceil` sur une date ou un horodatage gardent le jour. `Min`, `Max`,
+  `FirstValue`, `LastValue` et `Peek` d'une colonne de type date restent des
+  dates, ce qui permet de traduire le calendrier classique (`LET vMin =
+  Num(Peek('MinDate', 0, 'T'))` puis `AUTOGENERATE vMax - vMin + 1`). Une colonne déclarée
   texte dans `conf/schema` mais au format `DateFormat` du script
   (`DD/MM/YYYY`…) est lue comme une date dans les calculs, les comparaisons
   et les fonctions de date, comme Qlik le fait au chargement.
@@ -355,6 +358,10 @@ veut la refaire exprès).
 - Avec `FieldValue('F', RecNo())`, les valeurs sont numérotées dans l'ordre
   trié, alors que Qlik suit l'ordre de chargement.
 - `Date(x)` appliqué à un nombre (date Qlik en jours) n'est pas converti.
+- Le typage des dates repose sur `conf/schema`. Une colonne de dates sans
+  type déclaré (ou déclarée en texte) n'est pas reconnue comme date par
+  `Min`, `Max` ou `Peek`. Dans ce cas, le contrôle ne peut pas trancher sur
+  les types et laisse passer, et c'est le job qui plantera sur `date - date`.
 - `QUALIFY`, `NullAsValue`, `SET NullInterpret/NullValue` : signalés, à
   compléter à la main.
 - L'ordre entre scripts ne tient compte que des fichiers, pas des tables en

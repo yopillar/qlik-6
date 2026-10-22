@@ -484,6 +484,21 @@ def translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return DateSql(a[0] if not isinstance(a[0], TsSql)
                        else f"CAST({a[0]} AS DATE)")
     sql = _translate_function(name, a, raw, distinct, ctx)
+    # Min, Max, FirstValue… d'une date restent des dates. Sans ce typage,
+    # le calendrier classique (Min/Max d'une date, LET vMin = Peek(…), puis
+    # AUTOGENERATE vMax - vMin + 1) faisait date - date en Spark, qui donne
+    # un intervalle, et le + 1 plantait.
+    if n in ("min", "max", "firstvalue", "lastvalue", "only", "previous") \
+            and a and isinstance(a[0], DateSql):
+        return type(a[0])(sql)
+    if n == "peek" and raw:
+        # la valeur a le type de la colonne lue, s'il est connu
+        t = str(ctx.column_types.get(literal(raw[0]) or "", "")).lower()
+        t = t.split("(")[0]
+        if t in TS_TYPES:
+            return TsSql(sql)
+        if t in DATE_TYPES:
+            return DateSql(sql)
     if n in ("timestamp", "timestamp#", "now"):
         return TsSql(sql)
     if n in ("date", "date#", "makedate", "today", "addmonths",
@@ -574,7 +589,10 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return f"CAST({a[0]} AS DOUBLE)"
     if n == "num":
         need(1, 2, 3, 4)
-        # les autres arguments ne servent qu'à l'affichage
+        # Les autres arguments ne servent qu'à l'affichage. Une date reste
+        # une date (on renvoie a[0] avec son type) : les règles de
+        # l'arithmétique font déjà date - date = jours et date ± n = date,
+        # comme Qlik avec ses valeurs numériques.
         return a[0]
     if n in ("date#", "timestamp#"):
         fmt = literal(raw[1]) if k >= 2 else (
