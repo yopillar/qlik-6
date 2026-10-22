@@ -4,7 +4,9 @@
     python tools/migrate.py script_qvd/ventes.qvs             # ensuite
     python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
 
-Pour chaque script on enchaîne :
+Avant tout, fill_conf.py ajoute dans conf/io.yml et dans les schémas ce
+qui manque pour les scripts du dossier (jamais de modification de
+l'existant, --no-conf pour s'en passer). Puis, pour chaque script :
   1. prepare.py    découpe le script et traduit en SQL tout ce qu'on sait
                    traduire sans le modèle (le reste est marqué TODO(model))
   2. translate.py  fait compléter les TODO par le modèle, une table par
@@ -49,6 +51,8 @@ def main(argv=None) -> int:
     p.add_argument("--opencode-bin", default="opencode")
     p.add_argument("--skip-selftest", action="store_true",
                    help="ne pas tester le modèle avant de traduire")
+    p.add_argument("--no-conf", action="store_true",
+                   help="ne pas compléter conf/io.yml ni les schémas")
     p.add_argument("--var", action="append", default=[], metavar="NOM=VALEUR",
                    help="variable des locations de conf/io.yml, pour la "
                         "comparaison (ex. --var sorties=data/output)")
@@ -67,6 +71,11 @@ def main(argv=None) -> int:
     # data/output.
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, sorted(folder.glob("*.qvs"))))
+    # On complète conf/io.yml et les schémas avant de traduire, puisque la
+    # traduction s'en sert (colonnes des LOAD *, types des dates). Seulement
+    # des ajouts : ce qui est déjà déclaré n'est jamais modifié.
+    if not args.no_conf:
+        run("fill_conf.py", str(folder), *[f"--var={v}" for v in args.var])
 
     summary, stopped = [], False
     for script in scripts:
@@ -111,7 +120,9 @@ def main(argv=None) -> int:
                 rc = run("verify.py", str(workdir),
                          *[f"--var={v}" for v in args.var])
                 verdict = {0: "données identiques à Qlik",
-                           1: "écarts avec Qlik : voir comparaison.md"}.get(
+                           1: "écarts avec Qlik : voir comparaison.md",
+                           3: "pas d'export Qlik dans data/qlik_outputs/ "
+                              "pour comparer"}.get(
                     rc, "des étapes du job ont échoué (voir la trace), les "
                         "sorties produites sont identiques à Qlik")
                 state += f", {verdict}"

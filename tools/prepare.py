@@ -1708,7 +1708,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                 notes.append(f"l.{i.stmt.first_line}: {w}")
     if missing_conf:
         notes.append("absents de conf/io.yml, à y déclarer avant d'assembler "
-                     "(le job lit et écrit par nom via spark-foundation-core) : "
+                     "(le job lit et écrit par nom via spark-foundation-core ; "
+                     "migrate.py les ajoute, sauf avec --no-conf) : "
                      + ", ".join(sorted(missing_conf)))
     unresolved = sorted({m for i in insts for m in re.findall(
         r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))} - SYSTEM_VARS)

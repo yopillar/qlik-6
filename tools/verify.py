@@ -8,7 +8,7 @@ Le résultat va dans work/<script>/comparaison.md, dans le manifest (champ
 « compare ») et dans work/journal.csv.
 
 Code retour : 0 si tout est identique, 1 s'il y a des écarts, 2 si le job
-n'a pas pu tourner.
+n'a pas pu tourner, 3 si aucune sortie n'avait d'export Qlik pour comparer.
 
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
@@ -152,6 +152,8 @@ def main(argv=None) -> int:
           f"référence -> {args.workdir / 'comparaison.md'}")
     if job_failed and not n_ko:
         return 2
+    if not n_ok and not n_ko:
+        return 3          # rien à comparer : aucun export Qlik trouvé
     return 1 if n_ko else 0
 
 

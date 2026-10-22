@@ -220,6 +220,50 @@ un fichier non déclaré est cherché par défaut dans `data/input/<nom>` (ou
 `data/output/<nom>` s'il est écrit par un `STORE`), ce qui permet d'avancer
 sur les requêtes en attendant de compléter `conf/io.yml`.
 
+### `migrate.py` complète `conf/io.yml` et les schémas
+
+Avant de traduire, `migrate.py` lance `tools/fill_conf.py`, qui ajoute ce
+qui manque pour les scripts du dossier. La règle : on ajoute, on ne modifie
+jamais ce qui existe.
+
+- Une entrée ou une sortie absente est ajoutée à la fin de sa section, en
+  texte, avec l'indentation du fichier : les commentaires et la mise en
+  forme sont conservés. Chaque ajout porte un commentaire daté qui dit
+  pourquoi il est là.
+- Un schéma absent est créé (`colonne: type`). Un schéma existant n'est
+  jamais retouché, même s'il lui manque des colonnes : c'est signalé, car le
+  socle s'en sert pour lire le fichier et une colonne en trop pourrait le
+  casser.
+- Avant de modifier `io.yml`, une copie est gardée dans `conf/io.yml.bak`.
+  Si le résultat n'est plus du YAML lisible, l'original est conservé.
+- Relancer ne rajoute rien : ce qui a été ajouté est désormais déclaré.
+
+```bash
+python tools/migrate.py script_qvd/ --no-conf          # sans toucher à conf/
+python tools/fill_conf.py script_qvd/                  # seulement compléter conf/
+python tools/fill_conf.py script_qvd/ --draft          # brouillon dans conf/draft/
+```
+
+D'où viennent les informations :
+
+- Les entrées et sorties viennent des `FROM` et des `STORE` des scripts,
+  nommées d'après les fichiers Qlik, avec le même préfixe de location
+  (`${entrees}/…`) que ce qu'il y a déjà dans `io.yml`.
+- Les colonnes sont celles que les scripts lisent. Si le fichier de données
+  est là (dans `data/input/` ou à sa location), on prend toutes ses
+  colonnes, et on signale celles que les scripts lisent mais qui n'y sont
+  pas.
+- Les types sont lus dans le fichier quand c'est un Parquet : ceux-là sont
+  sûrs. Sinon ils sont suggérés d'après l'usage (`Year(col)` donne `date`,
+  `Sum(col)` ou un calcul donne `double`, `Date#(col)` ou `Upper(col)` donne
+  `string`), ou en dernier recours d'après le nom (`date_…`). Chaque type
+  porte en commentaire d'où il vient. Sans aucun indice, la colonne est mise
+  en `string`, le type que le kit suppose de toute façon, avec le
+  commentaire « type inconnu ». Une entrée dont on ne connaît aucune colonne
+  (`LOAD *` sans le fichier) est déclarée sans schéma, et c'est signalé.
+- Pour les entrées déjà déclarées, il signale les colonnes utilisées par les
+  scripts qui manquent dans leur schéma.
+
 Les variables des locations (`${entrees}`, `${sorties}`…) sont résolues par
 le socle quand le job tourne. Le kit, lui, en a besoin pour aller lire les
 sorties au moment de la comparaison avec Qlik : on les lui donne avec
@@ -339,6 +383,7 @@ veut la refaire exprès).
 | `translate.py` | complétion des `TODO(model)` par le modèle |
 | `check.py` | contrôles, et syntaxe Spark avec `--parse` |
 | `conf.py` | lecture de `conf/io.yml` et des schémas |
+| `fill_conf.py` | complète `conf/io.yml` et les schémas (lancé par `migrate.py`) |
 | `assemble.py` | copie des requêtes d'un script dans `src/<nom-projet>/sql/` |
 | `job_template.py` | gabarit du job, le seul endroit qui appelle `spark-foundation-core` |
 | `verify.py` | lance le job et compare avec `data/qlik_outputs/` |

@@ -70,7 +70,8 @@ def main(argv=None) -> int:
             undeclared.append(f"sortie {Path(s['outputs'][s['table']]).name}")
     if undeclared:
         print(f"{stem} : pas déclarés dans conf/io.yml, assemblage annulé : "
-              f"{', '.join(sorted(set(undeclared)))}")
+              f"{', '.join(sorted(set(undeclared)))}\n"
+              "  (python tools/fill_conf.py script_qvd/ les ajoute)")
         # un ancien assembly.json ferait entrer une version périmée du script
         # dans le job
         (args.workdir / "assembly.json").unlink(missing_ok=True)
