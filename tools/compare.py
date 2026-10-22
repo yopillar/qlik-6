@@ -1,25 +1,25 @@
-"""Compare la sortie Qlik (QVD ou CSV) à la sortie PySpark (Parquet ou CSV).
+"""Compare une sortie Qlik (QVD ou CSV) avec la sortie Spark (Parquet ou CSV).
 
-C'est la seule preuve réelle qu'une traduction est juste : check.py
-contrôle la forme du code, ce script compare les DONNÉES.
-Appelé par verify.py pour chaque STORE ; utilisable seul.
+C'est le seul vrai test d'une traduction : check.py ne regarde que le code,
+ici on compare les données. verify.py l'appelle pour chaque STORE, mais on
+peut aussi le lancer à la main.
 
-Contrôles, dans l'ordre :
-    1. colonnes (manquantes / en trop, comparaison insensible à la casse)
-    2. nombre de lignes
-    3. contenu : comparaison des lignes en multi-ensemble (l'ordre des lignes
-       n'a pas de sens, les doublons comptent)
+On vérifie, dans cet ordre :
+    1. les colonnes (manquantes ou en trop, sans tenir compte de la casse)
+    2. le nombre de lignes
+    3. le contenu, ligne à ligne, sans regarder l'ordre des lignes mais en
+       comptant les doublons
 
-Normalisation appliquée avant comparaison : espaces en bord de chaîne,
-nombres arrondis (--decimals), dates ramenées en ISO, vides/null unifiés.
+Avant de comparer, on normalise : espaces de début et de fin retirés,
+nombres arrondis (--decimals), dates en ISO, vide et null confondus.
 
 Usage :
-    python tools/compare.py qlik_outputs/commandes.qvd data/output/commandes/
-    python tools/compare.py qlik_outputs/commandes.csv data/output/commandes/
+    python tools/compare.py data/qlik_outputs/commandes.qvd data/output/commandes/
+    python tools/compare.py data/qlik_outputs/commandes.csv data/output/commandes/
 Code retour : 0 si identique, 1 sinon (utilisable en CI).
 
-Lecture des QVD : nécessite le paquet `pyqvd` (à vérifier sur le Nexus).
-À défaut, exporter la table en CSV depuis Qlik et comparer le CSV.
+Pour lire les QVD il faut le paquet `pyqvd` (pas encore vérifié qu'il est
+sur le Nexus). Sinon, exporter la table en CSV depuis Qlik et comparer ce CSV.
 """
 
 from __future__ import annotations
@@ -35,8 +35,9 @@ MAX_EXAMPLES = 20
 
 
 def guess_sep(path: Path) -> str:
-    """Séparateur d'un CSV parmi , ; tabulation | (défaut : virgule).
-    pandas devine parfois une lettre quand le fichier n'a qu'une colonne."""
+    """Devine le séparateur d'un CSV parmi , ; tabulation et | (virgule par
+    défaut). On ne laisse pas faire pandas : sur un fichier d'une seule
+    colonne, il lui arrive de prendre une lettre pour séparateur."""
     with path.open(encoding="utf-8-sig", errors="replace") as f:
         head = f.readline()
     counts = {c: head.count(c) for c in (",", ";", "\t", "|")}
@@ -45,7 +46,7 @@ def guess_sep(path: Path) -> str:
 
 
 def read_any(path: Path, sep: str) -> pd.DataFrame:
-    """Lit un QVD, un CSV ou un Parquet (fichier ou dossier de part-*)."""
+    """Lit un QVD, un CSV ou un Parquet (fichier seul ou dossier de part-*)."""
     suffix = path.suffix.lower()
     if suffix == ".qvd":
         try:
@@ -56,7 +57,7 @@ def read_any(path: Path, sep: str) -> pd.DataFrame:
                 "ou exporte la table en CSV depuis Qlik.") from exc
         return QvdTable.from_qvd(str(path)).to_pandas()
     if suffix in (".csv", ".txt"):
-        # séparateur détecté automatiquement si non fourni
+        # pas de séparateur fourni : on le devine
         return pd.read_csv(path, sep=sep or guess_sep(path), dtype=str,
                            keep_default_na=False, encoding="utf-8-sig")
     if path.is_dir():
@@ -73,7 +74,7 @@ def read_any(path: Path, sep: str) -> pd.DataFrame:
 
 
 def normalize(df: pd.DataFrame, decimals: int) -> pd.DataFrame:
-    """Ramène chaque valeur à une chaîne canonique comparable."""
+    """Ramène chaque valeur à une chaîne comparable d'un fichier à l'autre."""
     out = pd.DataFrame(index=df.index)
     for col in df.columns:
         s = df[col]
@@ -119,7 +120,8 @@ def compare(qlik: pd.DataFrame, spark: pd.DataFrame, decimals: int,
     if not common:
         report.append("- Aucune colonne commune, comparaison impossible")
         return False, report
-    # multi-ensemble : on numérote les doublons pour qu'ils comptent
+    # On numérote les doublons, sinon deux lignes identiques côté Qlik contre
+    # une seule côté Spark passeraient inaperçues.
     q2, s2 = q[common].copy(), s[common].copy()
     q2["_n"] = q2.groupby(common, dropna=False).cumcount()
     s2["_n"] = s2.groupby(common, dropna=False).cumcount()
@@ -142,13 +144,14 @@ def compare(qlik: pd.DataFrame, spark: pd.DataFrame, decimals: int,
 
 
 def _has_tabulate() -> bool:
-    """to_markdown() de pandas a besoin du paquet tabulate."""
+    """Pour to_markdown(), pandas a besoin du paquet tabulate."""
     return importlib.util.find_spec("tabulate") is not None
 
 
 def compare_files(qlik: Path, spark: Path, sep=None, decimals=6,
                   ignore=()) -> tuple[bool, str]:
-    """Compare deux fichiers/dossiers et renvoie (identique, rapport markdown)."""
+    """Compare deux fichiers (ou dossiers) et renvoie (identique, rapport en
+    markdown)."""
     ok, lines = compare(read_any(qlik, sep), read_any(spark, sep),
                         decimals, list(ignore))
     text = (f"# Comparaison {qlik.name} vs {spark.name}\n\n"

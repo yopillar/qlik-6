@@ -1,187 +1,241 @@
 # Migration Qlik → Spark SQL
 
-Un script Qlik devient un dossier `src/<script>/` : **des requêtes Spark SQL**
-(une par table, dans `src/<script>/sql/`) et **un job court**
-(`src/<script>/job.py`) qui les enchaîne en n'appelant que `pyspark-commons`.
+Chaque script Qlik est traduit en requêtes Spark SQL, une par table, rangées
+dans `src/<nom-projet>/sql/`. Un job unique, `src/<nom-projet>/job.py`, les
+enchaîne pour tout le projet et ne passe que par `pyspark-commons`.
 
-Le Python traduit lui-même la majorité du code Qlik (sans modèle). Le
-modèle n'est appelé que pour les parties qu'il ne sait pas traduire avec
-certitude, marquées `TODO(model)` dans une requête déjà écrite.
+L'essentiel de la traduction est fait en Python, sans modèle. On n'appelle
+le modèle que pour les morceaux qu'on ne sait pas traduire à coup sûr. Ils
+sont marqués `TODO(model)` dans une requête par ailleurs déjà écrite.
 
 ## Arborescence (un projet par zone médaillon)
 
 ```
 mon-projet/
-├── script_qvd/          scripts .qvs à traduire                      (toi)
-├── conf/io.yml          entrées / sorties : format, location, schéma (toi)
-├── conf/schema/*.yml    colonnes et types des entrées                (toi)
-├── data/input/          données lues (si absentes de conf/io.yml)    (toi)
-├── qlik_outputs/        sorties Qlik pour comparer, optionnel        (toi)
-├── data/output/         données écrites par les jobs                 (généré)
-├── src/<script>/job.py  job du script                                (généré)
-├── src/<script>/sql/    01_<table>.sql, 02_<table>.sql…              (généré)
-├── src/run_all.py       job principal : tous les scripts, dans l'ordre (généré)
-├── work/                travail intermédiaire + journal.csv          (généré)
+├── script_qvd/               scripts .qvs à traduire                      (à fournir)
+├── conf/io.yml               entrées / sorties : format, location, schéma (à fournir)
+├── conf/schema/*.yml         colonnes et types des entrées                (à fournir)
+├── data/input/               données lues (si absentes de conf/io.yml)    (à fournir)
+├── data/qlik_outputs/        sorties Qlik pour comparer, facultatif       (à fournir)
+├── data/output/              données écrites par le job                   (généré)
+├── src/<nom-projet>/job.py   job du projet, tous les scripts dans l'ordre (généré)
+├── src/<nom-projet>/sql/     <script>__01_<table>.sql, …                  (généré)
+├── work/                     travail intermédiaire, journal.csv           (généré)
 ├── .opencode/agents/translator.md
-├── .opencode/skills/    4 skills SQL (jointures, mappings, chaînes TMP, Peek/Previous)
+├── .opencode/skills/         4 skills SQL (jointures, mappings, chaînes TMP, Peek/Previous)
 ├── AGENTS.md
 └── tools/
 ```
 
+`<nom-projet>` est le nom du dossier du projet, ou la valeur de la variable
+`QLIK_PROJECT` si elle est définie. Tous les scripts partagent le même
+dossier `sql/`, d'où le préfixe `<script>__` dans les noms de fichiers : deux
+scripts peuvent avoir une table du même nom. Le numéro suit l'ordre des
+tables dans le script.
+
 ## Les deux bibliothèques
 
-- `spark-foundation-core` (interne, PySpark) : jamais appelée directement
-  par le code généré.
-- `pyspark-commons` (pour les gens de Qlik) : le job généré n'utilise
-  que `read`, `write`, `timer` et `setup_logging`. Ces appels sont tous dans
-  `tools/job_template.py` : si une signature change, on corrige ce seul
-  fichier et on relance `migrate.py`.
+- `spark-foundation-core` (interne, PySpark) : le code généré ne l'appelle
+  jamais directement.
+- `pyspark-commons` (pensée pour les gens qui viennent de Qlik) : le job
+  n'utilise que `get_local_spark_session`, `read`, `write`, `timer` et
+  `setup_logging`. Tous ces appels sont regroupés dans
+  `tools/job_template.py`. Si une signature change, on corrige ce fichier
+  et on relance `migrate.py`, rien d'autre à toucher.
 
 ## La commande
 
 ```bash
-python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # 1re fois, puis relire
+python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # la 1re fois, puis on relit
 python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
-python src/run_all.py                                     # exécuter le résultat
+python src/<nom-projet>/job.py                            # lancer le résultat
 ```
 
-Pour chaque script : traduction sans modèle, complétion des `TODO(model)`
-par le modèle (une table par appel, syntaxe validée par le parseur Spark,
-une relance si erreur), assemblage dans `src/`, puis, si
-`qlik_outputs/` existe, exécution et comparaison avec Qlik.
-Relançable à volonté : ce qui est fait et inchangé n'est pas refait.
+Pour chaque script, `migrate.py` traduit ce qu'il peut sans modèle, fait
+compléter les `TODO(model)` par le modèle (une table par appel, syntaxe
+vérifiée par le parseur Spark, une relance en cas d'erreur), range le tout
+dans `src/`, puis lance et compare avec Qlik s'il trouve des sorties dans
+`data/qlik_outputs/`.
 
-`work/<script>/rapport.md` dit, table par table, ce qui a été traduit sans
-modèle et ce qui reste à compléter, avec la raison.
+On peut le relancer autant qu'on veut : ce qui est fait et n'a pas changé
+n'est pas refait.
 
-## Ce que le traducteur fait sans modèle
+Pour savoir où on en est, `work/<script>/rapport.md` dit table par table ce
+qui a été traduit sans modèle, ce qui reste à compléter, et pourquoi.
 
-- Expressions : `If`, `&`, arithmétique, comparaisons, `like`, texte
+## Le job du projet : `src/<nom-projet>/job.py`
+
+```bash
+python src/<nom-projet>/job.py                  # tous les scripts
+python src/<nom-projet>/job.py --from ventes    # reprendre après un échec
+python src/<nom-projet>/job.py --only ventes    # un seul script
+```
+
+- Les scripts tournent dans l'ordre de leurs dépendances : un script qui lit
+  un fichier écrit par un autre passe après lui, comme avec l'enchaînement
+  des tâches de rechargement dans Qlik. L'ordre est calculé à partir de
+  `work/stores.json`, qui recense ce que chaque script lit et écrit.
+- La session Spark est créée par
+  `pyspark_commons.session.get_local_spark_session()`.
+- Les chemins relatifs partent de la racine du projet, peu importe le
+  dossier d'où on lance le job. Les `s3a://…` et les chemins absolus sont
+  pris tels quels.
+- Une lecture ou une étape SQL qui plante est loggée, et les suivantes
+  continuent. Un script qui dépend d'un script en échec n'est pas lancé, et
+  le job sort avec le code 1 s'il y a eu le moindre échec.
+- Les vues d'un script sont supprimées quand il a fini, pour que deux
+  scripts puissent avoir une table du même nom.
+- Chaque `STORE` du script Qlik devient une écriture. Un `STORE` qu'on
+  n'arrive à rattacher à aucune table est signalé dans le rapport et à
+  l'assemblage.
+- Seuls les scripts entièrement validés entrent dans le job. Les autres sont
+  listés par `orchestrate.py`, qui prévient aussi si un script du job dépend
+  de l'un d'eux.
+
+## Ce que le traducteur sait faire sans modèle
+
+- Les expressions : `If`, `&`, arithmétique, comparaisons, `like`, texte
   (`Index` avec n-ième occurrence, `SubField`, `KeepChar`…), dates (`Date#`
   avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths`…), nombres,
   `IsNum`, `Match`/`WildMatch`/`Pick`, `RangeSum`, agrégations.
-- **Booléens à la Qlik** : vrai vaut -1, faux 0, et tout nombre non nul est
-  vrai dans une condition.
-- `WHERE`, `GROUP BY`, `ORDER BY`, `DISTINCT`, `FIRST n`, LOAD empilés.
-- Sources : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple, et
-  `AUTOGENERATE` (voir ci-dessous).
-- **Ordre de chargement Qlik** (voir plus bas) : `RowNo`, `RecNo`, `Previous`,
-  `Peek` (champ simple, ou `Peek('f', n, 'T')` sur une autre table),
-  `FirstValue`, `LastValue`, `NoOfRows`, `FIRST n`, `DISTINCT` et mappings
-  (première valeur gardée), dans l'ordre exact de Qlik.
+- Les booléens façon Qlik : vrai vaut -1, faux vaut 0, et dans une condition
+  tout nombre non nul est vrai.
+- `WHERE`, `GROUP BY`, `ORDER BY`, `DISTINCT`, `FIRST n` et les LOAD empilés.
+- Les sources : fichier, `RESIDENT`, `INLINE`, `SQL SELECT` simple et
+  `AUTOGENERATE` (détaillé plus bas).
+- Tout ce qui dépend de l'ordre de chargement (voir la section sur l'ordre
+  des lignes) : `RowNo`, `RecNo`, `Previous`, `Peek` (champ simple, ou
+  `Peek('f', n, 'T')` sur une autre table), `FirstValue`, `LastValue`,
+  `NoOfRows`, `FIRST n`, `DISTINCT` et les mappings, qui gardent la première
+  valeur chargée comme Qlik.
 - `Exists(champ[, expr])` et `NOT Exists(…)`, y compris le dédoublonnage
   quand le LOAD charge lui-même le champ.
-- Variables `LET` calculées (`Peek`, `NoOfRows`, `Today()`…) : remplacées par
-  leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
-- Dates à la Qlik : `date - date` donne un nombre de jours ; `Floor`/`Ceil`
-  d'une date ou d'un horodatage gardent le jour ; une colonne texte
-  (`conf/schema`) au format `DateFormat` du script (`DD/MM/YYYY`…) est
-  interprétée comme une date dans les calculs, comparaisons et fonctions de
-  date, comme Qlik le fait au chargement.
-- Noms de champs sensibles à la casse, comme dans Qlik.
-- `Dual(texte, nombre)` : le texte est gardé (Parquet n'a qu'un type).
+- Les variables `LET` calculées (`Peek`, `NoOfRows`, `Today()`…), remplacées
+  par leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
+- Les dates à la Qlik : `date - date` donne un nombre de jours, `Floor` et
+  `Ceil` sur une date ou un horodatage gardent le jour. Une colonne déclarée
+  texte dans `conf/schema` mais au format `DateFormat` du script
+  (`DD/MM/YYYY`…) est lue comme une date dans les calculs, les comparaisons
+  et les fonctions de date, comme Qlik le fait au chargement.
+- La casse des noms de champs est respectée, comme dans Qlik.
+- `Dual(texte, nombre)` : on garde le texte, Parquet n'ayant qu'un type par
+  colonne (choix à valider).
 - `JOIN` (clés implicites, ordre des colonnes de Qlik), `KEEP`,
-  `CONCATENATE`, auto-concaténation, `DROP FIELD`.
-- `ApplyMap` → `LEFT JOIN` sur la source du mapping + `COALESCE`.
-- `AutoNumber`, `AutoNumberHash128/256` → `xxhash64` : clé stable entre les
-  tables, mais pas les mêmes nombres que Qlik ; ces colonnes sont exclues
-  automatiquement de la comparaison.
-- Variables, `CALL` de SUB, boucles `FOR` à liste fixe, `IF` évaluables.
-- Commentaires (`//`, `/* */`, `REM`) retirés ; tout ce qui suit un
-  `EXIT SCRIPT;` est ignoré.
-- Apostrophes : `'l''été'` (Qlik) devient `"l'été"`. En Spark SQL, `''` colle
-  deux chaînes (« lété ») : `check.py` le refuse dans une requête.
+  `CONCATENATE`, l'auto-concaténation et `DROP FIELD`.
+- `ApplyMap`, traduit en `LEFT JOIN` sur la source du mapping, avec un
+  `COALESCE` pour la valeur par défaut.
+- `AutoNumber` et `AutoNumberHash128/256`, traduits en `xxhash64`. La clé
+  est stable d'une table à l'autre, mais ce ne sont pas les mêmes nombres
+  que dans Qlik, donc ces colonnes sont exclues d'office de la comparaison.
+- Les variables, les `CALL` de SUB, les boucles `FOR` sur une liste fixe et
+  les `IF` qu'on peut évaluer.
+- Les commentaires (`//`, `/* */`, `REM`) sont retirés, et tout ce qui suit
+  un `EXIT SCRIPT;` est ignoré.
+- Les apostrophes : `'l''été'` côté Qlik devient `"l'été"`. Attention, en
+  Spark SQL `''` colle deux chaînes et on obtient « lété ». `check.py`
+  refuse donc cette écriture dans une requête.
 
-## `AUTOGENERATE` : toujours traduit sans modèle
+## `AUTOGENERATE`, toujours traduit sans modèle
 
 | Forme Qlik | Spark SQL généré |
 |---|---|
 | `AUTOGENERATE 10` | `range(1, 11)` |
-| `AUTOGENERATE vMax - vMin + 1` (variables, même `LET` calculées par `Peek`) | `explode(sequence(1, <expression>))` |
-| `AUTOGENERATE 1 WHILE <condition sur IterNo()>` (calendriers) | une ligne par itération, jusqu'à la première fausse, comme Qlik (au plus 100 000) |
-| `AUTOGENERATE FieldValueCount('F')` avec `FieldValue('F', RecNo())` | valeurs distinctes du champ `F` dans toutes les tables déjà chargées |
+| `AUTOGENERATE vMax - vMin + 1` (variables, même des `LET` calculés par `Peek`) | `explode(sequence(1, <expression>))` |
+| `AUTOGENERATE 1 WHILE <condition sur IterNo()>` (calendriers) | une ligne par itération jusqu'à la première fausse, comme Qlik (100 000 au plus) |
+| `AUTOGENERATE FieldValueCount('F')` avec `FieldValue('F', RecNo())` | les valeurs distinctes du champ `F` dans toutes les tables déjà chargées |
 
-`RecNo()`, `RowNo()` et `IterNo()` y sont exacts. Le modèle n'est appelé dans
-une table qui contient un `AUTOGENERATE` que pour **une autre expression**
-de cette table qu'il faut compléter, ou si la borne dépend d'une variable
-introuvable (boucle, include) : le rapport l'indique alors.
+`RecNo()`, `RowNo()` et `IterNo()` y sont exacts. Si le modèle est appelé
+sur une table qui contient un `AUTOGENERATE`, c'est pour une autre
+expression de la table, ou parce que la borne dépend d'une variable qu'on
+n'a pas trouvée (boucle, include). Le rapport le précise.
 
 ## L'ordre des lignes, comme dans Qlik
 
-Qlik traite les lignes dans leur ordre physique de chargement ; Spark n'a
-pas d'ordre. Chaque table porte donc une colonne technique `_qlik_order`
-(`array<bigint>`) :
+Qlik traite les lignes dans l'ordre où elles ont été chargées, alors que
+Spark n'a pas d'ordre du tout. Chaque table porte donc une colonne
+technique `_qlik_order` (`array<bigint>`) :
 
-- **lecture** : reprise du fichier si elle y est (fichier écrit par un job
-  migré), sinon numérotation dans l'ordre de lecture, avant toute opération ;
-- **propagation** selon les règles de Qlik : `ORDER BY` (puis ordre
-  précédent à égalité), `CONCATENATE` (lignes ajoutées après), `JOIN` (ordre
-  de la table de gauche, puis lignes sans correspondance), `GROUP BY` et
-  `DISTINCT` (première occurrence) ;
-- **écriture** : gardée dans chaque sortie, le script suivant hérite de
-  l'ordre exact, comme avec un QVD.
+- à la lecture, on la reprend si elle est déjà dans le fichier (fichier
+  écrit par un job migré). Sinon on numérote les lignes dans l'ordre de
+  lecture, avant toute autre opération.
+- elle suit ensuite les règles de Qlik : `ORDER BY` (et à égalité l'ordre
+  d'avant), `CONCATENATE` (les lignes ajoutées passent après), `JOIN`
+  (l'ordre de la table de gauche, puis les lignes sans correspondance),
+  `GROUP BY` et `DISTINCT` (première occurrence).
+- elle est écrite dans chaque sortie, si bien que le script suivant récupère
+  exactement le même ordre, comme avec un QVD.
 
-`compare.py` l'ignore. Pour des données d'entrée converties depuis des QVD,
-le plus fiable est d'y ajouter le numéro de ligne d'origine dans une colonne
-`_qlik_order` ; à défaut, l'ordre de lecture d'un fichier Parquet unique est
-le bon.
+À savoir : `compare.py` ne vérifie pas l'ordre des lignes, il ignore cette
+colonne et compare le contenu sans tenir compte de l'ordre.
+
+Pour des données d'entrée converties depuis des QVD, le plus sûr est d'y
+ajouter le numéro de ligne d'origine dans une colonne `_qlik_order`. À
+défaut, l'ordre de lecture d'un fichier Parquet unique convient.
 
 ## Entrées et sorties : `conf/io.yml`
 
-Chaque fichier Qlik est rattaché à l'entrée (ou la sortie) de `conf/io.yml`
-de même nom, ou dont la `location` porte ce nom. Sa `location` et son
-`format` sont utilisés par le job ; son `schema_file` donne les colonnes
-(les `LOAD *` deviennent traduisibles sans aucune donnée) et leurs types.
+Chaque fichier lu ou écrit par le script Qlik est rattaché à l'entrée (ou la
+sortie) de `conf/io.yml` qui porte le même nom, ou dont la `location` porte
+ce nom. Le job utilise sa `location` et son `format`. Son `schema_file`
+donne les colonnes et leurs types, ce qui permet de traduire les `LOAD *`
+sans avoir les données.
 
 ```bash
-python tools/conf.py      # affiche ce qui a été compris de conf/io.yml
+python tools/conf.py      # pour voir ce qui a été compris de conf/io.yml
 ```
 
-Un fichier absent de `conf/io.yml` suit la règle par défaut : écrit par un
-`STORE` → `data/output/<nom>`, sinon `data/input/<nom>`, en Parquet. Le
-rapport liste ces fichiers.
+Un fichier absent de `conf/io.yml` suit la règle par défaut : s'il est écrit
+par un `STORE`, il va dans `data/output/<nom>`, sinon il est lu dans
+`data/input/<nom>`, en Parquet dans les deux cas. Le rapport liste ces
+fichiers.
 
 ## Le modèle ne traduit que des petits morceaux
 
-Quand le traducteur bute, c'est presque toujours sur **une expression** d'un
-LOAD (`ConvertToLocalTime`, `Peek` récursif, fonction inconnue). Il écrit
-alors toute l'instruction et ne laisse qu'un **trou** à la place de cette
-expression. Pour chaque table, dans l'ordre :
+Quand le traducteur bloque, c'est presque toujours sur une seule expression
+d'un LOAD (`ConvertToLocalTime`, un `Peek` récursif, une fonction qu'il ne
+connaît pas). Il écrit quand même toute l'instruction et laisse juste un
+trou à la place de l'expression. Ensuite, pour chaque table :
 
-1. **expressions isolées** (`holes_prompt.md`) : le modèle reçoit chaque
-   expression, l'instruction Qlik qui la contient, les colonnes disponibles
-   avec leur type (`conf/schema`) et l'ordre de chargement ; il répond
-   `h1: <expression>`. Quelques centaines de tokens en entrée, quelques
-   dizaines en sortie. S'il répond `h1: ?`, il est relancé avec plus de
-   contexte (la table résumée) ;
-2. **instructions entières** (`prompt.md`) : seulement pour ce qui bloque
-   toute une instruction (colonnes inconnues, `KEEP` entre tables…), ou en
-   dernier recours si les expressions isolées échouent. Le modèle ne renvoie
-   que les CTE à compléter, greffées dans le brouillon ; le brouillon ne
-   montre en entier que ce que ces CTE lisent.
+1. Les expressions isolées (`holes_prompt.md`). Le modèle reçoit
+   l'expression, l'instruction Qlik qui la contient, les colonnes
+   disponibles avec leur type (`conf/schema`) et l'ordre de chargement, et
+   répond `h1: <expression>`. Ça fait quelques centaines de tokens en
+   entrée et quelques dizaines en sortie. S'il répond `h1: ?`, on le relance
+   avec plus de contexte (la table résumée).
+2. Les instructions entières (`prompt.md`), seulement pour ce qui bloque une
+   instruction complète (colonnes inconnues, `KEEP` entre tables…), ou en
+   dernier recours si les expressions isolées n'ont rien donné. Le modèle ne
+   renvoie que les CTE à compléter, qu'on greffe dans le brouillon. Dans le
+   brouillon qu'on lui montre, seul ce que ces CTE lisent apparaît en
+   entier.
 
-Aucune valeur de donnée n'est envoyée au modèle : seulement des noms et des
+Aucune valeur de donnée n'est envoyée au modèle : uniquement des noms et des
 types de colonnes, et les messages d'erreur de Spark.
 
 ## Le contrôle avant l'assemblage
 
-Avant d'assembler un script, `migrate.py` analyse **toutes** ses requêtes avec
-Spark (`check.py --parse --mark`), sans données : vues vides aux colonnes
-connues, typées par `conf/schema`, sensibles à la casse comme Qlik. Une
-erreur sûre (syntaxe, `GROUP BY`, référence ambiguë…) bloque la table avant
-l'exécution du job. Une colonne introuvable dans une table amont dont les
-colonnes ont été déduites du script (pas de schéma) est seulement signalée.
+Avant d'assembler un script, `migrate.py` fait analyser toutes ses requêtes
+par Spark (`check.py --parse --mark`), sans données : on crée des vues vides
+avec les bonnes colonnes, typées d'après `conf/schema` et sensibles à la
+casse comme dans Qlik. Une erreur certaine (syntaxe, `GROUP BY`, référence
+ambiguë…) bloque la table avant qu'elle n'arrive dans le job. Une colonne
+introuvable est seulement signalée quand les colonnes de la table amont ont
+été déduites du script, faute de schéma, parce qu'on n'en est pas sûr.
 
-Les erreurs déjà présentes dans le brouillon, avant toute réponse du modèle,
-viennent du traducteur : elles ne sont jamais reprochées au modèle.
+Les erreurs déjà présentes dans le brouillon avant que le modèle n'y touche
+viennent du traducteur. On ne les lui renvoie jamais, sinon il cherche à
+corriger ce qui n'est pas de son fait.
 
 ## Le cache d'expressions : `work/expressions.json`
 
-Chaque expression traduite par le modèle y est enregistrée **non vérifiée**.
-Elle devient **vérifiée** quand la comparaison de sa table avec Qlik est
-identique : elle est alors appliquée sans modèle dans tous les scripts
-suivants. Non vérifiée, elle n'est proposée au modèle que comme piste.
-Le fichier se corrige à la main ; ne le supprime pas en vidant `work/`.
+Chaque expression traduite par le modèle y est enregistrée comme non
+vérifiée. Elle passe en vérifiée quand la comparaison de sa table avec Qlik
+est identique, et elle est alors réutilisée telle quelle, sans modèle, dans
+tous les scripts suivants. Tant qu'elle n'est pas vérifiée, elle est juste
+proposée au modèle comme piste.
+
+Le fichier peut se corriger à la main. Attention à ne pas le supprimer en
+vidant `work/`.
 
 ## Vérifier que le modèle répond
 
@@ -189,43 +243,47 @@ Le fichier se corrige à la main ; ne le supprime pas en vidant `work/`.
 python tools/translate.py --selftest
 ```
 
-Envoie une question triviale à l'agent et affiche : code retour, outils que
-le modèle a tenté d'utiliser, texte reçu, SQL extrait. `migrate.py` fait ce
-test automatiquement avant de traduire et s'arrête s'il échoue, plutôt que
-d'enchaîner des échecs sur toutes les tables.
+Ça envoie une question bête à l'agent et affiche le code retour, les outils
+que le modèle a essayé d'utiliser, le texte reçu et le SQL extrait.
+`migrate.py` fait ce test tout seul avant de traduire, et s'arrête s'il
+échoue, plutôt que d'enchaîner les échecs sur toutes les tables.
 
-`translate.py` lance `opencode run --format json` et lit le flux
-d'événements : il distingue ainsi un modèle qui a répondu, un modèle qui a
-tenté un outil (refusé) au lieu de répondre, et un modèle qui n'a produit que
-du raisonnement. Version d'opencode sans `--format json` : repli
-automatique sur la sortie texte.
+`translate.py` lance `opencode run --format json` et lit les événements un
+par un. Ça permet de faire la différence entre un modèle qui a répondu, un
+modèle qui a tenté un outil (refusé) au lieu de répondre, et un modèle qui
+n'a produit que du raisonnement. Avec une version d'opencode qui n'a pas
+`--format json`, on se rabat sur la sortie texte.
 
 ## Voir ce que le modèle a fait
 
-Pour chaque table envoyée au modèle, dans `work/<script>/<table>/` :
+Pour chaque table passée au modèle, dans `work/<script>/<table>/` :
 
 | Fichier | Contenu |
 |---|---|
 | `prompt.md` | le prompt de la table |
-| `model_1.log`, `model_2.log` | commande, **message envoyé**, durée et **réponse brute** (stdout puis stderr), par tentative |
+| `model_1.log`, `model_2.log` | par tentative : la commande, le message envoyé, la durée et la réponse brute (stdout puis stderr) |
 | `query.attempt1.sql`, `query.attempt2.sql` | la requête extraite de chaque réponse |
 
-En tête de chaque log, une ligne `# Note` résume ce qui s'est passé :
+La première ligne de chaque log, `# Note`, résume ce qui s'est passé :
 « a tenté d'utiliser un outil (read…) au lieu de répondre », « n'a produit
 que du raisonnement », « réponse VIDE », « aucune requête SQL trouvée » ou
-« opencode a échoué (code retour non nul) ». Dans les trois cas, la
-tentative est relancée une fois ; si aucun appel n'aboutit, la table passe
-en `erreur_modele` (relancée au prochain `migrate.py`).
+« opencode a échoué (code retour non nul) ». Dans tous ces cas, la tentative
+est relancée une fois. Si aucun appel n'aboutit, la table passe en
+`erreur_modele`, et elle sera reprise au prochain `migrate.py`.
 
-## Quand une table est à corriger
+## Corriger une table à la main
 
-1. Corrige `work/<script>/<table>/query.sql` (`prompt.md` à côté contient le
-   code Qlik et les faits).
-2. `python tools/check.py work/<script> --only <table> --parse`
-3. Relance `migrate.py` : il assemble et compare.
-4. Note la cause dans la colonne `resolution` de `work/journal.csv`.
+1. Corriger `work/<script>/<table>/query.sql` (jamais un
+   `query.attemptN.sql`). Le `prompt.md` d'à côté contient le code Qlik et
+   ce qu'on sait de la table.
+2. Valider la correction :
+   `python tools/check.py work/<script> --only <table> --parse`
+3. Relancer `migrate.py`, qui assemble et compare.
+4. Noter la cause dans la colonne `resolution` de `work/journal.csv`.
 
-Une table en `escalade` n'est jamais retraduite automatiquement.
+Une table en `escalade` n'est jamais retraduite automatiquement, pour ne
+pas écraser une correction manuelle (`translate.py --retry-escalated` si on
+veut la refaire exprès).
 
 ## Les outils
 
@@ -233,31 +291,33 @@ Une table en `escalade` n'est jamais retraduite automatiquement.
 |---|---|
 | `migrate.py` | la seule commande à lancer |
 | `prepare.py` | analyse du script, sections, chemins, rapport |
-| `qlik2sql.py` | traducteur Qlik → Spark SQL sans modèle |
-| `translate.py` | le modèle complète les `TODO(model)` |
-| `check.py` | contrôles, syntaxe Spark avec `--parse` |
+| `qlik2sql.py` | traduction Qlik → Spark SQL sans modèle |
+| `translate.py` | complétion des `TODO(model)` par le modèle |
+| `check.py` | contrôles, et syntaxe Spark avec `--parse` |
 | `conf.py` | lecture de `conf/io.yml` et des schémas |
-| `assemble.py` | `src/<script>/job.py` + `src/<script>/sql/*.sql` |
-| `job_template.py` | gabarit du job, seuls appels à `pyspark-commons` |
-| `verify.py` | lance le job, compare avec `qlik_outputs/` |
+| `assemble.py` | copie des requêtes d'un script dans `src/<nom-projet>/sql/` |
+| `job_template.py` | gabarit du job, le seul endroit qui appelle `pyspark-commons` |
+| `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
 | `compare.py` | comparaison de deux tables |
-| `orchestrate.py` | `src/run_all.py`, ordre des scripts entre eux |
-| `journal.py` | `work/journal.csv` |
+| `orchestrate.py` | génère `src/<nom-projet>/job.py` et ordonne les scripts |
+| `journal.py` | tenue de `work/journal.csv` |
 
-## Limites
+## Limites connues
 
-- Laissés au modèle : `Peek` récursif (cumuls), `FirstSortedValue`,
+- Ce qui reste au modèle : `Peek` récursif (cumuls), `FirstSortedValue`,
   `ConvertToLocalTime` sans fuseau explicite, `RIGHT`/`INNER KEEP` vers une
   table d'une autre section, boucles sur `FileList`, `SQL SELECT` avec
-  jointure ou `WHERE` (dialecte de la base).
-- `JOIN` (ordre des lignes) : Qlik ne documente pas l'ordre après une
-  jointure ; la règle « gauche puis lignes sans correspondance » est à
-  confirmer par la comparaison.
-- `ApplyMap` : en cas de clés en double, Qlik garde la première valeur, la
-  traduction prend la plus petite.
-- `Date(x)` sur un nombre (date Qlik en jours) n'est pas converti.
+  jointure ou `WHERE` (le dialecte dépend de la base).
+- L'ordre des lignes après un `JOIN` : Qlik ne le documente pas. La règle
+  « la gauche, puis les lignes sans correspondance » reste à confirmer, et
+  `compare.py` ne vérifie pas l'ordre, il faudra donc le contrôler à part.
+- Avec `FieldValue('F', RecNo())`, les valeurs sont numérotées dans l'ordre
+  trié, alors que Qlik suit l'ordre de chargement.
+- `Date(x)` appliqué à un nombre (date Qlik en jours) n'est pas converti.
 - `QUALIFY`, `NullAsValue`, `SET NullInterpret/NullValue` : signalés, à
-  compléter.
-- L'ordre entre scripts ne voit que les fichiers, pas les bases de données.
-- Testé ici avec un vrai Spark 4.0 (ta cible est 3.5.8) et un faux
-  `pyspark-commons` reproduisant son API ; pas avec un vrai opencode.
+  compléter à la main.
+- L'ordre entre scripts ne tient compte que des fichiers, pas des tables en
+  base de données.
+- Testé avec Spark 4.0 en local (la cible est la 3.5.8) et une version
+  bouchonnée de `pyspark-commons` qui reproduit son API. Pas encore testé
+  avec un vrai opencode.

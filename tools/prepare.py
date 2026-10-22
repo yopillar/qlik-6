@@ -1,14 +1,19 @@
-"""Prépare la traduction d'un script Qlik en Spark SQL, sans modèle.
+"""Prépare la traduction d'un script Qlik en Spark SQL, sans le modèle.
 
-  1. découpage en instructions (chaînes, crochets, commentaires, LOAD empilés) ;
-  2. exécution « à blanc » : variables remplacées ($(v), $(#v), $(v(a,b))),
-     CALL de SUB développés, FOR à liste fixe déroulés, IF évaluables tranchés ;
+Étapes :
+  1. découpage en instructions, en tenant compte des chaînes, des crochets,
+     des commentaires et des LOAD empilés
+  2. exécution « à blanc » : on remplace les variables ($(v), $(#v),
+     $(v(a,b))), on développe les CALL de SUB, on déroule les FOR à liste
+     fixe et on tranche les IF qu'on sait évaluer
   3. graphe des tables (RESIDENT, JOIN, CONCATENATE, ApplyMap, DROP, STORE),
-     colonnes suivies, clés implicites des JOIN, auto-concaténation ;
-  4. une section par table finale (tables TMP incluses), dans l'ordre ;
-  5. traduction Qlik -> Spark SQL par qlik2sql.py : une CTE par instruction ;
-     ce qui ne se traduit pas avec certitude devient une CTE « TODO(model) »
-     et un prompt.md minimal est écrit pour le modèle.
+     avec le suivi des colonnes, les clés implicites des JOIN et
+     l'auto-concaténation
+  4. une section par table finale, dans l'ordre du script (tables TMP
+     comprises)
+  5. traduction en Spark SQL par qlik2sql.py, une CTE par instruction. Ce
+     qu'on ne sait pas traduire à coup sûr devient une CTE « TODO(model) »,
+     et on écrit un prompt.md minimal pour le modèle.
 
 Usage :
     python tools/prepare.py script_qvd/ventes.qvs
@@ -17,7 +22,7 @@ Usage :
 Sorties dans work/<script>/ :
     manifest.json, rapport.md
     <section>/source.qvs   code Qlik de la table
-    <section>/query.sql    requête Spark SQL (complète, ou avec TODO(model))
+    <section>/query.sql    requête Spark SQL (complète, ou avec des TODO(model))
     <section>/prompt.md    seulement s'il reste des TODO(model)
 """
 
@@ -36,8 +41,8 @@ from conf import IoConf  # noqa: E402
 from qlik2sql import (SectionContext, translate_section,  # noqa: E402
                       view_name)
 
-# Construction détectée -> skill à injecter (adapter aux noms de tes skills)
-# Construction présente dans une partie à compléter -> skill injecté
+# Skill à joindre au prompt selon ce qu'on trouve dans la partie à compléter.
+# Les noms doivent correspondre aux dossiers de .opencode/skills/.
 SKILL_BY_CONSTRUCT = {
     "applymap": "qlik-mapping-to-sql",
     "join": "qlik-joins-sql",
@@ -51,7 +56,8 @@ CONTROL_WORDS = {"FOR", "NEXT", "IF", "ELSEIF", "ELSE", "END", "ENDIF",
                  "SUB", "ENDSUB", "DO", "LOOP", "SWITCH", "CASE", "DEFAULT",
                  "ENDSWITCH", "EXIT"}
 OPENERS = {"FOR", "DO", "SUB", "SWITCH", "IF"}
-# variables de paramétrage régional : jamais substituées dans le code
+# Variables de paramétrage régional (séparateurs, formats de date…). Qlik s'en
+# sert pour interpréter les données, on ne les remplace jamais dans le code.
 SYSTEM_VARS = {"ThousandSep", "DecimalSep", "MoneyThousandSep",
                "MoneyDecimalSep", "MoneyFormat", "TimeFormat", "DateFormat",
                "TimestampFormat", "MonthNames", "LongMonthNames", "DayNames",
@@ -63,14 +69,14 @@ NAME = r"(\[[^\]]+\]|\"[^\"]+\"|[^\s,;()\[\]\"'=]+)"
 
 
 # ==========================================================================
-# 1. Tokenisation
+# 1. Découpage en instructions
 # ==========================================================================
 
 @dataclass
 class Stmt:
     raw: str
     line: int            # ligne du premier caractère de raw
-    first_line: int      # ligne du premier caractère utile
+    first_line: int      # ligne du premier caractère qui n'est pas un blanc
     last_line: int
 
     @property
@@ -92,7 +98,8 @@ def normalize(text: str) -> str:
 
 
 def strip_comments(text: str) -> str:
-    """Retire // et /* */ hors chaînes et crochets (lib:// préservé)."""
+    """Retire les // et /* */ qui ne sont ni dans une chaîne ni entre
+    crochets (lib:// n'est donc pas touché)."""
     out, i, n, quote = [], 0, len(text), None
     while i < n:
         ch = text[i]
@@ -117,8 +124,9 @@ def strip_comments(text: str) -> str:
 
 
 def tokenize(text: str) -> list[Stmt]:
-    """Découpe en instructions. Les instructions de contrôle (FOR, IF…THEN,
-    NEXT, ENDIF…) n'ont pas de ';' : elles s'arrêtent en fin de ligne."""
+    """Découpe le script en instructions. Les instructions de contrôle (FOR,
+    IF…THEN, NEXT, ENDIF…) n'ont pas de ';', elles s'arrêtent en fin de
+    ligne."""
     stmts: list[Stmt] = []
     i, n, line = 0, len(text), 1
     start, start_line, first_line = 0, 1, None
@@ -177,14 +185,17 @@ def tokenize(text: str) -> list[Stmt]:
 
 
 def drop_rem(stmts: list[Stmt]) -> list[Stmt]:
-    """« REM … ; » est un commentaire Qlik : supprimé comme // et /* */."""
+    """« REM … ; » est un commentaire en Qlik, on l'enlève comme // et
+    /* */."""
     return [st for st in stmts if st.word != "REM"]
 
 
 def merge_preceding_loads(stmts: list[Stmt]) -> list[Stmt]:
-    """Fusionne les LOAD empilés : en Qlik, un « preceding load »
-    (LOAD sans FROM/RESIDENT/INLINE/AUTOGENERATE) se termine par ';' mais
-    s'applique à l'instruction qui le suit. Ils forment UNE seule table."""
+    """Fusionne les LOAD empilés.
+
+    En Qlik, un preceding load (LOAD sans FROM, RESIDENT, INLINE ni
+    AUTOGENERATE) se termine bien par ';', mais il s'applique à
+    l'instruction qui suit. L'ensemble ne fait qu'une table."""
     out: list[Stmt] = []
     pending: Stmt | None = None
     for st in stmts:
@@ -213,7 +224,7 @@ def merge_preceding_loads(stmts: list[Stmt]) -> list[Stmt]:
 @dataclass
 class Node:
     kind: str                      # stmt | for | if | sub | do | switch
-    stmt: Stmt | None = None       # instruction (ou en-tête du bloc)
+    stmt: Stmt | None = None       # l'instruction, ou l'en-tête du bloc
     branches: list = field(default_factory=list)   # [(en-tête, [Node])]
     closer: Stmt | None = None
 
@@ -230,7 +241,8 @@ def parse_blocks(stmts: list[Stmt]) -> tuple[list[Node], list[str]]:
         w = st.word
         c = st.clean
         if w == "IF" and not re.search(r"\bTHEN\s*$", c, re.I):
-            current().append(Node("stmt", st))     # IF sur une ligne : rare
+            # IF sur une seule ligne, rare
+            current().append(Node("stmt", st))
             warnings.append(f"l.{st.first_line}: IF sur une seule ligne")
             continue
         if w == "END" and re.match(r"\s*END\s*(IF|SUB|SWITCH)\b", c, re.I) \
@@ -265,7 +277,7 @@ def parse_blocks(stmts: list[Stmt]) -> tuple[list[Node], list[str]]:
 
 @dataclass
 class Inst:
-    """Instruction « exécutée » : texte avec variables substituées."""
+    """Une instruction « exécutée » : son texte, variables remplacées."""
     stmt: Stmt
     text: str
     context: list[str] = field(default_factory=list)
@@ -290,21 +302,26 @@ LET_TOKEN = re.compile(r"'[^']*'|\[[^\]]*\]|\"[^\"]*\"|([^\W\d][\w.#]*)\s*(\()?"
 
 class Env:
     def let_expression(self, name: str, text: str, pos: int) -> str | None:
-        """$(v) d'un LET calculé (LET v = Peek(…), Today(), NoOfRows(…)…) :
-        on substitue l'expression elle-même, traduite en SQL plus loin.
-        Seulement dans une expression (pas dans une chaîne ni un nom), et si
-        l'expression ne lit que des fonctions et des littéraux."""
+        """Pour $(v) quand v est un LET calculé (LET v = Peek(…), Today(),
+        NoOfRows(…)…) : on met l'expression à la place, elle sera traduite
+        en SQL plus loin.
+
+        On ne le fait que dans une expression (pas dans une chaîne ni dans
+        un nom), et seulement si l'expression ne contient que des fonctions
+        et des littéraux."""
         rhs = self.lets.get(name)
         if not rhs or "$(" in rhs or _in_quotes(text, pos):
             return None
         for m in LET_TOKEN.finditer(rhs):
             if m.group(1) and not m.group(2):
-                return None          # nom nu : variable ou champ, incertain
+                # nom nu : variable ou champ ? on ne sait pas
+                return None
         return f"({rhs})"
 
     def bare_variables(self, text: str) -> str:
-        """AUTOGENERATE vMax - vMin + 1 : sans table source, un nom nu ne peut
-        être qu'une variable ; on le remplace par sa valeur ou son expression."""
+        """Dans AUTOGENERATE vMax - vMin + 1, il n'y a pas de table source,
+        donc un nom nu est forcément une variable : on le remplace par sa
+        valeur ou par son expression."""
         m = re.search(r"\bAUTOGENERATE\b(.*?)(;|$)", text, re.I | re.S)
         if not m:
             return text
@@ -319,13 +336,14 @@ class Env:
         return text[:m.start(1)] + new + text[m.end(1):]
 
     def __init__(self):
-        self.directory = ""             # instruction DIRECTORY courante
+        self.directory = ""             # dernier DIRECTORY rencontré
         self.vars: dict[str, str | None] = {}
         self.lets: dict[str, str] = {}
 
     def expand(self, text: str) -> str:
-        # '$(v)' seul entre apostrophes, v étant un LET calculé (date, Peek…) :
-        # Qlik interprète la valeur, on substitue l'expression elle-même
+        # '$(v)' tout seul entre apostrophes, avec v un LET calculé (date,
+        # Peek…) : Qlik interprète la valeur, donc on met directement
+        # l'expression.
         def quoted(m):
             sub = self.let_expression(m.group(1), "", 0)
             return sub if sub else m.group(0)
@@ -352,7 +370,8 @@ class Env:
 
 
 def _in_quotes(text: str, pos: int) -> bool:
-    """La position est-elle dans une chaîne '…' ou un nom […] / "…" ?"""
+    """Dit si la position tombe dans une chaîne '…' ou dans un nom […] ou
+    "…"."""
     quote = None
     for ch in text[:pos]:
         if quote:
@@ -371,7 +390,8 @@ def unquote(v: str) -> str:
 
 
 def let_value(expr: str) -> str | None:
-    """Valeur d'un LET si c'est un littéral (nombre, chaîne, concaténation)."""
+    """Valeur d'un LET quand c'est un littéral (nombre, chaîne ou
+    concaténation de littéraux)."""
     expr = expr.strip()
     if re.fullmatch(r"-?\d+(\.\d+)?", expr):
         return expr
@@ -382,7 +402,8 @@ def let_value(expr: str) -> str | None:
 
 
 def eval_condition(cond: str) -> bool | None:
-    """Évalue une condition triviale entre littéraux (après substitution)."""
+    """Évalue une condition simple entre littéraux, une fois les variables
+    remplacées."""
     lit = r"('[^']*'|-?\d+(?:\.\d+)?)"
     m = re.fullmatch(r"\s*" + lit + r"\s*(=|<>|<=|>=|<|>)\s*" + lit + r"\s*", cond)
     if not m:
@@ -414,7 +435,7 @@ def execute(nodes, env: Env, ctx, subs, out: list[Inst], notes: list[str],
             run_for(node, env, ctx, subs, out, notes, depth)
         elif node.kind == "if":
             run_if(node, env, ctx, subs, out, notes, depth)
-        else:   # do, switch : exécutés une fois, signalés
+        else:   # do, switch : exécutés une fois, et signalés
             label = f"bloc {node.kind.upper()} l.{node.stmt.first_line}"
             out.append(control_inst(node.stmt, env, ctx))
             for _, body in node.branches:
@@ -430,7 +451,7 @@ def control_inst(st, env, ctx):
 
 
 class StopScript(Exception):
-    """EXIT SCRIPT exécuté : Qlik s'arrête là."""
+    """Levée sur un EXIT SCRIPT : Qlik s'arrête là."""
 
     def __init__(self, line: int):
         super().__init__(line)
@@ -441,7 +462,8 @@ def run_stmt(st, env, ctx, subs, out, notes, depth):
     c = st.clean
     w = st.word
     if w == "EXIT" and re.match(r"\s*EXIT\s+SCRIPT\s*;?\s*$", c, re.I):
-        # EXIT SCRIPT inconditionnel, hors IF/boucle incertains : fin du script
+        # EXIT SCRIPT inconditionnel, et pas dans un IF ou une boucle qu'on n'a
+        # pas su trancher : le script s'arrête ici.
         uncertain = [x for x in ctx if x.startswith(("branche", "boucle",
                                                      "bloc"))]
         if not uncertain:
@@ -544,7 +566,8 @@ def run_if(node, env, ctx, subs, out, notes, depth):
             notes.append(f"l.{header.first_line}: condition « {cond} » fausse, "
                          "branche ignorée")
             continue
-        # condition non évaluable : toutes les branches, signalées
+        # condition qu'on ne sait pas évaluer : on garde toutes les branches,
+        # et on le signale
         undecided = True
         out.append(control_inst(header, env, ctx))
         execute(body, env, ctx + [f"branche conditionnelle l.{header.first_line}"
@@ -585,7 +608,8 @@ def split_top(s: str) -> list[str]:
 
 
 def mask_strings(s: str) -> str:
-    """Remplace le contenu des chaînes par des X (garde les crochets)."""
+    """Remplace le contenu des chaînes par des X, en gardant les
+    crochets."""
     return re.sub(r"'[^']*'", lambda m: "'" + "X" * (len(m.group()) - 2) + "'", s)
 
 
@@ -681,7 +705,7 @@ def analyze(inst: Inst) -> None:
     if inst.target is None:
         inst.target = inst.label
 
-    # « … AS Resident » ou « …, Resident » : un champ, pas la clause
+    # dans « … AS Resident » ou « …, Resident », c'est un champ, pas la clause
     rm = next((m for m in re.finditer(r"\bRESIDENT\s+" + NAME, body, re.I)
                if not re.search(r"(\bAS|,)\s*$", body[:m.start()], re.I)
                and m.group(1) != ","), None)
@@ -690,8 +714,8 @@ def analyze(inst: Inst) -> None:
         inst.constructs.add("resident")
     sel = re.search(r"\bSELECT\b", masked, re.I)
     if sel:
-        # SQL SELECT vers une base : chaque table lue est supposée exportée
-        # en Parquet dans data/input/<table>
+        # SQL SELECT vers une base : on suppose que chaque table lue a été
+        # exportée en Parquet dans data/input/<table>.
         for tm in re.finditer(r"\b(?:FROM|JOIN)\s+(\[[^\]]+\]|\"[^\"]+\"|[\w.$]+)",
                               body[sel.end():], re.I):
             table = strip_name(tm.group(1)).split(".")[-1].strip('"[]')
@@ -730,7 +754,8 @@ def analyze(inst: Inst) -> None:
                              "IN", "AND", "OR", "NOT", "JOIN", "KEEP",
                              "CONCATENATE", "WHERE", "INTO", "TXT", "QVD"):
             inst.functions.add(f.lower())
-    # fonctions dépendant de l'ordre de chargement, laissées au modèle
+    # Fonctions qui dépendent de l'ordre de chargement. Si l'une d'elles finit
+    # chez le modèle, il recevra la skill qlik-row-functions-sql.
     if inst.functions & {"peek", "previous", "above", "below", "firstvalue",
                          "lastvalue", "firstsortedvalue"}:
         inst.constructs.add("row_functions")
@@ -760,7 +785,8 @@ def _balanced(s: str, open_idx: int) -> str:
 
 
 def extract_fields(body: str) -> list[str]:
-    """Colonnes produites par le dernier LOAD (le plus haut d'un LOAD empilé)."""
+    """Colonnes produites par le dernier LOAD, c'est-à-dire celui du haut
+    dans un LOAD empilé."""
     masked = mask_strings(body)
     m = re.search(r"\bLOAD\b(?:\s+DISTINCT\b)?", masked, re.I)
     if not m:
@@ -788,7 +814,8 @@ def extract_fields(body: str) -> list[str]:
 
 
 def resolve_path(path: str, directory: str) -> str:
-    """Préfixe un chemin relatif par le DIRECTORY courant (comme Qlik)."""
+    """Préfixe un chemin relatif par le DIRECTORY courant, comme le fait
+    Qlik."""
     if not directory or re.match(r"(lib://|[A-Za-z]:|[\\/]|\.\.|https?:)",
                                  path, re.I):
         return path
@@ -801,11 +828,14 @@ def resolve_path(path: str, directory: str) -> str:
 # ==========================================================================
 
 def build_graph(insts: list[Inst]):
-    """Construit les tables. Une table supprimée (DROP) puis rechargée sous le
-    même nom devient une NOUVELLE table : clé « NOM__2 », « NOM__3 »…"""
+    """Construit les tables du script.
+
+    Une table supprimée (DROP) puis rechargée sous le même nom est une
+    autre table pour nous : elle prend la clé « NOM__2 », puis « NOM__3 »,
+    etc."""
     tables: dict[str, dict] = {}
     schemas: dict[str, list[str]] = {}
-    live: dict[str, str] = {}        # nom Qlik -> clé de la version vivante
+    live: dict[str, str] = {}        # nom Qlik -> clé de la version en cours
     versions: dict[str, int] = {}
     last = None
     anon = 0
@@ -844,13 +874,14 @@ def build_graph(insts: list[Inst]):
             inst.resident = ref(inst.resident)
             for a in inst.applymaps:
                 a["map"] = ref(a["map"])
-            # Peek('f', n, 'T') / NoOfRows('T') : table lue à ce moment-là
+            # Peek('f', n, 'T') / NoOfRows('T') : dépend de l'état de T à ce
+            # moment-là
             inst.table_refs = {}
             for tm in re.finditer(r"\b(?:Peek\s*\([^()]*?,[^()]*?|NoOfRows\s*\()"
                                   r"\s*'([^']+)'\s*\)", inst.text, re.I):
                 if tm.group(1) in live:
                     inst.table_refs[tm.group(1)] = live[tm.group(1)]
-            # Exists(champ) : tables vivantes qui contiennent déjà ce champ
+            # Exists(champ) : les tables déjà chargées qui ont ce champ
             inst.exists_tables = {}
             for fm in re.finditer(r"\bExists\s*\(\s*(\[[^\]]+\]|\"[^\"]+\"|"
                                   r"'[^']+'|[^\s,()]+)", inst.text, re.I):
@@ -866,7 +897,8 @@ def build_graph(insts: list[Inst]):
                         else ["*"]
                 else:
                     new.append(f)
-            # auto-concaténation Qlik : mêmes champs qu'une table vivante
+            # auto-concaténation de Qlik : mêmes champs qu'une table déjà
+            # chargée
             if not explicit and "noconcatenate" not in inst.constructs \
                     and "mapping" not in inst.constructs \
                     and "*" not in new and "?" not in new:
@@ -887,8 +919,9 @@ def build_graph(insts: list[Inst]):
                 key = ref(inst.target) if inst.target in live else \
                     create(inst.target)
             elif "keep" in inst.constructs:
-                # la table entre parenthèses filtre la table chargée : c'est
-                # une dépendance (ordre des sections, vue à exposer)
+                # La table entre parenthèses filtre celle qu'on charge. C'est
+                # donc une dépendance : elle compte pour l'ordre des sections
+                # et doit exister en vue.
                 inst.keep_other = ref(inst.target)
                 key = create(inst.label) if inst.label else ref(inst.target)
             else:
@@ -929,8 +962,8 @@ def build_graph(insts: list[Inst]):
         elif inst.kind == "store" and inst.stored:
             key = ref(inst.stored[0])
             if key not in tables:
-                # même table écrite avec une autre casse (STORE commandes /
-                # table Commandes) : on la rattache quand même
+                # Même table écrite avec une autre casse (STORE commandes /
+                # table Commandes) : on la rattache quand même.
                 same = [v for n_, v in live.items()
                         if n_.lower() == inst.stored[0].lower()]
                 key = same[0] if len(same) == 1 else key
@@ -993,8 +1026,8 @@ def build_sections(insts, tables, schemas):
         else:
             f = downstream(n)
             owner[n] = next(iter(f)) if len(f) == 1 else n
-    # une table interne à une section mais lue par une autre section doit
-    # devenir sa propre section (sinon elle n'existe pas comme vue SQL)
+    # Une table interne à une section mais lue par une autre doit devenir une
+    # section à part, sinon elle n'existera pas comme vue SQL.
     changed = True
     while changed:
         changed = False
@@ -1018,11 +1051,12 @@ def build_sections(insts, tables, schemas):
             continue
         if inst.kind in ("variable", "connect", "include", "other",
                          "control"):
-            # les IF/FOR/DO ne sont pas recopiés : chaque instruction porte
-            # son contexte (boucle, condition, CALL) dans les Facts
+            # On ne recopie pas les IF/FOR/DO : chaque instruction garde son
+            # contexte (boucle, condition, CALL) dans ses Facts.
             sec_of[k] = "__init__"
             continue
-        # STORE/DROP d'une table inconnue, RENAME… : section voisine
+        # STORE/DROP d'une table inconnue, RENAME… : on le met dans la section
+        # voisine
         nxt = next((sec_of[j] for j in range(k + 1, len(insts))
                     if sec_of.get(j, "__init__") != "__init__"), None)
         prv = next((sec_of[j] for j in range(k - 1, -1, -1)
@@ -1061,24 +1095,26 @@ def norm_path(path: str) -> str:
 
 
 def file_stem(path: str) -> str:
-    """Nom du fichier sans dossiers ni extension : c'est la seule clé."""
+    """Nom du fichier sans dossier ni extension. C'est la seule clé qu'on
+    utilise pour rapprocher les fichiers."""
     name = re.split(r"[\\/]", path.replace("\\", "/"))[-1]
     return re.sub(r"\.(qvd|txt|csv|parquet|xlsx?)$", "", name, flags=re.I)
 
 
 def is_output(path: str, stored: dict) -> bool:
-    """Fichier écrit par un STORE de ce script ou d'un autre script du projet."""
+    """Vrai si le fichier est écrit par un STORE, de ce script ou d'un autre
+    script du projet."""
     return norm_path(path) in stored.get("paths", ()) or \
         file_stem(path).lower() in stored.get("names", ())
 
 
 def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
-    """Fichier Qlik -> (location, format, entrée de conf/io.yml ou None).
+    """Associe un fichier Qlik à (location, format, entrée io.yml ou None).
 
-    1. l'entrée de conf/io.yml de même nom (sorties pour un fichier écrit par
-       un STORE, entrées sinon) ;
-    2. à défaut, la règle fixe : data/output/<nom> pour un fichier écrit par
-       un STORE, data/input/<nom> sinon, en Parquet."""
+    On prend d'abord l'entrée de conf/io.yml qui a le même nom (dans les
+    sorties si le fichier est écrit par un STORE, dans les entrées sinon).
+    S'il n'y en a pas, règle fixe : data/output/<nom> pour un fichier écrit
+    par un STORE, data/input/<nom> sinon, en Parquet."""
     output = store or is_output(path, stored)
     entry = conf.find(path, "output" if output else "input") if conf else None
     if entry:
@@ -1093,8 +1129,8 @@ def map_path(path: str, stored: dict, conf: IoConf | None = None,
 
 
 def numbered(insts_of_section) -> str:
-    """Code de la section, commentaires et lignes vides retirés, numéros de
-    ligne du script d'origine conservés."""
+    """Code de la section sans commentaires ni lignes vides, avec les
+    numéros de ligne du script d'origine."""
     lines = []
     for inst in insts_of_section:
         text = strip_comments(inst.text)
@@ -1213,7 +1249,8 @@ def hole_block(h: dict) -> str:
 
 
 def hole_key(h: dict) -> str:
-    """Clé du cache d'expressions : même expression Qlik, même contexte."""
+    """Clé du cache d'expressions : la même expression Qlik dans le même
+    contexte."""
     return f"{h['kind']}|{h.get('qualifier') or ''}|{' '.join(h['qlik'].split())}"
 
 
@@ -1282,7 +1319,7 @@ def mapping_code(insts) -> str:
 
 
 def analyze_script(script: Path):
-    """Tokenise, exécute à blanc et construit le graphe d'un script."""
+    """Découpe, exécute à blanc et construit le graphe d'un script."""
     text = script.read_text(encoding="utf-8-sig", errors="replace") \
         .replace("\r\n", "\n")
     stmts = merge_preceding_loads(drop_rem(tokenize(text)))
@@ -1299,9 +1336,9 @@ def analyze_script(script: Path):
 
 
 def collect_io(script: Path) -> dict:
-    """Fichiers lus et écrits par un script (chemins normalisés), et colonnes
-    connues des fichiers écrits : un autre script qui fait « LOAD * » dessus
-    connaîtra ainsi ses colonnes."""
+    """Fichiers lus et écrits par un script (chemins normalisés), plus les
+    colonnes connues des fichiers écrits. Un autre script qui fait un
+    « LOAD * » sur l'un d'eux connaîtra ainsi ses colonnes."""
     _, _, insts, _, _, schemas = analyze_script(script)
     writes, columns = set(), {}
     for i in insts:
@@ -1315,7 +1352,8 @@ def collect_io(script: Path) -> dict:
 
 
 def load_project_stores(path: Path, script_name: str) -> dict:
-    """Chemins écrits par tous les scripts, et noms écrits par les AUTRES."""
+    """Chemins écrits par l'ensemble des scripts, et noms écrits par les
+    autres scripts que celui-ci."""
     if not path.exists():
         return {"paths": set(), "names": {}, "columns": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -1330,8 +1368,9 @@ def load_project_stores(path: Path, script_name: str) -> dict:
 
 
 def load_cache(out_root: Path) -> dict:
-    """Expressions déjà traduites par le modèle et validées (work/
-    expressions.json) : réutilisées sans modèle, modifiables à la main."""
+    """Expressions déjà traduites par le modèle et validées
+    (work/expressions.json). On les réutilise sans repasser par le modèle,
+    et on peut les corriger à la main dans le fichier."""
     f = out_root / "expressions.json"
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
 
@@ -1345,8 +1384,9 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
     for i in insts:
         i.clean_text = strip_comments(i.text)
 
-    # réglages qui changent les données des LOAD suivants
-    global_settings = []      # (index d'instruction, texte, champs | None)
+    # réglages qui changent la façon dont les LOAD suivants chargent les
+    # données
+    global_settings = []      # (n° d'instruction, texte, champs ou None)
     for k, i in enumerate(insts):
         c = normalize(i.clean_text)
         m = re.match(r"(UN)?QUALIFY\b|NULLASVALUE\b|NULLASNULL\b", c, re.I)
@@ -1365,7 +1405,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         if not (skills_dir / name / "SKILL.md").exists():
             notes.append(f"skill {name} introuvable dans {skills_dir}")
 
-    # chemins : écrit par un STORE (ce script ou un autre) -> data/output
+    # fichier écrit par un STORE (ici ou dans un autre script) : data/output
     project_stores = project_stores or {"paths": set(), "names": {},
                                         "columns": {}}
     stored = {"paths": {norm_path(i.stored[1]) for i in insts
@@ -1399,14 +1439,16 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
     ids = {g: f"{k:03d}_{slug('init' if g == '__init__' else g)}"
            for k, g in enumerate((["__init__"] if has_init else []) + order)}
     table_views = {g: view_name(g) for g in order}
-    # types de colonnes déclarés dans conf/schema (par nom de colonne)
+    # types déclarés dans conf/schema, par nom de colonne
     conf_types: dict[str, str] = {}
     if conf:
         for e in conf.inputs + conf.outputs:
             conf_types.update(e.types or {})
     inputs: dict[str, dict] = {}         # vue d'entrée -> location, format
-    final_columns: dict[str, list] = {}  # colonnes produites par chaque section
-    missing_conf: set[str] = set()       # fichiers absents de conf/io.yml
+    # colonnes produites par chaque section
+    final_columns: dict[str, list] = {}
+    # fichiers qu'on n'a pas trouvés dans io.yml
+    missing_conf: set[str] = set()
 
     def input_view(path: str) -> str:
         location, fmt, entry = resolve_io(path, stored, conf)
@@ -1420,7 +1462,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
         return view
 
     def file_schema(path: str):
-        # 1. schéma de conf/schema ; 2. Parquet présent ; 3. STORE d'un script
+        # Par ordre de préférence : conf/schema, puis un Parquet déjà présent,
+        # puis le STORE d'un autre script.
         entry = resolve_io(path, stored, conf)[2]
         if entry and entry.columns:
             return entry.columns
@@ -1501,7 +1544,7 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             return [table_views[t] for t in found]
         produced.append(g)
 
-        # ---- traduction déterministe
+        # ---- traduction sans modèle
         inputs.clear()
         ctx = SectionContext(
             final_table=g,
@@ -1520,16 +1563,18 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                   "-- Traduit depuis Qlik par tools/prepare.py\n")
         sql, todos, cols, technical, short_sql, holes, derived = translate_section(
             sec_insts, [i.clean_text for i in sec_insts], ctx, header)
-        # colonnes calculées en date : connues des tables suivantes (un même
-        # nom de champ désigne la même donnée dans le modèle associatif Qlik)
+        # Colonnes calculées en date : on les fait connaître aux tables
+        # suivantes. Dans le modèle associatif de Qlik, un même nom de champ
+        # désigne la même donnée partout.
         for c_, t_ in derived.items():
             conf_types.setdefault(c_, t_)
-        # expressions déjà traduites et validées ailleurs : sans modèle
+        # expression déjà traduite et validée ailleurs : pas besoin du modèle
         known = {h["id"]: cache[hole_key(h)]["sql"] for h in holes
                  if cache.get(hole_key(h), {}).get("verified")}
         for h in holes:
             if hole_key(h) in cache and h["id"] not in known:
-                h["hint"] = cache[hole_key(h)]["sql"]    # piste non vérifiée
+                # simple piste, pas encore vérifiée
+                h["hint"] = cache[hole_key(h)]["sql"]
         if known:
             sql = fill_holes(sql, known)
             short_sql = fill_holes(short_sql, known)
@@ -1566,7 +1611,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
             (d / "prompt.md").unlink(missing_ok=True)
             sec["status"] = "deterministic"
         elif unchanged and old.get("status") in ("ok", "escalade"):
-            sec["status"] = old["status"]      # déjà complété, inchangé
+            # déjà complétée et pas modifiée depuis
+            sec["status"] = old["status"]
         else:
             (d / "query.sql").write_text(sql, encoding="utf-8")
             statement_todos = [t for t in todos if "(expression h" not in t]
@@ -1592,9 +1638,9 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                                   applicable),
                 mappings=("\n# Mappings used\n" + map_txt) if map_txt else "",
                 skills=skill_txt)
-            # prompt.md : instructions entières à compléter ; pour une table
-            # qui n'a que des trous d'expression, dernier recours si le modèle
-            # n'arrive pas à les traduire isolément
+            # prompt.md, pour les instructions entières à compléter. Pour une
+            # table qui n'a que des trous d'expression, il sert de dernier
+            # recours si le modèle n'arrive pas à les traduire une par une.
             (d / "prompt.md").write_text(prompt, encoding="utf-8")
             sec["statement_todos"] = bool(statement_todos)
             sec["prompt_tokens"] = len(prompt) // 4 if statement_todos else 0
@@ -1610,7 +1656,8 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                     if len(code) > 3000 and not any(re.search(
                             r"\b(peek|previous|above)\b", h["qlik"], re.I)
                             for h in hs):
-                        # très gros LOAD : seules les lignes des expressions
+                        # LOAD énorme : on ne garde que les lignes qui
+                        # contiennent les expressions
                         first = code.splitlines()[:2]
                         keep = [ln for ln in code.splitlines()
                                 if any(h["qlik"].splitlines()[0].strip()[:40]
@@ -1657,7 +1704,7 @@ def _known(cols):
 
 
 def parquet_columns(path: str):
-    """Colonnes d'un Parquet déjà présent dans data/ (sinon None) : permet de
+    """Colonnes d'un Parquet déjà présent dans data/, ou None. Ça permet de
     traduire les « LOAD * FROM fichier » et de calculer leurs clés."""
     try:
         import pyarrow.parquet as pq

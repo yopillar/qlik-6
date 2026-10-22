@@ -1,20 +1,24 @@
-"""Migration complète en UNE commande.
+"""Lance toute la migration d'un script, ou d'un dossier de scripts.
 
-    python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # 1re fois
-    python tools/migrate.py script_qvd/ventes.qvs             # le reste
+    python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # la 1re fois
+    python tools/migrate.py script_qvd/ventes.qvs             # ensuite
     python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
 
-Enchaîne pour chaque script :
-  1. prepare.py   découpage et traduction Qlik -> SQL sans modèle ;
-                  les parties non traduites sont marquées TODO(model)
-  2. translate.py le modèle complète ces parties, une table par appel,
-                  contrôle, 1 relance
-  3. assemble.py  src/<script>/job.py + src/<script>/sql/, dès que tout est validé
-  4. verify.py    si qlik_outputs/ existe : lance le job, compare à Qlik
-Puis orchestrate.py génère src/run_all.py, le job principal qui lance tous
-les scripts migrés dans l'ordre de leurs dépendances.
+Pour chaque script on enchaîne :
+  1. prepare.py    découpe le script et traduit en SQL tout ce qu'on sait
+                   traduire sans le modèle (le reste est marqué TODO(model))
+  2. translate.py  fait compléter les TODO par le modèle, une table par
+                   appel, avec un contrôle et une relance si ça ne passe pas
+  3. assemble.py   copie les requêtes dans src/<nom-projet>/sql/ quand tout
+                   est validé, puis orchestrate.py régénère job.py
+  4. verify.py     compare avec Qlik, s'il y a des sorties dans
+                   data/qlik_outputs/
 
-Relançable à volonté : ce qui est déjà traduit et inchangé n'est pas refait.
+Au bout, src/<nom-projet>/job.py contient tous les scripts assemblés, dans
+l'ordre de leurs dépendances.
+
+On peut relancer autant de fois qu'on veut : ce qui est déjà traduit et n'a
+pas bougé n'est pas refait.
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ import sys
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TOOLS))
+from job_template import project_dir  # noqa: E402
 WORK = Path("work")
 
 
@@ -50,10 +56,12 @@ def main(argv=None) -> int:
     if not scripts:
         print(f"Aucun .qvs dans {args.path}")
         return 1
-    compare = Path("qlik_outputs").is_dir() and any(Path("qlik_outputs").iterdir())
+    qlik_dir = Path("data") / "qlik_outputs"
+    compare = qlik_dir.is_dir() and any(qlik_dir.iterdir())
 
-    # recensement de TOUS les scripts du dossier : un fichier écrit par un
-    # script et lu par un autre doit être lu dans data/output
+    # On recense tous les scripts du dossier, même si on n'en migre qu'un :
+    # quand un script lit un fichier écrit par un autre, il doit le lire dans
+    # data/output.
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, sorted(folder.glob("*.qvs"))))
 
@@ -72,15 +80,15 @@ def main(argv=None) -> int:
         if args.pilot:
             extra += ["--limit", str(args.pilot)]
         if run("translate.py", str(workdir), *extra):
-            # modèle injoignable ou qui ne répond pas : inutile de continuer
-            # avec les autres scripts, mais run_all.py est quand même généré
+            # Le modèle ne répond pas, pas la peine d'enchaîner sur les scripts
+            # suivants. On régénère quand même le job en sortant de la boucle.
             summary.append((script.name, "traduction arrêtée : le modèle ne "
                             "répond pas (voir le test ci-dessus)", []))
             stopped = True
             break
 
-        # analyse Spark de TOUTES les requêtes avant d'assembler : un cas mal
-        # traduit est bloqué ici plutôt qu'à l'exécution du job
+        # Spark parse toutes les requêtes avant l'assemblage. Une traduction
+        # bancale se voit ici, et pas au premier lancement du job.
         run("check.py", str(workdir), "--parse", "--mark")
         manifest = json.loads((workdir / "manifest.json").read_text(
             encoding="utf-8"))
@@ -92,6 +100,7 @@ def main(argv=None) -> int:
                             "à corriger à la main", to_fix))
         else:
             run("assemble.py", str(workdir))
+            run("orchestrate.py")      # ajoute ce script au job
             state = "assemblé dans src/"
             if compare:
                 rc = run("verify.py", str(workdir))
@@ -105,7 +114,7 @@ def main(argv=None) -> int:
             break
 
     print()
-    run("orchestrate.py")      # src/run_all.py : le job principal
+    run("orchestrate.py")      # régénère src/<nom-projet>/job.py
 
     print(f"\n{'=' * 70}\nRÉSUMÉ")
     for name, state, to_fix in summary:
@@ -113,14 +122,15 @@ def main(argv=None) -> int:
         for sid in to_fix[:15]:
             print(f"    à corriger : {WORK / Path(name).stem / sid}/query.sql")
     ready = sum("assemblé" in state for _, state, _ in summary)
-    print(f"\nJob principal : python src/run_all.py "
+    print(f"\nJob du projet : python {project_dir() / 'job.py'} "
           f"({'contient les scripts assemblés' if ready else 'aucun script assemblé pour l’instant'})")
     print(f"Journal : {WORK / 'journal.csv'}")
     if not compare:
-        print("Pas de dossier qlik_outputs/ : comparaison des données non faite.")
+        print("Pas de dossier data/qlik_outputs/ : comparaison des données "
+              "non faite.")
     if args.pilot:
         print("Pilote terminé : relis les query.sql, puis relance sans --pilot "
-              "(le script n'est assemblé, et ajouté à run_all.py, qu'une fois "
+              "(le script n'est assemblé, et ajouté au job, qu'une fois "
               "toutes ses tables validées).")
     return 1 if stopped else 0
 

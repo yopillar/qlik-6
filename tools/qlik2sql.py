@@ -1,15 +1,15 @@
-"""Traduction déterministe Qlik -> Spark SQL (sans modèle).
+"""Traduction Qlik vers Spark SQL, sans le modèle.
 
-Deux niveaux :
-  - expressions : If, &, arithmétique, comparaisons, fonctions Qlik courantes
-    -> expressions Spark SQL natives (aucune UDF) ;
-  - instructions : LOAD (champs, WHERE, GROUP BY, DISTINCT, FIRST, LOAD
+Ça se passe à deux niveaux :
+  - les expressions : If, &, arithmétique, comparaisons et fonctions Qlik
+    courantes, traduites en expressions Spark SQL natives (pas d'UDF)
+  - les instructions : LOAD (champs, WHERE, GROUP BY, DISTINCT, FIRST, LOAD
     empilés), FROM fichier / RESIDENT / INLINE / SQL SELECT simple, JOIN,
-    KEEP, CONCATENATE, DROP FIELD, ApplyMap -> une CTE chacune.
+    KEEP, CONCATENATE, DROP FIELD, ApplyMap. Chacune donne une CTE.
 
-Ce qui ne se traduit pas avec certitude lève Untranslatable : la CTE devient
-un bloc « TODO(model) » que le modèle complète, le reste de la requête est
-déjà écrit.
+Dès qu'on n'est pas sûr de la traduction, on lève Untranslatable. La CTE
+concernée devient un bloc « TODO(model) » que le modèle complétera, et le
+reste de la requête est déjà écrit.
 """
 
 from __future__ import annotations
@@ -19,16 +19,17 @@ import re
 from dataclasses import dataclass, field
 
 
-# Colonne technique portée par TOUTES les tables : l'ordre de chargement Qlik.
-# Créée à la lecture (job du script), propagée par chaque étape selon les règles de
-# Qlik, écrite dans les sorties : le script suivant hérite de l'ordre exact.
-# Type array<bigint>, comparé élément par élément : une concaténation préfixe
-# 0 (lignes existantes) ou 1 (lignes ajoutées) sans renuméroter la table.
+# Colonne technique présente dans toutes les tables : l'ordre de chargement
+# Qlik. Le job la crée à la lecture, chaque étape la fait suivre en appliquant
+# les règles de Qlik, et elle est écrite dans les sorties pour que le script
+# suivant récupère exactement le même ordre. C'est un array<bigint>, comparé
+# élément par élément. Ça permet à un CONCATENATE de mettre 0 devant les lignes
+# existantes et 1 devant les nouvelles, sans renuméroter toute la table.
 ORD = "_qlik_order"
 
 
 class Untranslatable(Exception):
-    """L'élément Qlik ne peut pas être traduit de façon sûre."""
+    """Levée quand on ne sait pas traduire un élément Qlik à coup sûr."""
 
 
 # ==========================================================================
@@ -48,7 +49,8 @@ SQL_RESERVED = {
 
 
 def ident(name: str) -> str:
-    """Nom de colonne SQL : tel quel si simple, sinon entre backticks."""
+    """Nom de colonne SQL : tel quel s'il est simple, entre backticks
+    sinon."""
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) and \
             name.upper() not in SQL_RESERVED:
         return name
@@ -56,8 +58,9 @@ def ident(name: str) -> str:
 
 
 def view_name(name: str) -> str:
-    """Nom de vue / CTE sûr (ASCII). Les noms non ASCII reçoivent un suffixe
-    court pour rester uniques ; le nom Qlik est rappelé en commentaire."""
+    """Nom de vue ou de CTE sans risque (ASCII seulement). Un nom avec des
+    caractères non ASCII reçoit un petit suffixe pour rester unique, et le
+    nom Qlik est rappelé en commentaire."""
     v = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_")
     if not v or not re.fullmatch(r"[A-Za-z0-9_]+", name):
         h = hashlib.sha1(name.encode()).hexdigest()[:6]
@@ -70,9 +73,12 @@ def view_name(name: str) -> str:
 
 
 def sql_string(value: str) -> str:
-    """Littéral Spark SQL. Une apostrophe Qlik ('l''été') ne se double PAS en
-    Spark (deux chaînes collées : « lété ») : on passe en guillemets doubles,
-    lisibles et sans échappement ; antislash en dernier recours."""
+    """Littéral Spark SQL.
+
+    Attention à l'apostrophe : en Qlik on la double ('l''été'), mais en
+    Spark ça donne deux chaînes collées (« lété »). On passe donc en
+    guillemets doubles, plus lisibles et sans échappement, et on ne garde
+    l'antislash que si on n'a pas le choix."""
     v = value.replace("\\", "\\\\")
     if "'" in value and '"' not in value:
         return '"' + v + '"'
@@ -118,20 +124,25 @@ def tokenize_expr(text: str) -> list[tuple[str, str]]:
 
 @dataclass
 class ExprCtx:
-    """Contexte de traduction d'une expression."""
+    """Ce qu'il faut savoir pour traduire une expression."""
     qualifier: str = ""                       # alias de la source (« s »)
     applymap: object = None                   # callback (map, key, default)
-    date_format: str | None = None            # DateFormat Qlik du script
+    date_format: str | None = None            # DateFormat du script
     timestamp_format: str | None = None
-    recno: str | None = None                  # RecNo()/RowNo() d'un AUTOGENERATE
-    iterno: str | None = None                 # IterNo() d'un AUTOGENERATE … WHILE
-    rowno: str | None = None                  # RowNo() si différent de RecNo()
-    order_by: str | None = None               # ORDER BY du LOAD (RowNo/RecNo)
+    # RecNo()/RowNo() d'un AUTOGENERATE
+    recno: str | None = None
+    # IterNo() d'un AUTOGENERATE … WHILE
+    iterno: str | None = None
+    # RowNo() quand il diffère de RecNo()
+    rowno: str | None = None
+    # ORDER BY du LOAD, pour RowNo/RecNo
+    order_by: str | None = None
     in_where: bool = False
     exists: object = None                     # callback Exists(champ, valeur)
     column_types: dict = field(default_factory=dict)   # types de conf/schema
     order_key: str | None = None              # clé d'ordre (FirstValue…)
-    output_field: object = None               # champ du LOAD en cours (Peek)
+    # champ du LOAD en cours (pour Peek)
+    output_field: object = None
     peek_table: object = None                 # Peek('f', n, 'T')
     noofrows: object = None                   # NoOfRows('T')
     aggregate_used: bool = False              # Sum/Min/Max… dans le LOAD
@@ -152,8 +163,9 @@ class TsSql(DateSql):
 
 
 class StrField(str):
-    """Colonne déclarée texte dans conf/schema. Qlik interprète au chargement
-    un texte au format DateFormat comme une date : Spark non."""
+    """Colonne déclarée en texte dans conf/schema. Qlik, au chargement,
+    prend pour une date un texte au format DateFormat. Spark ne le fait
+    pas, il faut le lui dire."""
 
 
 DATE_TYPES = ("date",)
@@ -162,7 +174,8 @@ STR_TYPES = ("string", "str", "text", "varchar", "char")
 
 
 def parse_date(sql: str, ctx) -> DateSql:
-    """Texte -> date, au format DateFormat du script (sinon ISO)."""
+    """Convertit un texte en date avec le DateFormat du script (ISO à
+    défaut)."""
     fmt = None
     if ctx.date_format:
         try:
@@ -176,23 +189,26 @@ def parse_date(sql: str, ctx) -> DateSql:
 
 
 def as_date(sql: str, ctx) -> str:
-    """Argument d'une fonction de date : un texte est d'abord interprété."""
+    """Argument d'une fonction de date : si c'est du texte, on le convertit
+    d'abord."""
     return parse_date(sql, ctx) if isinstance(sql, StrField) else sql
 
 
 def as_value(sql: str) -> str:
-    """Booléen utilisé comme valeur : Qlik donne -1 (vrai) ou 0 (faux)."""
+    """Booléen utilisé comme valeur. En Qlik, vrai vaut -1 et faux vaut 0."""
     return f"CASE WHEN {sql} THEN -1 ELSE 0 END" if isinstance(sql, Bool) else sql
 
 
 def as_cond(sql: str) -> str:
-    """Valeur utilisée comme condition : en Qlik, tout nombre non nul est vrai."""
+    """Valeur utilisée comme condition. En Qlik, tout nombre non nul est
+    vrai."""
     return sql if isinstance(sql, Bool) else Bool(f"(({sql}) <> 0)")
 
 
 class ExprParser:
-    """Analyse descendante : or < and < not < comparaison < & < + - < * / <
-    unaire < primaire. Chaque règle renvoie directement du SQL."""
+    """Analyse descendante, par priorité croissante : or, and, not,
+    comparaison, &, + -, * /, unaire, primaire. Chaque règle renvoie
+    directement du SQL."""
 
     def __init__(self, text: str, ctx: ExprCtx):
         self.t = tokenize_expr(text)
@@ -249,7 +265,7 @@ class ExprParser:
         if kind == "op" and v in ("=", "<>", "<", ">", "<=", ">="):
             self.take()
             right = self.p_concat()
-            # date comparée à un texte : Qlik l'interprète comme une date
+            # date comparée à un texte : Qlik lit le texte comme une date
             if isinstance(left, DateSql) and isinstance(right, StrField):
                 right = parse_date(right, self.ctx)
             elif isinstance(right, DateSql) and isinstance(left, StrField):
@@ -263,7 +279,7 @@ class ExprParser:
             pat = pv[1:-1].replace("''", "'")
             pat = pat.replace("%", "\\%").replace("_", "\\_") \
                 .replace("*", "%").replace("?", "_")
-            # LIKE Qlik : jokers * ? et insensible à la casse
+            # le LIKE de Qlik : jokers * et ?, et pas sensible à la casse
             return Bool(f"(lower({as_value(left)}) LIKE lower({sql_string(pat)}))")
         if kind == "kw" and v in ("PRECEDES", "FOLLOWS"):
             raise Untranslatable(f"opérateur {v}")
@@ -276,7 +292,7 @@ class ExprParser:
             parts.append(self.p_add())
         if len(parts) == 1:
             return parts[0]
-        # & Qlik : un null compte comme une chaîne vide
+        # avec & en Qlik, un null se comporte comme une chaîne vide
         return "concat_ws('', " + ", ".join(f"CAST({as_value(p)} AS STRING)"
                                             for p in parts) + ")"
 
@@ -290,14 +306,16 @@ class ExprParser:
             if op == "-" and isinstance(left, StrField) and isinstance(right, DateSql):
                 left = parse_date(left, self.ctx)
             if op == "-" and isinstance(left, DateSql) and isinstance(right, DateSql):
-                # Qlik : une date est un nombre de jours, date - date = jours
+                # en Qlik une date est un nombre de jours, donc date - date
+                # donne des jours
                 if isinstance(left, TsSql) or isinstance(right, TsSql):
                     left = (f"((unix_timestamp({left}) - unix_timestamp({right}))"
                             " / 86400.0)")
                 else:
                     left = f"datediff({left}, {right})"
             elif isinstance(left, DateSql) and not isinstance(right, DateSql):
-                left = DateSql(f"({left} {op} {as_value(right)})")   # date ± jours
+                # date ± jours
+                left = DateSql(f"({left} {op} {as_value(right)})")
             else:
                 left = f"({as_value(left)} {op} {as_value(right)})"
         return left
@@ -361,7 +379,8 @@ class ExprParser:
                 if self.peek() == ("op", ","):
                     self.take()
                     if self.peek() == ("op", ")"):
-                        # argument vide toléré par Qlik : If(c, x, ) -> NULL
+                        # Qlik accepte un argument vide, If(c, x, ) : on met
+                        # NULL
                         args.append("NULL")
                         raw.append([])
                         break
@@ -369,7 +388,7 @@ class ExprParser:
                 break
         self.expect(")")
         n = name.lower()
-        if n == "if" and args:          # condition, puis valeurs
+        if n == "if" and args:          # la condition, puis les valeurs
             args = [as_cond(args[0])] + [as_value(a) for a in args[1:]]
         else:
             args = [as_value(a) for a in args]
@@ -377,7 +396,7 @@ class ExprParser:
 
 
 def literal(raw_tokens) -> str | None:
-    """Valeur d'un argument s'il est une chaîne littérale seule."""
+    """Valeur de l'argument quand c'est juste une chaîne littérale."""
     if len(raw_tokens) == 1 and raw_tokens[0][0] == "str":
         return raw_tokens[0][1][1:-1].replace("''", "'")
     return None
@@ -390,7 +409,7 @@ def number(raw_tokens) -> str | None:
 
 
 def signed_int(raw_tokens) -> int | None:
-    """Entier littéral, éventuellement négatif (-1)."""
+    """Entier littéral, négatif ou non (-1)."""
     if len(raw_tokens) == 1 and raw_tokens[0][0] == "num":
         return int(float(raw_tokens[0][1]))
     if len(raw_tokens) == 2 and raw_tokens[0] == ("op", "-") \
@@ -400,7 +419,7 @@ def signed_int(raw_tokens) -> int | None:
 
 
 def regex_class(chars: str) -> str:
-    """Classe de caractères Java regex, échappée."""
+    """Classe de caractères pour une regex Java, échappée."""
     return "".join("\\" + c if c in "\\]^-[" else c for c in chars)
 
 
@@ -418,7 +437,8 @@ QLIK_DATE_TOKENS = [
 
 
 def qlik_format_to_spark(fmt: str) -> str:
-    """Format de date Qlik -> motif Spark (lettres inconnues : refus)."""
+    """Traduit un format de date Qlik en motif Spark. Une lettre qu'on ne
+    connaît pas fait échouer la traduction."""
     out, i = [], 0
     twelve = "TT" in fmt
     while i < len(fmt):
@@ -448,8 +468,8 @@ def translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
     if n in DATE_ARG_FUNCTIONS and a:
         a = [as_date(a[0], ctx)] + a[1:]
     if n in ("floor", "ceil") and len(a) == 1 and isinstance(a[0], DateSql):
-        # Qlik : une date est un nombre, Floor garde le jour ; Spark refuse
-        # floor() sur une date
+        # En Qlik une date est un nombre, et Floor garde le jour. Spark, lui,
+        # refuse floor() sur une date.
         x = a[0]
         if not isinstance(x, TsSql):
             return DateSql(x)
@@ -554,7 +574,8 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return f"CAST({a[0]} AS DOUBLE)"
     if n == "num":
         need(1, 2, 3, 4)
-        return a[0]                               # format d'affichage
+        # les autres arguments ne servent qu'à l'affichage
+        return a[0]
     if n in ("date#", "timestamp#"):
         fmt = literal(raw[1]) if k >= 2 else (
             ctx.date_format if n == "date#" else ctx.timestamp_format)
@@ -565,7 +586,8 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return f"CAST({ts} AS DATE)" if n == "date#" else ts
     if n == "date":
         need(1, 2)
-        return f"CAST({a[0]} AS DATE)"            # format d'affichage ignoré
+        # le format d'affichage est ignoré
+        return f"CAST({a[0]} AS DATE)"
     if n == "timestamp":
         need(1, 2)
         return f"CAST({a[0]} AS TIMESTAMP)"
@@ -573,7 +595,8 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return "current_date()" if n == "today" else "current_timestamp()"
     if n == "month":
         need(1)
-        return f"month({a[0]})"                   # ⚠ Qlik : valeur duale
+        # ⚠ en Qlik c'est une valeur duale (texte + nombre)
+        return f"month({a[0]})"
     if n == "weekday":
         need(1)
         return f"((dayofweek({a[0]}) + 5) % 7)"
@@ -618,9 +641,10 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         need(1, 2)
         if k == 1:
             return f"{n}({a[0]})"
-        return f"({n}({a[0]} / {a[1]}) * {a[1]})"     # 2e arg Qlik = pas
+        # en Qlik le 2e argument est le pas
+        return f"({n}({a[0]} / {a[1]}) * {a[1]})"
     if n == "rangesum":
-        # RangeSum ignore les valeurs nulles (comptées 0)
+        # RangeSum ignore les nulls (comptés comme 0)
         return "(" + " + ".join(f"COALESCE({x}, 0)" for x in a) + ")"
     if n in ("rangemax", "rangemin"):
         return f"{'greatest' if n == 'rangemax' else 'least'}({', '.join(a)})"
@@ -628,7 +652,8 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         need(1, 2)
         if k == 1:
             return f"round({a[0]})"
-        return f"(round({a[0]} / {a[1]}) * {a[1]})"   # 2e arg Qlik = pas
+        # en Qlik le 2e argument est le pas
+        return f"(round({a[0]} / {a[1]}) * {a[1]})"
     if n == "mod":
         need(2)
         return f"pmod({a[0]}, {a[1]})"
@@ -640,7 +665,8 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         return f"power({a[0]}, {a[1]})"
     if n == "dual":
         need(2)
-        return a[0]       # valeur duale : Parquet n'a qu'un type, on garde le texte
+        # Parquet n'a qu'un type par colonne : on garde le texte (à valider)
+        return a[0]
     if n == "null":
         return "NULL"
     if n == "isnull":
@@ -715,7 +741,7 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         need(1)
         if not ctx.order_key:
             raise Untranslatable(f"{name}() après un ORDER BY … DESC")
-        # 1re / dernière valeur non nulle dans l'ordre de chargement
+        # première / dernière valeur non nulle dans l'ordre de chargement
         fn = "min_by" if n == "firstvalue" else "max_by"
         return (f"{fn}({a[0]}, CASE WHEN {a[0]} IS NOT NULL THEN "
                 f"{ctx.order_key} END)")
@@ -726,11 +752,13 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
             return ctx.iterno
         if n == "rowno" and ctx.rowno is not None:
             return ctx.rowno
-        if ctx.recno is not None:                   # AUTOGENERATE : exact
+        # AUTOGENERATE : on sait faire exactement
+        if ctx.recno is not None:
             return ctx.recno
         if ctx.in_where:
             raise Untranslatable(f"{name}() dans un WHERE")
-        # ordre du LOAD … ORDER BY, sinon ordre de lecture du fichier
+        # ordre du LOAD … ORDER BY s'il y en a un, sinon ordre de lecture du
+        # fichier
         order = ctx.order_by or "monotonically_increasing_id()"
         return f"row_number() OVER (ORDER BY {order})"
     if n == "fieldvalue":
@@ -742,9 +770,10 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
     if n in ("autonumber", "autonumberhash128", "autonumberhash256"):
         if k == 0:
             raise Untranslatable(f"{name}() sans argument")
-        # Qlik numérote 1, 2, 3… dans l'ordre de chargement : ici une clé
-        # technique stable (même valeur pour la même combinaison, dans
-        # toutes les tables), mais pas les mêmes nombres que Qlik
+        # Qlik numérote 1, 2, 3… dans l'ordre de chargement. On met à la place
+        # une clé technique stable (même combinaison, même valeur, dans toutes
+        # les tables). Les valeurs ne sont pas celles de Qlik, d'où l'exclusion
+        # de ces colonnes dans verify.py.
         ctx.technical = True
         vals = a[:1] if n == "autonumber" else a
         return "xxhash64(" + ", ".join(f"CAST({v} AS STRING)" for v in vals) + ")"
@@ -780,7 +809,8 @@ def cond(text: str, ctx: ExprCtx) -> str:
 # ==========================================================================
 
 def _scan(text: str):
-    """Itère (position, profondeur) hors chaînes, crochets et guillemets."""
+    """Parcourt le texte en donnant (position, profondeur), en sautant les
+    chaînes, les crochets et les guillemets."""
     depth, quote = 0, None
     for i, ch in enumerate(text):
         if quote:
@@ -798,7 +828,8 @@ def _scan(text: str):
 
 
 def find_keywords(text: str, words: tuple[str, ...]) -> list[tuple[int, str]]:
-    """Positions des mots-clés au niveau 0 (hors chaînes et parenthèses)."""
+    """Positions des mots-clés au premier niveau, hors chaînes et
+    parenthèses."""
     found, upper = [], text.upper()
     for i, depth in _scan(text):
         if depth != 0 or (i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_#.$")):
@@ -826,7 +857,8 @@ def split_top(s: str, sep: str = ",") -> list[str]:
 class Segment:
     fields: list[tuple[str, str | None]]     # (expression Qlik, alias)
     distinct: bool = False
-    source: tuple | None = None              # ('file'|'resident'|'inline'|'sql'|'autogen', …)
+    # ('file'|'resident'|'inline'|'sql'|'autogen', …)
+    source: tuple | None = None
     where: str | None = None
     group_by: list[str] = field(default_factory=list)
     order_by: str | None = None
@@ -856,14 +888,15 @@ def parse_fields(text: str) -> list[tuple[str, str | None]]:
 
 
 def parse_segment(text: str) -> Segment:
-    """« LOAD [DISTINCT] champs [FROM|RESIDENT|INLINE…] [WHERE] [GROUP BY] »"""
+    """Découpe « LOAD [DISTINCT] champs [FROM|RESIDENT|INLINE…] [WHERE]
+    [GROUP BY] »."""
     body = re.sub(r"^\s*LOAD\b", "", text, flags=re.I).strip()
     distinct = False
     m = re.match(r"DISTINCT\b", body, re.I)
     if m:
         distinct, body = True, body[m.end():].strip()
-    # un champ peut porter le nom d'un mot-clé (« …, Resident » ou
-    # « … AS Resident ») : ce n'est alors pas une clause
+    # Un champ peut s'appeler comme un mot-clé (« …, Resident » ou « … AS
+    # Resident »). Dans ce cas ce n'est pas une clause.
     kws = [(pos, kw) for pos, kw in find_keywords(body, CLAUSES)
            if not re.search(r"(\bAS|,)\s*$", body[:pos], re.I)
            and not re.match(r"\s*(,|$)", body[pos + len(kw):])]
@@ -892,8 +925,9 @@ def parse_segment(text: str) -> Segment:
 
 
 def split_statement(text: str) -> tuple[list[Segment], str | None, int | None]:
-    """Instruction LOAD -> segments (du haut vers le bas), SQL SELECT final
-    éventuel, FIRST n éventuel. Le label et les préfixes sont ignorés."""
+    """Découpe une instruction LOAD en segments (du haut vers le bas), plus
+    le SQL SELECT final et le FIRST n s'il y en a. Le label et les préfixes
+    sont ignorés ici."""
     first = None
     fm = re.search(r"\bFIRST\s+(\d+)\b", text[:200], re.I)
     loads = find_keywords(text, ("LOAD",))
@@ -912,7 +946,8 @@ def split_statement(text: str) -> tuple[list[Segment], str | None, int | None]:
 
 
 def inline_values(arg: str) -> tuple[list[str], list[list[str]]]:
-    """Contenu d'un INLINE [ … ] (options éventuelles) -> en-tête, lignes."""
+    """Lit le contenu d'un INLINE [ … ] (avec ses options éventuelles) et
+    renvoie l'en-tête et les lignes."""
     m = re.match(r"\[(.*)\]\s*(\((.*)\))?\s*$", arg, re.S) or \
         re.match(r"\"(.*)\"\s*(\((.*)\))?\s*$", arg, re.S)
     if not m:
@@ -935,14 +970,15 @@ def inline_values(arg: str) -> tuple[list[str], list[list[str]]]:
 
 
 def values_sql(header, data) -> str:
-    if not data:          # INLINE avec seulement l'en-tête : table vide
+    if not data:          # INLINE avec juste l'en-tête : table vide
         return "SELECT " + ", ".join(f"CAST(NULL AS STRING) AS {ident(h)}"
                                      for h in header) + \
             f", CAST(NULL AS ARRAY<BIGINT>) AS {ORD} WHERE false"
     rows = ",\n    ".join("(" + ", ".join(sql_string(v) for v in r) + ")"
                           for r in data)
     cols = ", ".join(ident(h) for h in header)
-    # VALUES est lu sur une seule partition : l'identifiant suit l'ordre écrit
+    # VALUES tient sur une seule partition, donc l'identifiant suit l'ordre des
+    # lignes tel qu'il est écrit.
     return (f"SELECT *, array(monotonically_increasing_id()) AS {ORD} FROM VALUES\n  "
             f"{rows.replace(chr(10) + '    ', chr(10) + '  ')}\nAS t({cols})")
 
@@ -963,16 +999,20 @@ class Cte:
 
 @dataclass
 class SectionContext:
-    """Ce que prepare.py sait et que le traducteur utilise."""
+    """Ce que prepare.py sait de la section et dont le traducteur a
+    besoin."""
     final_table: str
     table_view: object          # clé de table amont -> nom de vue
-    input_view: object          # chemin Qlik -> nom de vue (enregistre l'entrée)
+    # chemin Qlik -> nom de vue (et enregistre l'entrée)
+    input_view: object
     file_schema: object         # chemin Qlik -> colonnes connues ou None
     mapping_insts: object       # clé de mapping -> instructions du mapping
     table_name: object          # clé -> nom Qlik (pour KEEP)
     graph_schema: object        # clé -> colonnes calculées par le graphe
-    tables_with_field: object = lambda f: []   # vues amont contenant le champ
-    column_types: dict = field(default_factory=dict)  # conf/schema, par colonne
+    # vues amont qui contiennent le champ
+    tables_with_field: object = lambda f: []
+    # types de conf/schema, par colonne
+    column_types: dict = field(default_factory=dict)
     date_format: str | None = None
     timestamp_format: str | None = None
 
@@ -1006,7 +1046,8 @@ class SectionTranslator:
         return name
 
     def source_of(self, table: str) -> tuple[str, list[str] | None]:
-        """CTE de la section, sinon vue d'une table amont."""
+        """Renvoie la CTE de la section pour cette table, ou à défaut la
+        vue de la table amont."""
         if table in self.cur:
             return self.cur[table], self.cols[self.cur[table]]
         view = self.ctx.table_view(table)
@@ -1035,8 +1076,9 @@ class SectionTranslator:
         except Untranslatable as exc:
             self.placeholder(inst, line, str(exc))
 
-    # une expression non traduite ne bloque pas toute l'instruction : seul
-    # son emplacement est laissé au modèle (question minuscule, cache possible)
+    # Une expression qu'on ne sait pas traduire ne bloque pas toute
+    # l'instruction : on ne laisse au modèle que cet endroit-là. La question
+    # est minuscule, et la réponse peut passer en cache.
     HOLE_EXCLUDED = ("Exists", "expression sans alias", "dans un WHERE")
 
     def hole(self, qlik: str, kind: str, reason: str, ectx, alias=None,
@@ -1068,8 +1110,8 @@ class SectionTranslator:
         else:
             src = None
         self.todos.append(f"l.{line} : {reason}")
-        # colonnes attendues si le graphe les connaît : la requête finale
-        # reste explicite et check.py peut les contrôler
+        # Si le graphe connaît les colonnes attendues, on les écrit : la
+        # requête finale reste explicite et check.py peut les vérifier.
         cols = None if {"join", "keep", "concatenate"} & inst.constructs \
             else self.ctx.graph_schema(table)
         body = (f"-- TODO(model): l.{line} : {reason}\n"
@@ -1106,8 +1148,8 @@ class SectionTranslator:
             ectx.fieldvalue = self.autogen_field
         if self.autogen_bottom == "while":
             ectx.recno, ectx.rowno, ectx.iterno = "1", f"{pre}__iter", f"{pre}__iter"
-        # ordre de chargement des lignes de la source (Qlik : ordre physique,
-        # ou ORDER BY du RESIDENT, à égalité dans l'ordre précédent)
+        # Ordre de chargement des lignes de la source. Côté Qlik, c'est l'ordre
+        # physique, ou l'ORDER BY du RESIDENT (et à égalité, l'ordre d'avant).
         order_items = [self.order_item(o, ectx) for o in split_top(seg.order_by)] \
             if seg.order_by else []
         ectx.order_by = ", ".join(order_items + [ord_src])
@@ -1118,7 +1160,8 @@ class SectionTranslator:
         exprs = {(a_ or e).strip("[]\""): e for e, a_ in seg.fields if e != "*"}
 
         def output_field(name):
-            """Expression d'un champ de ce LOAD (Peek sur la table en cours)."""
+            """Expression d'un champ de ce LOAD (pour un Peek sur la table
+            en cours)."""
             e = exprs.get(name)
             if e is None:
                 if "*" in [x for x, _ in seg.fields] or not exprs:
@@ -1133,8 +1176,8 @@ class SectionTranslator:
         ectx.exists = self.exists_sql
         self.dedup_field = None
         star = any(e == "*" for e, _ in seg.fields)
-        # l'ordre change (ORDER BY, GROUP BY, DISTINCT, dédoublonnage) : il faut
-        # le recalculer, donc lister les colonnes au lieu de « * »
+        # L'ordre change (ORDER BY, GROUP BY, DISTINCT, dédoublonnage), il faut
+        # donc le recalculer : on liste les colonnes au lieu de mettre « * ».
         reorder = bool(order_items or seg.group_by or seg.distinct)
         fields = seg.fields
         if star and reorder:
@@ -1191,11 +1234,13 @@ class SectionTranslator:
         group_sql = [g_ for g_ in (expr(g, ectx) for g in seg.group_by)
                      if not re.fullmatch(r"-?\d+(\.\d+)?", g_.strip("() "))]
         if seg.group_by or ectx.aggregate_used:
-            # agrégat (avec ou sans GROUP BY) : ordre de la 1re ligne agrégée
+            # agrégat, avec ou sans GROUP BY : on prend l'ordre de la 1re ligne
+            # agrégée
             select.append(f"min({ord_src}) AS {ORD}")
         elif seg.distinct:
-            # DISTINCT : 1re occurrence ; une constante ne se groupe pas (un
-            # entier dans un GROUP BY Spark est un numéro de colonne)
+            # DISTINCT : on garde la 1re occurrence. On ne groupe pas sur une
+            # constante, car dans un GROUP BY Spark un entier est un numéro de
+            # colonne.
             group_sql = [v for v in values
                          if not re.fullmatch(r"-?\d+(\.\d+)?|'[^']*'|\"[^\"]*\"|NULL",
                                              v.strip("() "))]
@@ -1207,8 +1252,9 @@ class SectionTranslator:
             select.append(ord_src)
         source = src
         if self.dedup_field:
-            # WHERE NOT Exists(champ) alors que ce LOAD charge le champ : Qlik
-            # garde la 1re ligne de chaque valeur, dans l'ordre de chargement
+            # WHERE NOT Exists(champ) alors que ce LOAD charge justement ce
+            # champ : Qlik garde la 1re ligne de chaque valeur, dans l'ordre de
+            # chargement.
             if joins or star:
                 raise Untranslatable("NOT Exists sur la même table avec "
                                      "ApplyMap ou LOAD * : à traduire")
@@ -1232,7 +1278,8 @@ class SectionTranslator:
         return sql, out_cols
 
     def base_ectx(self, q: str = "", applymap=None) -> ExprCtx:
-        """Contexte d'expression avec accès aux tables (Peek, NoOfRows)."""
+        """Contexte d'expression qui a accès aux tables (pour Peek et
+        NoOfRows)."""
         ectx = ExprCtx(q, applymap, self.ctx.date_format,
                        self.ctx.timestamp_format)
         ectx.peek_table = self.peek_table_sql
@@ -1250,7 +1297,8 @@ class SectionTranslator:
         return view
 
     def peek_table_sql(self, field_name: str, row: int, table: str) -> str:
-        """Peek('champ', n, 'T') : n-ième ligne de T (négatif : depuis la fin)."""
+        """Peek('champ', n, 'T') : n-ième ligne de T (en partant de la fin
+        si n est négatif)."""
         src = self.table_ref(table)
         if row >= 0:
             order, offset = "", row
@@ -1269,27 +1317,30 @@ class SectionTranslator:
 
     def exists_sql(self, field_name: str, value: str,
                    value_tokens: list[str] | None = None) -> str:
-        """Exists(champ, valeur) : la valeur figure-t-elle dans le champ des
-        tables chargées AVANT cette instruction ?"""
+        """Exists(champ, valeur) : la valeur est-elle déjà dans ce champ,
+        dans les tables chargées avant cette instruction ?"""
         inst = self.current_inst
         keys = getattr(inst, "exists_tables", {}).get(field_name, [])
-        # le LOAD en cours produit-il lui-même ce champ ? (sinon, la table
-        # cible n'est qu'une source de valeurs déjà chargées comme les autres)
+        # Est-ce que le LOAD en cours produit lui-même ce champ ? Sinon, la
+        # table cible n'est qu'une source de valeurs déjà chargées, comme les
+        # autres.
         self_loaded = field_name in [
             (a or e).strip("[]\"") for e, a in self.current_fields
             if e != "*"]
         if self_loaded:
             # WHERE Exists(f) alors que la table charge aussi f : une ligne ne
-            # passe que si f existe déjà, donc les lignes chargées n'ajoutent
-            # aucune valeur nouvelle : équivalent à une semi-jointure sur les
+            # passe que si f existe déjà, donc les lignes chargées n'apportent
+            # aucune valeur nouvelle. Ça revient à une semi-jointure sur les
             # tables précédentes. Avec NOT (ou une autre valeur que f), c'est
-            # un dédoublonnage dans l'ordre de chargement : pas d'équivalent sûr.
+            # un dédoublonnage dans l'ordre de chargement, et là il n'y a pas
+            # d'équivalent sûr.
             where = self.current_where or ""
             negated = re.search(r"\bNOT\s+Exists\s*\(\s*[\['\"]?"
                                 + re.escape(field_name), where, re.I)
             plain_value = value.split(".")[-1] == ident(field_name)
             if value_tokens is not None and not plain_value:
-                # Exists(f, expr) où ce LOAD définit f comme expr (« expr AS f »)
+                # Exists(f, expr) quand ce LOAD définit f comme expr (« expr AS
+                # f »)
                 for e_, a_ in self.current_fields:
                     if (a_ or "").strip("[]\"") == field_name and \
                             [v.lower() for _, v in tokenize_expr(e_)] == value_tokens:
@@ -1302,8 +1353,8 @@ class SectionTranslator:
                     raise Untranslatable(f"NOT Exists({field_name}) combiné "
                                          "avec OR")
                 self.dedup_field = value          # 1re ligne par valeur
-            # une table créée par ce LOAD n'a pas encore de lignes ; pour un
-            # CONCATENATE, ses lignes déjà chargées comptent
+            # Une table créée par ce LOAD n'a pas encore de lignes. Pour un
+            # CONCATENATE en revanche, celles déjà chargées comptent.
             if not {"concatenate", "join"} & inst.constructs:
                 keys = [k_ for k_ in keys if k_ != inst.target]
         sources = []
@@ -1317,7 +1368,7 @@ class SectionTranslator:
                                          "non disponible")
                 sources.append(view)
         if not sources:
-            return "false"                      # champ encore jamais chargé
+            return "false"                      # champ jamais chargé jusqu'ici
         union = " UNION ALL ".join(f"SELECT {ident(field_name)} AS v FROM {src}"
                                    for src in dict.fromkeys(sources))
         return f"EXISTS (SELECT 1 FROM ({union}) ex WHERE ex.v = {value})"
@@ -1346,7 +1397,7 @@ class SectionTranslator:
         if seg.where:
             where = " WHERE " + expr(seg.where, ExprCtx(
                 "", None, self.ctx.date_format, self.ctx.timestamp_format))
-        # clés en double : Qlik garde la PREMIÈRE valeur chargée
+        # clé en double : Qlik garde la première valeur chargée
         return (f"(SELECT map_key, min_by(map_value, __o) AS map_value FROM "
                 f"(SELECT {k} AS map_key, {v} AS map_value, {ORD} AS __o "
                 f"FROM {src}{where}) GROUP BY map_key)")
@@ -1375,8 +1426,9 @@ class SectionTranslator:
         raise Untranslatable(f"source {kind}")
 
     def autogenerate(self, arg: str, seg: Segment):
-        """AUTOGENERATE n -> range(1, n + 1) ; AUTOGENERATE FieldValueCount(f)
-        avec FieldValue(f, RecNo()) -> valeurs distinctes du champ f."""
+        """AUTOGENERATE n donne range(1, n + 1). AUTOGENERATE
+        FieldValueCount(f) avec FieldValue(f, RecNo()) donne les valeurs
+        distinctes du champ f."""
         if seg.has_while:
             return self.autogenerate_while(arg, seg)
         if re.match(r"EXTENSION\b", arg, re.I):
@@ -1395,8 +1447,9 @@ class SectionTranslator:
                 f"SELECT {ident(field_name)} AS __fv FROM {src}"
                 for src in dict.fromkeys(sources))
             self.autogen_bottom, self.autogen_field = "fieldvalue", field_name
-            # valeurs distinctes du champ, toutes tables confondues ; RecNo()
-            # numérote ces valeurs (ordre trié, Qlik : ordre de chargement)
+            # Valeurs distinctes du champ, toutes tables confondues. RecNo()
+            # les numérote dans l'ordre trié, alors que Qlik suit l'ordre de
+            # chargement.
             return (f"(\n  SELECT __fv, __recno, array(CAST(__recno AS BIGINT)) "
                     f"AS {ORD} FROM (\n"
                     f"  SELECT __fv, row_number() OVER (ORDER BY __fv) AS "
@@ -1409,7 +1462,7 @@ class SectionTranslator:
             for k, (kind, val) in enumerate(toks):
                 nxt = toks[k + 1] if k + 1 < len(toks) else (None, None)
                 if kind in ("word", "field") and nxt != ("op", "("):
-                    # sans table source, un nom est une variable Qlik
+                    # sans table source, un nom est forcément une variable Qlik
                     raise Untranslatable(f"AUTOGENERATE {arg[:40]} : variable "
                                          f"{val} non résolue")
             n = f"CAST({expr(arg, self.base_ectx())} AS INT)"
@@ -1417,19 +1470,21 @@ class SectionTranslator:
         if re.fullmatch(r"\d+", n):
             return (f"(SELECT CAST(id AS INT) AS __recno, array(id) AS {ORD} "
                     f"FROM range(1, {n} + 1))"), []
-        # borne calculée (variable LET, sous-requête) : range() exige une
-        # constante, sequence() accepte une expression
+        # Borne calculée (variable LET, sous-requête) : range() veut une
+        # constante, sequence() accepte une expression.
         return (f"(SELECT __recno, array(CAST(__recno AS BIGINT)) AS {ORD} FROM "
                 f"(SELECT explode(sequence(1, {n})) AS __recno))"), []
 
-    # nombre maximal d'itérations d'un WHILE (un calendrier de 273 ans)
+    # garde-fou sur le nombre d'itérations d'un WHILE (100 000 jours, soit un
+    # calendrier de plus de 270 ans)
     WHILE_CAP = 100_000
 
     def autogenerate_while(self, arg: str, seg: Segment):
-        """AUTOGENERATE 1 WHILE <condition sur IterNo()> : une ligne par
-        itération, jusqu'à la PREMIÈRE itération où la condition est fausse
-        (sémantique exacte du WHILE Qlik, même si la condition redevient
-        vraie ensuite)."""
+        """AUTOGENERATE 1 WHILE <condition sur IterNo()>.
+
+        Une ligne par itération, jusqu'à la première itération où la
+        condition est fausse. C'est le comportement exact de Qlik : on
+        s'arrête même si la condition redevient vraie plus loin."""
         if arg.strip() != "1":
             raise Untranslatable(f"AUTOGENERATE {arg.strip()} WHILE : une seule "
                                  "ligne source attendue")
@@ -1437,10 +1492,11 @@ class SectionTranslator:
         for k, (kind, val) in enumerate(toks):
             nxt = toks[k + 1] if k + 1 < len(toks) else (None, None)
             if kind in ("word", "field") and nxt != ("op", "("):
-                # sans table source, un nom est une variable non résolue
+                # sans table source, un nom est une variable qu'on n'a pas
+                # résolue
                 raise Untranslatable(f"WHILE : « {val} » non résolu")
         cap = self.WHILE_CAP
-        # range() renvoie des BIGINT : date + BIGINT est refusé par Spark
+        # range() renvoie des BIGINT, et Spark refuse date + BIGINT
         c_outer = cond(seg.while_cond, ExprCtx(iterno="CAST(g.id AS INT)"))
         c_inner = cond(seg.while_cond, ExprCtx(iterno="CAST(r.id AS INT)"))
         self.autogen_bottom = "while"
@@ -1492,14 +1548,15 @@ class SectionTranslator:
             segs_sql = []
             for k, seg in enumerate(reversed(segs)):
                 top = k == len(segs) - 1
-                if k > 0:          # segment supérieur : lit le résultat inférieur
+                # segment du dessus : il lit le résultat de celui du dessous
+                if k > 0:
                     self.autogen_bottom = self.autogen_field = None
                     sub = segs_sql[-1]
                     src, cols = "(\n" + _indent(sub[0], 2) + "\n)", sub[1]
                 segs_sql.append(self.segment_sql(seg, src, cols, line,
                                                  first if top else None))
-                # RecNo/IterNo d'un AUTOGENERATE n'existent que dans le
-                # segment le plus bas
+                # RecNo/IterNo d'un AUTOGENERATE n'existent que dans le segment
+                # le plus bas
                 self.autogen_bottom, self.autogen_field = None, None
         sql, columns = segs_sql[-1]
         target = inst.target
@@ -1551,15 +1608,17 @@ class SectionTranslator:
                    "right": "RIGHT JOIN", "inner": "INNER JOIN"}[how]
         added = [f"b.{ident(c)}" for c in right_cols if c not in keys]
         if how in ("left", "inner"):
-            # « a.* » : colonnes de gauche (ordre et _qlik_order compris), puis
-            # les nouvelles colonnes ; évite de relister toute la table à
-            # chaque jointure (requêtes énormes sur les tables très enrichies)
+            # « a.* » : les colonnes de gauche (ordre et _qlik_order compris),
+            # puis les nouvelles. Ça évite de relister toute la table à chaque
+            # jointure, ce qui donnait des requêtes énormes sur les tables très
+            # enrichies.
             select = ["a.*"] + added
         else:
             select = [f"COALESCE(a.{ident(c)}, b.{ident(c)}) AS {ident(c)}"
                       if c in keys else f"a.{ident(c)}" for c in left_cols]
             select += added
-            # lignes de gauche dans leur ordre, puis lignes seulement à droite
+            # les lignes de gauche dans leur ordre, puis celles qui ne sont
+            # qu'à droite
             select.append(f"CASE WHEN a.{ORD} IS NULL THEN concat(array(1L), "
                           f"b.{ORD}) ELSE concat(array(0L), a.{ORD}) END AS {ORD}")
         cols = left_cols + [c for c in right_cols if c not in keys]
@@ -1576,7 +1635,7 @@ class SectionTranslator:
         self.add(target, sql, comment, cols)
 
     def keep(self, inst, target, right, right_cols, line, how):
-        """KEEP : jointure utilisée comme filtre, les deux tables restent."""
+        """KEEP : une jointure qui sert de filtre, les deux tables restent."""
         m = re.search(r"\bKEEP\s*\(\s*(\[[^\]]+\]|\"[^\"]+\"|[^\s)]+)\s*\)",
                       inst.clean_text, re.I)
         if not m:
@@ -1653,16 +1712,19 @@ class SectionTranslator:
     # -- assemblage
     def render(self, header: str, condensed: bool = False
                ) -> tuple[str, list[str] | None]:
-        """Requête complète ; condensed : version pour le prompt, où les CTE
-        déjà traduites sont résumées à leurs colonnes (le modèle ne renvoie
-        que les CTE TODO, il n'a besoin que de savoir ce qu'il peut lire)."""
+        """Renvoie la requête complète.
+
+        Avec condensed=True, c'est la version pour le prompt : les CTE déjà
+        traduites sont réduites à leurs colonnes. Le modèle ne renvoie que
+        les CTE TODO, il a juste besoin de savoir ce qu'il peut lire."""
         final = self.cur.get(self.ctx.final_table)
         if final is None:
             raise Untranslatable("table finale non produite")
         cols = self.cols[final]
         out = [header, "WITH"]
-        # version pour le prompt : en entier seulement ce que le modèle doit
-        # écrire ; ce qu'il lit, avec ses colonnes ; le reste, son nom seul
+        # Version pour le prompt : en entier, seulement ce que le modèle doit
+        # écrire ; ce qu'il lit, avec ses colonnes ; tout le reste, juste son
+        # nom.
         statement = [c for c in self.ctes if "TODO(model): l." in c.sql]
         todo = statement or [c for c in self.ctes if "TODO(model)" in c.sql]
         todo_text = "\n".join(c.sql for c in todo)
@@ -1693,8 +1755,8 @@ def _indent(text: str, n: int) -> str:
 
 
 def translate_section(insts, texts, ctx: SectionContext, header: str):
-    """-> (sql, todos, colonnes finales, colonnes techniques, version courte
-    pour le prompt, expressions laissées au modèle)."""
+    """Renvoie (sql, todos, colonnes finales, colonnes techniques, version
+    courte pour le prompt, expressions laissées au modèle)."""
     tr = SectionTranslator(ctx)
     for inst, text in zip(insts, texts):
         tr.translate(inst, text)

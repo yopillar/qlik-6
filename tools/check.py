@@ -1,18 +1,19 @@
-"""Contrôles automatiques d'une requête traduite (sans modèle, sans Spark).
+"""Contrôles automatiques d'une requête traduite, sans modèle et sans données.
 
-Vérifie work/<script>/<table>/query.sql contre les faits du manifest :
-  - plus aucun bloc « TODO(model) » ;
-  - une seule requête, aucune instruction interdite (CREATE, INSERT…) ;
-  - seules les vues et CTE existantes sont lues ;
-  - chaque colonne de sortie attendue apparaît ;
-  - chaque instruction Qlik est référencée par un commentaire « l.<n> » ;
-  - avec --parse (ou depuis translate.py) : syntaxe validée par le parseur
-    de Spark, puis requête analysée contre des vues vides quand toutes leurs
-    colonnes sont connues (colonnes inexistantes, fonctions inconnues…).
+On vérifie work/<script>/<table>/query.sql par rapport à ce que le manifest
+sait de la table :
+  - il ne reste plus de bloc « TODO(model) »
+  - il n'y a qu'une requête, et pas d'instruction interdite (CREATE, INSERT…)
+  - elle ne lit que des vues ou des CTE qui existent
+  - toutes les colonnes de sortie attendues y figurent
+  - chaque instruction Qlik est citée dans un commentaire « l.<n> »
+  - avec --parse (toujours le cas depuis translate.py), Spark parse la
+    requête, puis l'analyse sur des vues vides quand on connaît toutes leurs
+    colonnes (colonne qui n'existe pas, fonction inconnue…)
 
-Ces contrôles ne prouvent pas que le résultat est juste (c'est le rôle de
-verify.py sur les données), mais ils rattrapent en une seconde les oublis
-typiques d'un modèle faible.
+Ça ne prouve pas que le résultat est juste, c'est le travail de verify.py
+sur les données. Mais ça rattrape en une seconde les oublis classiques d'un
+petit modèle.
 
 Usage :
     python tools/check.py work/ventes                  # toutes les tables
@@ -33,7 +34,8 @@ import journal  # noqa: E402
 
 FORBIDDEN = ("CREATE", "INSERT", "DELETE", "UPDATE", "MERGE", "DROP",
              "ALTER", "TRUNCATE", "CACHE", "REFRESH")
-# au-delà de ce taux d'instructions non référencées, c'est une erreur
+# Au-delà de 30 % d'instructions Qlik non citées, on considère que la requête a
+# sauté une partie du script.
 MAX_UNREFERENCED = 0.3
 
 
@@ -46,8 +48,9 @@ TOKENS = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:``|[^`])*`")
 
 
 def strip_sql_strings(sql: str, idents: bool = False) -> str:
-    """Vide les chaînes '…' (et les noms `…` si idents). Les deux sont lus
-    ensemble : un nom `Payment's type` ne doit pas ouvrir une chaîne."""
+    """Vide les chaînes '…' (et les noms `…` si idents=True). On traite les
+    deux dans la même regex, sinon l'apostrophe de `Payment's type` serait
+    prise pour le début d'une chaîne."""
     def repl(m):
         tok = m.group()
         if tok[0] in "'\"":
@@ -66,32 +69,36 @@ SPARK_TYPES = {"int": "INT", "integer": "INT", "bigint": "BIGINT", "long": "BIGI
 
 
 def spark_type(t) -> str:
-    """Type de conf/schema -> type Spark (inconnu : STRING)."""
+    """Traduit un type de conf/schema en type Spark (STRING si on ne le
+    connaît pas)."""
     if not t:
         return "STRING"
     t = str(t).lower().split("(")[0].strip()
     return SPARK_TYPES.get(t, "STRING")
 
 
-# erreurs d'analyse qui dépendent des types : non fiables tant que les types
-# des colonnes ne sont pas tous connus (une colonne sans type est STRING)
+# Erreurs liées aux types. Tant que toutes les colonnes ne sont pas typées (une
+# colonne sans type est déclarée STRING), on ne peut pas s'y fier.
 TYPE_ERRORS = ("DATATYPE_MISMATCH", "CAST_WITHOUT_SUGGESTION",
                "UNEXPECTED_INPUT_TYPE", "BINARY_OP_DIFF_TYPES")
-# erreurs qui dépendent de la connaissance des colonnes amont (déduites du
-# script quand il n'y a pas de schéma) : à signaler sans bloquer
+# Colonne introuvable : quand il n'y a pas de schéma, les colonnes amont sont
+# déduites du script et peuvent être incomplètes. On le signale, sans bloquer.
 KNOWLEDGE_ERRORS = ("UNRESOLVED_COLUMN",)
 
 
 class SparkChecker:
-    """Parseur et analyseur de Spark, sans données : la requête est analysée
-    contre des vues vides aux colonnes connues (noms de colonnes et de vues,
-    fonctions, types de base). Rien n'est exécuté."""
+    """Parseur et analyseur de Spark, sans aucune donnée.
+
+    La requête est analysée sur des vues vides qui ont les bonnes colonnes,
+    ce qui suffit à vérifier les noms de colonnes et de vues, les fonctions
+    et les types de base. Rien n'est exécuté."""
 
     def __init__(self, spark):
         import threading
         self.spark = spark
         self.parser = spark._jsparkSession.sessionState().sqlParser()
-        self.lock = threading.Lock()       # vues partagées entre threads
+        # les vues sont partagées entre threads
+        self.lock = threading.Lock()
 
     def parse(self, sql: str) -> str | None:
         try:
@@ -103,7 +110,8 @@ class SparkChecker:
     def analyze(self, section: dict, sql: str) -> str | None:
         views = section.get("views", {})
         if not views or any(not v.get("columns") for v in views.values()):
-            return None                    # colonnes inconnues : pas d'analyse
+            # on ne connaît pas toutes les colonnes
+            return None
         with self.lock:
             try:
                 for name, v in views.items():
@@ -115,28 +123,37 @@ class SparkChecker:
                     cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
                     self.spark.sql(f"SELECT {', '.join(cols)} WHERE false") \
                         .createOrReplaceTempView(name)
-                self.spark.sql(sql).schema       # analyse seulement
+                self.spark.sql(sql).schema       # on demande juste le schéma
                 return None
             except Exception as exc:
                 msg = str(exc).splitlines()[0]
                 all_typed = all(set(v["columns"]) - {"_qlik_order"}
                                 <= set(v.get("types") or {}) for v in views.values())
                 if any(k in msg for k in TYPE_ERRORS) and not all_typed:
-                    return None                  # types inconnus : non fiable
+                    # types incomplets, on ne conclut pas
+                    return None
                 return "analyse Spark : " + msg[:300]
 
 
 def get_parser():
-    """Vérificateur Spark (None si pyspark n'est pas installé)."""
+    """Renvoie le vérificateur Spark, ou None si pyspark n'est pas installé.
+
+    On prend la session de pyspark-commons, comme le job. Si la lib n'est pas
+    là, on se rabat sur une session locale minimale."""
     try:
-        from pyspark.sql import SparkSession
+        from pyspark_commons.session import get_local_spark_session
+        spark = get_local_spark_session()
     except ImportError:
-        return None
-    spark = (SparkSession.builder.master("local[1]")
-             .config("spark.ui.enabled", "false")
-             .config("spark.sql.ansi.enabled", "false")      # comme Spark 3.5
-             .config("spark.sql.caseSensitive", "true")      # comme Qlik
-             .getOrCreate())
+        try:
+            from pyspark.sql import SparkSession
+        except ImportError:
+            return None
+        spark = (SparkSession.builder.master("local[1]")
+                 .config("spark.ui.enabled", "false").getOrCreate())
+    # même comportement que Spark 3.5
+    spark.conf.set("spark.sql.ansi.enabled", "false")
+    # Qlik est sensible à la casse
+    spark.conf.set("spark.sql.caseSensitive", "true")
     spark.sparkContext.setLogLevel("ERROR")
     return SparkChecker(spark)
 
@@ -160,13 +177,14 @@ def check_section(section: dict, query_path: Path,
             errors.append(f"instruction interdite : {kw}")
     if re.search(r"```", raw):
         errors.append("balises ``` dans le fichier : SQL seul attendu")
-    # habitude Qlik : 'l''été'. En Spark SQL, '' colle deux chaînes et
-    # l'apostrophe disparaît (« lété ») : écrire "l'été" ou 'l\'été'
+    # Réflexe Qlik : 'l''été'. En Spark SQL, '' accole deux chaînes et
+    # l'apostrophe disparaît (on obtient « lété »). Il faut écrire "l'été" ou
+    # 'l\'été'.
     if re.search(r"\w''\w", strip_sql_comments(raw)):
         errors.append("apostrophe doublée '' dans une chaîne : en Spark SQL elle "
                       "disparaît ; écrire \"l'été\" (guillemets doubles)")
 
-    # vues et CTE lues
+    # vues et CTE lues par la requête
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents,
                                           re.I)}
     allowed = ctes | {v.lower() for v in section.get("views", {})}
@@ -174,7 +192,7 @@ def check_section(section: dict, query_path: Path,
     for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)(\s*\()?",
                          code_no_idents, re.I):
         if m.group(2):
-            continue          # fonction-table (range(…), explode…), pas une vue
+            continue          # fonction-table (range(…), explode…)
         name = m.group(1).lower()
         if name not in allowed and name not in ("values", "lateral") \
                 and m.group(1) not in unknown:
@@ -184,7 +202,7 @@ def check_section(section: dict, query_path: Path,
                       f"autorisées : {', '.join(sorted(section.get('views', {}))) or 'aucune'}"
                       " + les CTE de la requête)")
 
-    # colonnes de sortie attendues
+    # colonnes de sortie
     cols = section.get("columns") or []
     if cols and "*" not in cols and "?" not in cols:
         missing = [c for c in cols if not re.search(
@@ -192,7 +210,7 @@ def check_section(section: dict, query_path: Path,
         if missing:
             errors.append(f"colonnes de sortie absentes : {missing}")
 
-    # couverture des instructions Qlik
+    # chaque instruction Qlik doit être citée en « -- l.<n> »
     refs = {int(n) for n in re.findall(r"--\s*l\.(\d+)", raw)}
     lines = section.get("statement_lines", [])
     unref = [n for n in lines if n not in refs]
@@ -201,7 +219,8 @@ def check_section(section: dict, query_path: Path,
                       f"commentaire « -- l.<n> » : {unref[:10]}")
     elif unref:
         warnings.append(f"instructions sans commentaire « -- l.<n> » : {unref}")
-    # les blocs TODO(model) restants n'empêchent pas d'analyser le reste
+    # On lance l'analyse Spark même s'il reste des TODO(model) : autant
+    # remonter tout de suite les autres erreurs.
     if parser is not None and not [e for e in errors if "TODO(model)" not in e]:
         problem = parser.parse(raw) or parser.analyze(section, raw)
         if problem:
@@ -232,7 +251,7 @@ def main(argv=None) -> int:
                                          / "query.sql", parser)
         if not errors and sec["status"] in ("escalade", "erreur_modele",
                                             "todo") and args.only:
-            sec["status"] = "ok"         # corrigée à la main puis validée
+            sec["status"] = "ok"         # corrigée à la main, et validée
             changed = True
         sure = [e for e in errors if not any(k in e for k in KNOWLEDGE_ERRORS)]
         if errors and not sure and args.mark:
@@ -240,8 +259,9 @@ def main(argv=None) -> int:
                   "du script : à confirmer, non bloquant)")
             continue
         if sure and args.mark and sec["status"] in ("deterministic", "ok"):
-            # traduction acceptée mais refusée par l'analyse Spark : souvent un
-            # cas que le traducteur gère mal ; on bloque avant l'exécution
+            # La requête avait été acceptée mais Spark la refuse. C'est souvent
+            # un cas que le traducteur gère mal : on la repasse en escalade
+            # avant qu'elle n'arrive dans le job.
             sec["status"] = "escalade"
             sec.setdefault("todos", []).append("contrôle : " + errors[0][:200])
             changed = True

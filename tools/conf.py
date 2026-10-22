@@ -1,14 +1,15 @@
-"""Lecture de conf/io.yml et des schémas de conf/schema/.
+"""Lit conf/io.yml et les schémas de conf/schema/.
 
-io.yml décrit chaque entrée et chaque sortie : format, location, schema_file.
-La lecture est volontairement tolérante sur la forme du fichier :
-  - sections dont le nom contient « input » / « output » ;
-  - entrées en dictionnaire (nom: {…}) ou en liste ({name: …, …}) ;
-  - clés reconnues : format, location (ou path), schema_file (ou schema).
-Un schéma peut être : {colonne: type}, une liste de {name, type}, ou l'une de
-ces formes sous une clé columns / fields / schema.
+io.yml donne, pour chaque entrée et chaque sortie, le format, la location et
+le schema_file. La forme exacte du fichier n'étant pas figée, la lecture
+accepte plusieurs variantes :
+  - les sections dont le nom contient « input » ou « output »
+  - les entrées en dictionnaire (nom: {…}) ou en liste ({name: …, …})
+  - format, location (ou path), schema_file (ou schema)
+Même chose pour les schémas : {colonne: type}, une liste de {name, type}, ou
+l'une des deux rangée sous une clé columns, fields ou schema.
 
-    python tools/conf.py          # affiche ce qui a été compris
+    python tools/conf.py          # pour voir ce qu'il a compris
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ IO_FILE = CONF / "io.yml"
 @dataclass
 class IoEntry:
     name: str
-    kind: str                     # "input" | "output"
+    kind: str                     # "input" ou "output"
     location: str
     format: str = "parquet"
     schema_file: str | None = None
@@ -48,7 +49,8 @@ def _load_yaml(path: Path):
 
 
 def _schema_columns(data) -> tuple[list[str], dict[str, str]]:
-    """Colonnes (dans l'ordre) et types d'un schéma, quelle que soit sa forme."""
+    """Colonnes d'un schéma dans l'ordre, avec leur type, quelle que soit la
+    forme du schéma."""
     if isinstance(data, dict):
         for key in ("columns", "fields", "schema"):
             if key in data and isinstance(data[key], (list, dict)):
@@ -64,7 +66,8 @@ def _schema_columns(data) -> tuple[list[str], dict[str, str]]:
         for item in data:
             if isinstance(item, dict):
                 name = item.get("name") or item.get("column") or item.get("field")
-                if name is None and len(item) == 1:      # - colonne: type
+                # cas « - colonne: type »
+                if name is None and len(item) == 1:
                     name, typ = next(iter(item.items()))
                     cols.append(str(name))
                     types[str(name)] = str(typ)
@@ -97,7 +100,8 @@ def _entries(section, kind: str):
 
 
 class IoConf:
-    """Entrées et sorties déclarées, retrouvées par nom de fichier Qlik."""
+    """Entrées et sorties de io.yml, qu'on retrouve à partir du nom de
+    fichier utilisé dans le script Qlik."""
 
     def __init__(self, path: Path = IO_FILE):
         self.path = path
@@ -138,8 +142,8 @@ class IoConf:
                              f"({entry.schema_file})")
 
     def find(self, qlik_path: str, kind: str) -> IoEntry | None:
-        """Entrée correspondant à un fichier Qlik : même nom que l'entrée,
-        ou même nom de fichier que sa location."""
+        """Cherche l'entrée qui correspond à un fichier Qlik, soit par le nom
+        de l'entrée, soit par le nom de fichier de sa location."""
         stem = _stem(qlik_path)
         pool = self.inputs if kind == "input" else self.outputs
         for e in pool:

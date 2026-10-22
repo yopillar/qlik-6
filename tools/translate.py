@@ -1,21 +1,24 @@
-"""Fait compléter par le modèle les parties que prepare.py n'a pas traduites.
+"""Fait compléter par le modèle ce que prepare.py n'a pas su traduire.
 
-Seules les tables au statut « todo » passent ici : leur query.sql est déjà
-écrit, sauf les CTE marquées TODO(model). Pour chacune :
-  1. opencode run --agent translator, session neuve, avec son prompt.md
-     (le brouillon SQL + le code Qlik + les faits) ;
-  2. check.py sur le query.sql complété ;
-  3. si erreurs : UNE relance, avec sa réponse et la liste exacte des erreurs ;
-  4. statut mis à jour dans le manifest et dans journal.csv.
+Ne passent ici que les tables au statut « todo » : leur query.sql existe
+déjà, il n'y manque que les trous TODO(model). Pour chaque table :
+  1. d'abord les expressions isolées (holes_prompt.md), puis les instructions
+     entières (prompt.md) s'il en reste, chaque fois avec
+     opencode run --agent translator dans une session neuve
+  2. check.py sur la requête complétée
+  3. en cas d'erreur, une seule relance, avec la réponse précédente et la
+     liste exacte des erreurs
+  4. mise à jour du statut dans le manifest et dans journal.csv
 
-Reprise naturelle : relancer la commande ne traite que les sections « todo »
-et « erreur_modele ». Les « escalade » ne sont jamais retraduites
-automatiquement (ta correction manuelle serait écrasée) : --retry-escalated
-pour le faire exprès. Les « deterministic » ne passent jamais par le modèle.
+Relancer la commande reprend là où on en était : seules les sections
+« todo » et « erreur_modele » sont retraitées. Une table en « escalade »
+n'est jamais retraduite d'office, pour ne pas écraser une correction faite à
+la main (--retry-escalated si on le veut vraiment). Les « deterministic » ne
+voient jamais le modèle.
 
-Le prompt est envoyé DANS le message et le modèle répond par un bloc
-```sql``` : il n'a besoin d'aucun outil ni d'aucun fichier (tous ses outils
-sont coupés). Pour voir ce qu'il a fait : work/<script>/<table>/model_<n>.log
+Le prompt part dans le message lui-même et le modèle répond en texte : il
+n'a besoin ni d'outil ni de fichier, et ses outils sont d'ailleurs tous
+coupés. Pour voir ce qu'il a fait : work/<script>/<table>/model_<n>.log
 (message et réponse brute) et query.attempt<n>.sql.
 
 Usage :
@@ -43,9 +46,9 @@ import journal  # noqa: E402
 from check import check_section, get_parser  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 
-# Le prompt est envoyé DANS le message et le modèle répond par un bloc
-# ```sql``` : aucun outil, aucune lecture de fichier, aucune permission à
-# demander. Taille max d'un argument de ligne de commande sous Linux : 128 Kio.
+# Le prompt est passé en argument d'opencode run, pas dans un fichier, donc le
+# modèle n'a rien à lire et aucune permission à demander. Limite : un argument
+# de ligne de commande ne dépasse pas 128 Kio sous Linux, d'où une marge.
 MAX_INLINE = 120_000
 RETRY_TEXT = """
 
@@ -64,14 +67,15 @@ and answer again with the complete query in one ```sql block."""
 
 
 def extract_sql(text: str) -> str | None:
-    """Requête dans la réponse du modèle : le plus long bloc ```sql```, ou à
-    défaut le texte à partir de la première ligne SQL."""
+    """Récupère la requête dans la réponse du modèle : le plus long bloc
+    ```sql```, ou sinon tout le texte à partir de la première ligne qui
+    ressemble à du SQL."""
     text = text.split("\n--- stderr ---\n")[0]
     blocks = re.findall(r"```(?:sql)?\s*\n(.*?)```", text, re.S | re.I)
     blocks = [b for b in blocks if re.search(r"\bSELECT\b", b, re.I)]
     if blocks:
         return max(blocks, key=len)
-    # pas de balises : la requête commence à la première ligne SQL
+    # pas de balises ```, on part de la première ligne SQL
     m = re.search(r"^\s*(--|WITH\b|SELECT\b)", text, re.M | re.I)
     if m and re.search(r"\bSELECT\b", text[m.start():], re.I):
         return text[m.start():].strip()
@@ -79,22 +83,24 @@ def extract_sql(text: str) -> str | None:
 
 
 def shrink(msg: str) -> str:
-    """Allège un message trop long en retirant les skills."""
+    """Raccourcit un message trop long en enlevant les skills."""
     for marker in ("\n# Skill: ",):
         if len(msg.encode("utf-8")) <= MAX_INLINE:
             break
         head, sep, tail = msg.partition(marker)
         if sep:
-            # on retire la rubrique jusqu'à la rubrique suivante non concernée
+            # on coupe la section Skill jusqu'à la section suivante
             rest = re.split(r"\n# (?!Skill: )(?=\S)", tail, maxsplit=1)
             msg = head + ("\n# " + rest[1] if len(rest) > 1 else "")
     return msg
 
 
 def parse_events(stdout: str) -> dict:
-    """Lit le flux d'événements de « opencode run --format json » (une ligne
-    JSON par événement) : texte final, outils tentés, raisonnement, erreurs.
-    Le schéma varie selon les versions : lecture volontairement tolérante."""
+    """Lit la sortie de « opencode run --format json », un événement JSON
+    par ligne : texte final, outils tentés, raisonnement, erreurs.
+
+    Le format change d'une version d'opencode à l'autre, donc on lit large
+    et on ignore ce qu'on ne reconnaît pas."""
     found = {"text": [], "tools": [], "reasoning": False, "errors": [],
              "json": False, "tool_inputs": [], "finish": None,
              "output_tokens": None}
@@ -115,7 +121,7 @@ def parse_events(stdout: str) -> dict:
                 state = obj.get("state")
                 status = state.get("status") if isinstance(state, dict) else ""
                 found["tools"].append(f"{obj.get('tool', '?')} {status}".strip())
-                # contenu que le modèle voulait écrire (write / edit refusés)
+                # ce que le modèle a essayé d'écrire via write / edit (refusés)
                 inp = state.get("input") if isinstance(state, dict) else None
                 if isinstance(inp, dict):
                     for key in ("content", "newString", "new_string", "text",
@@ -146,13 +152,14 @@ def parse_events(stdout: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Greffe des CTE du modèle dans le brouillon : le modèle ne renvoie que les
-# CTE à compléter (sortie courte), le reste de la requête n'est jamais réécrit.
+# Greffe des CTE du modèle dans le brouillon. Le modèle ne renvoie que les CTE
+# à compléter, ce qui garde ses réponses courtes, et on ne lui laisse jamais
+# réécrire le reste de la requête.
 # ---------------------------------------------------------------------------
 
 def _scan_parens(sql: str, start: int) -> int:
-    """Position de la parenthèse fermante associée à sql[start] == '('.
-    Ignore chaînes, noms `…` et commentaires -- ."""
+    """Renvoie la position de la parenthèse qui ferme sql[start] == '('.
+    Les chaînes, les noms `…` et les commentaires -- sont sautés."""
     depth, i, n = 0, start, len(sql)
     while i < n:
         ch = sql[i]
@@ -177,7 +184,8 @@ def _scan_parens(sql: str, start: int) -> int:
 
 
 def ctes_of(sql: str) -> list[tuple[str, int, int]]:
-    """CTE d'une requête ou d'une réponse : (nom, début du corps, fin)."""
+    """Liste les CTE d'une requête (ou d'une réponse) : (nom, début du
+    corps, fin)."""
     out, pos = [], 0
     for m in re.finditer(r"\b([A-Za-z_]\w*)\s+AS\s*\(", sql, re.I):
         if m.start() < pos or m.group(1).upper() in ("CAST", "TRY_CAST"):
@@ -186,7 +194,7 @@ def ctes_of(sql: str) -> list[tuple[str, int, int]]:
         close = _scan_parens(sql, open_)
         if close == -1:
             break
-        # une CTE est suivie de « , » ou du SELECT final, pas d'un autre AS
+        # après une CTE on trouve « , » ou le SELECT final, jamais un autre AS
         out.append((m.group(1), open_ + 1, close))
         pos = close
     return out
@@ -198,8 +206,10 @@ def todo_ctes(draft: str) -> list[str]:
 
 
 def splice(draft: str, answer: str) -> tuple[str, list[str]]:
-    """Remplace le corps des CTE TODO(model) du brouillon par ceux de la
-    réponse ; les CTE nouvelles sont insérées avant la première CTE TODO.
+    """Remplace dans le brouillon le corps des CTE TODO(model) par celui
+    donné dans la réponse. Les CTE que le modèle a ajoutées sont insérées
+    avant la première CTE TODO.
+
     Renvoie (requête, CTE TODO restées sans réponse)."""
     todos = todo_ctes(draft)
     given = {name.lower(): answer[a:b] for name, a, b in ctes_of(answer)}
@@ -221,7 +231,8 @@ def splice(draft: str, answer: str) -> tuple[str, list[str]]:
         head = sql.rfind("\n", 0, sql.rfind(todos[0], 0, first)) + 1
         prev = sql.rfind("\n", 0, head - 1) + 1
         if sql[prev:head].lstrip().startswith("-- l."):
-            head = prev                    # garder le commentaire avec sa CTE
+            # on garde le « -- l.<n> » avec sa CTE
+            head = prev
         block = "".join(f"-- CTE ajoutée par le modèle\n{n_} AS (\n"
                         f"{body.strip(chr(10))}\n),\n" for n_, body in helpers)
         sql = sql[:head] + block + sql[head:]
@@ -230,8 +241,9 @@ def splice(draft: str, answer: str) -> tuple[str, list[str]]:
 
 
 def answer_sql(ok: bool, log: str, events: dict):
-    """Texte de la réponse, requête extraite, et si elle vient d'une
-    tentative d'écriture (outil refusé) plutôt que du texte."""
+    """Renvoie le texte de la réponse, la requête extraite, et un booléen
+    qui dit si la requête vient d'une tentative d'écriture de fichier (outil
+    refusé) plutôt que du texte."""
     answer = events.get("text") if events.get("json") else \
         log.split("\n--- stderr ---\n")[0].strip()
     if not ok:
@@ -247,7 +259,7 @@ def answer_sql(ok: bool, log: str, events: dict):
 
 
 def run_opencode(message: str, args) -> tuple[bool, str, dict]:
-    """Un appel au modèle. Renvoie (succès, sortie brute, événements lus)."""
+    """Fait un appel au modèle. Renvoie (succès, sortie brute, événements)."""
     cmd = [args.opencode_bin, "run", "--agent", args.agent]
     if args.model:
         cmd += ["--model", args.model]
@@ -264,7 +276,7 @@ def run_opencode(message: str, args) -> tuple[bool, str, dict]:
         return False, f"timeout après {args.timeout}s", {}
     if res.returncode and not args.text_output and re.search(
             r"format|unknown (option|argument)|unrecognized", res.stderr, re.I):
-        # ancienne version d'opencode sans --format json : sortie texte
+        # vieil opencode sans --format json : on lit la sortie texte
         args.text_output = True
         print("    (opencode sans --format json : passage en sortie texte)")
         return run_opencode(message, args)
@@ -275,15 +287,17 @@ def run_opencode(message: str, args) -> tuple[bool, str, dict]:
 
 
 class Calls:
-    """Appels au modèle d'une table : un log numéroté par appel."""
+    """Les appels au modèle pour une table, avec un log numéroté par appel."""
 
     def __init__(self, d: Path, sec: dict, args):
         self.d, self.sec, self.args, self.n = d, sec, args, 0
         self.failures, self.last_note = 0, ""
 
     def call(self, msg: str, holes: bool = False):
-        """-> (ok, texte, sql extrait, réponse coupée, note).
-        holes : la réponse attendue est « hN: expression », pas une requête."""
+        """Renvoie (ok, texte, sql extrait, réponse coupée, note).
+
+        Avec holes=True on attend des lignes « hN: expression », pas une
+        requête."""
         self.n += 1
         t0 = time.perf_counter()
         ok, log, events = run_opencode(msg, self.args)
@@ -357,7 +371,8 @@ MORE_CONTEXT = """
 
 
 def parse_holes(text: str) -> dict[str, str]:
-    """Réponse « h1: expr » (une ligne, ou plusieurs jusqu'au trou suivant)."""
+    """Lit une réponse « h1: expr » (sur une ligne, ou sur plusieurs
+    jusqu'au trou suivant)."""
     block = extract_sql(text) or text
     out, cur = {}, None
     for line in block.splitlines():
@@ -372,16 +387,17 @@ def parse_holes(text: str) -> dict[str, str]:
 
 
 def translator_errors(sec: dict, path: Path, parser) -> list[str]:
-    """Erreurs du brouillon AVANT toute réponse du modèle : elles viennent du
-    traducteur, on ne les reproche pas au modèle (sinon il s'égare)."""
+    """Erreurs déjà présentes dans le brouillon, avant que le modèle n'y
+    touche. Elles viennent du traducteur : si on les lui renvoyait, il
+    essaierait de les corriger et partirait dans tous les sens."""
     errors, _ = check_section(sec, path, parser)
     return [e for e in errors if "TODO(model)" not in e]
 
 
 def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
                 statement_left: bool) -> tuple[dict, list[str]]:
-    """Le modèle traduit les expressions laissées par le traducteur.
-    -> (réponses acceptées {id: sql}, problèmes restants)."""
+    """Le modèle traduit les expressions que le traducteur a laissées.
+    Renvoie (réponses acceptées {id: sql}, problèmes restants)."""
     out = d / "query.sql"
     base = out.read_text(encoding="utf-8")
     prompt = (d / "holes_prompt.md").read_text(encoding="utf-8")
@@ -390,7 +406,8 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
     pending = [h["id"] for h in sec.get("holes", [])]
     answers, errors, previous, more = {}, [], "", False
     baseline = set(translator_errors(sec, out, parser))
-    for _ in range(args.retries + 2):         # +1 : niveau de contexte
+    # +1 pour la passe avec plus de contexte
+    for _ in range(args.retries + 2):
         msg = prompt + (MORE_CONTEXT.format(draft=condensed) if more else "")
         if previous or errors:
             msg += HOLE_RETRY.format(previous=previous or "(nothing)",
@@ -410,8 +427,9 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
         candidate = fill_holes(base, {**answers, **tentative})
         out.write_text(candidate, encoding="utf-8")
         problems, _ = check_section(sec, out, parser)
-        # les trous encore sans réponse (et les blocs d'instruction) sont
-        # attendus ici : seules les erreurs de syntaxe / d'analyse comptent
+        # Les trous pas encore remplis et les blocs d'instruction sont normaux
+        # à ce stade, seules les erreurs de syntaxe ou d'analyse nous
+        # intéressent.
         problems = [p for p in problems if "TODO(model)" not in p
                     and p not in baseline
                     and not (statement_left and p.startswith("colonnes de sortie"))]
@@ -424,7 +442,8 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
             errors = []
         pending = [k for k in pending if k not in answers]
         if unknown and not more:
-            more = True                      # le modèle demande plus de contexte
+            # il a répondu « ? », il veut plus de contexte
+            more = True
             print(f"    {sec['id']} : le modèle demande plus de contexte "
                   f"({', '.join(unknown)})")
         if not pending:
@@ -434,7 +453,8 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
 
 
 def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
-    """Le modèle complète les CTE TODO(model) (instructions entières)."""
+    """Le modèle complète les CTE TODO(model), c'est-à-dire des
+    instructions entières."""
     out, prompt_path = d / "query.sql", d / "prompt.md"
     prompt = prompt_path.read_text(encoding="utf-8")
     draft = out.read_text(encoding="utf-8")
@@ -494,9 +514,10 @@ def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
 
 
 def translate_section(workdir: Path, sec: dict, args, parser=None):
-    """Complète une table : d'abord les expressions isolées (holes_prompt.md),
-    puis les instructions entières (prompt.md), s'il y en a.
-    -> (statut, nombre d'appels, problème, réponses aux expressions)."""
+    """Complète une table : les expressions isolées d'abord
+    (holes_prompt.md), puis les instructions entières (prompt.md) s'il y en
+    a. Renvoie (statut, nombre d'appels, problème, réponses aux
+    expressions)."""
     d = workdir / sec["id"]
     for old in list(d.glob("model_*.log")) + list(d.glob("query.attempt*.sql")):
         old.unlink(missing_ok=True)
@@ -517,15 +538,17 @@ def translate_section(workdir: Path, sec: dict, args, parser=None):
     if calls.failures == calls.n:
         return "erreur_modele", calls.n, "opencode en échec : voir model_*.log", {}
     if not [e for e in final if "TODO(model)" in e]:
-        # tout est complété mais le contrôle refuse : souvent le traducteur
+        # Plus de trou mais le contrôle refuse : le problème vient souvent du
+        # traducteur, pas du modèle.
         return "escalade", calls.n, ("contrôle refusé (à vérifier, peut venir du "
                                      "traducteur) : " + " | ".join(final))[:500], answers
     return "escalade", calls.n, " | ".join(problems or final)[:500], answers
 
 
 def selftest(args, quiet: bool = False) -> int:
-    """Envoie une question triviale à l'agent et montre ce qui revient.
-    quiet : n'affiche rien si tout va bien (contrôle avant traduction)."""
+    """Pose une question bête à l'agent et affiche ce qui revient.
+    Avec quiet=True, n'affiche rien si tout va bien (c'est le test lancé
+    avant chaque traduction)."""
     msg = ("Reply with exactly this text and nothing else, without using any "
            "tool:\n```sql\nSELECT 1 AS ok\n```")
     t0 = time.perf_counter()
@@ -600,7 +623,8 @@ def main(argv=None) -> int:
                   "Test seul : python tools/translate.py --selftest")
             return 1
 
-    # parseur Spark partagé : une erreur de syntaxe déclenche la relance
+    # un seul parseur Spark pour tous les threads, une erreur de syntaxe
+    # déclenche la relance
     parser = None if args.dry_run or not todo else get_parser()
 
     cache_path = args.workdir.parent / "expressions.json"
@@ -624,8 +648,9 @@ def main(argv=None) -> int:
                 continue
             sec["status"] = status
             if status == "ok" and answers:
-                # réponses du modèle aux expressions : en cache, NON vérifiées
-                # tant que la comparaison avec Qlik n'a pas été identique
+                # On met en cache les réponses du modèle aux expressions, mais
+                # marquées non vérifiées tant qu'une comparaison avec Qlik ne
+                # les a pas confirmées.
                 by_id = {h["id"]: h for h in sec.get("holes", [])}
                 sec["hole_answers"] = {hole_key(by_id[k]): v
                                        for k, v in answers.items() if k in by_id}

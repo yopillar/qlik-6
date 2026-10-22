@@ -1,7 +1,8 @@
-"""Journal des tables traduites : work/journal.csv (séparateur ';').
+"""Journal des tables traduites, dans work/journal.csv (séparateur ;).
 
-Une ligne par (script, section). Les mises à jour fusionnent les colonnes :
-la colonne « resolution », remplie à la main, n'est jamais écrasée.
+Une ligne par couple (script, section). Une mise à jour ne touche qu'aux
+colonnes qu'on lui passe : la colonne « resolution », qu'on remplit à la
+main, n'est donc jamais écrasée.
 """
 
 from __future__ import annotations

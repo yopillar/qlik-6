@@ -1,13 +1,14 @@
-"""Preuve par les données : lance le job, compare chaque sortie à Qlik.
+"""Lance le job et compare chaque sortie avec celle de Qlik.
 
-Pour chaque STORE du script (OUTPUTS des sections) :
-    qlik_outputs/<nom>.qvd|.csv|.parquet   (fourni par toi, exporté de Qlik)
-    data/output/<nom>/                     (écrit par src/<script>/job.py)
-sont comparés par compare.py. Le résultat est écrit dans
-work/<script>/comparaison.md, dans le manifest (champ « compare ») et dans
-work/journal.csv.
+C'est la vérification sur les données. Pour chaque STORE du script (les
+OUTPUTS des sections), on compare avec compare.py :
+    data/qlik_outputs/<nom>.qvd|.csv|.parquet   (export Qlik, à fournir)
+    data/output/<nom>/                          (écrit par le job du projet)
+Le résultat va dans work/<script>/comparaison.md, dans le manifest (champ
+« compare ») et dans work/journal.csv.
 
-Code retour : 0 identique, 1 écarts, 2 le job n'a pas pu tourner.
+Code retour : 0 si tout est identique, 1 s'il y a des écarts, 2 si le job
+n'a pas pu tourner.
 
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
@@ -26,13 +27,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
+from job_template import project_dir  # noqa: E402
 
-QLIK_DIR = Path("qlik_outputs")
+QLIK_DIR = Path("data") / "qlik_outputs"
 EXTENSIONS = (".qvd", ".csv", ".txt", ".parquet")
 
 
 def find_reference(name: str) -> Path | None:
-    """Fichier Qlik de même nom (insensible à la casse et à l'extension)."""
+    """Cherche dans data/qlik_outputs/ le fichier du même nom, sans tenir
+    compte de la casse ni de l'extension."""
     if not QLIK_DIR.exists():
         return None
     for f in QLIK_DIR.iterdir():
@@ -54,17 +57,19 @@ def main(argv=None) -> int:
     mpath = args.workdir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     stem = Path(manifest["script"]).stem
-    job = Path("src") / stem / "job.py"
+    job = project_dir() / "job.py"
 
     job_failed = False
     if not args.no_run:
         if not job.exists():
-            print(f"{job} absent : lance d'abord l'assemblage.")
+            print(f"{job} absent : lance d'abord assemble.py puis "
+                  "orchestrate.py (ou migrate.py).")
             return 2
         print(f"Exécution de {job} …")
-        res = subprocess.run([sys.executable, str(job)])
+        res = subprocess.run([sys.executable, str(job), "--only", stem])
         if res.returncode:
-            # étapes isolées : on compare quand même ce qui a été produit
+            # Le job isole ses étapes, donc il a pu écrire une partie des
+            # sorties : on compare quand même ce qui existe.
             print("⚠ Une ou plusieurs étapes du job ont échoué (voir la trace "
                   "ci-dessus) : comparaison de ce qui a été produit.")
             job_failed = True
@@ -83,8 +88,10 @@ def main(argv=None) -> int:
                 verdict, detail = "sortie absente", f"{out_path} n'existe pas"
                 n_ko += 1
             else:
-                # clés AutoNumber / Hash : valeurs différentes de Qlik par
-                # construction, exclues de la comparaison
+                # Les clés AutoNumber / Hash ne peuvent pas avoir les mêmes
+                # valeurs que dans Qlik, on les sort de la comparaison.
+                # _qlik_order aussi, Qlik n'a pas cette colonne. Conséquence :
+                # l'ordre des lignes n'est pas vérifié ici.
                 tech = sec.get("technical_columns", [])
                 ok, detail = compare_files(ref, Path(out_path),
                                            ignore=list(args.ignore) + tech
@@ -106,8 +113,9 @@ def main(argv=None) -> int:
                 "status": sec["status"], "compare": verdict})
 
     if verified:
-        # expressions traduites par le modèle, désormais prouvées par les
-        # données : réutilisables sans modèle dans les autres scripts
+        # Ces expressions venaient du modèle, mais la comparaison vient de leur
+        # donner raison : on les met en cache pour les réutiliser telles
+        # quelles dans les autres scripts, sans rappeler le modèle.
         cache_path = args.workdir.parent / "expressions.json"
         cache = json.loads(cache_path.read_text(encoding="utf-8")) \
             if cache_path.exists() else {}
