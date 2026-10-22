@@ -53,6 +53,9 @@ d'autre à toucher.
 
 ## La commande
 
+Toutes les commandes se lancent depuis la racine du projet : les chemins
+(`conf/`, `src/`, `work/`, `data/`) partent du dossier courant.
+
 ```bash
 python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # la 1re fois, puis on relit
 python tools/migrate.py script_qvd/ --jobs 4              # tout le dossier
@@ -230,7 +233,10 @@ jamais ce qui existe.
   texte, avec l'indentation du fichier : les commentaires et la mise en
   forme sont conservés. Chaque ajout porte un commentaire daté qui dit
   pourquoi il est là.
-- Un schéma absent est créé (`colonne: type`). Un schéma existant n'est
+- Un schéma absent est créé dans la forme des schémas déjà présents : par
+  défaut celle du socle, `columns:` puis `NomCol: TYPE`, types en
+  majuscules. Les noms de colonnes gardent la casse du script Qlik (ou du
+  fichier de données), puisque Qlik y est sensible. Un schéma existant n'est
   jamais retouché, même s'il lui manque des colonnes : c'est signalé, car le
   socle s'en sert pour lire le fichier et une colonne en trop pourrait le
   casser.
@@ -299,6 +305,16 @@ trou à la place de l'expression. Ensuite, pour chaque table :
 
 Aucune valeur de donnée n'est envoyée au modèle : uniquement des noms et des
 types de colonnes, et les messages d'erreur de Spark.
+
+Sur une table de plus de 30 colonnes, les prompts ne citent que les colonnes
+que le code Qlik à traduire utilise, avec le nombre des autres. Le modèle
+reçoit la consigne de garder ces dernières avec `*`, et le `SELECT` final,
+écrit par l'outil, les liste toutes. Sans ça, une table de 300 colonnes
+était répétée dans les faits, le brouillon et chaque expression : un prompt
+passait de 2 000 à 45 000 tokens, au point de dépasser la taille maximale
+d'un argument de ligne de commande (« Argument list too long »). Les erreurs
+de Spark renvoyées au modèle sont aussi raccourcies, car « colonne
+introuvable » y ajoute la liste de toutes les colonnes.
 
 ## Le contrôle avant l'assemblage
 
@@ -403,6 +419,10 @@ veut la refaire exprès).
 - Avec `FieldValue('F', RecNo())`, les valeurs sont numérotées dans l'ordre
   trié, alors que Qlik suit l'ordre de chargement.
 - `Date(x)` appliqué à un nombre (date Qlik en jours) n'est pas converti.
+- Piège de Spark hors mode ANSI : `FROM t WHERE (x)` est lu comme l'alias de
+  table `WHERE`, et le filtre disparaît sans erreur. Le traducteur double
+  les parenthèses dans ce cas, et `check.py` refuse cette écriture si le
+  modèle la produit.
 - Le typage des dates repose sur `conf/schema`. Une colonne de dates sans
   type déclaré (ou déclarée en texte) n'est pas reconnue comme date par
   `Min`, `Max` ou `Peek`. Dans ce cas, le contrôle ne peut pas trancher sur

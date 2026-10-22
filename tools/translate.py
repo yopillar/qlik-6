@@ -82,6 +82,16 @@ def extract_sql(text: str) -> str | None:
     return None
 
 
+def short_error(error: str) -> str:
+    """Raccourcit une erreur avant de la renvoyer au modèle. Sur une table
+    large, Spark ajoute à « colonne introuvable » la liste de toutes les
+    colonnes (« Did you mean one of the following? [...] »), soit des
+    milliers de caractères."""
+    error = re.sub(r"(Did you mean one of the following\?\s*\[)([^\]]{200,})\]",
+                   lambda m: m.group(1) + m.group(2)[:200] + "…]", error)
+    return error if len(error) <= 600 else error[:600] + "…"
+
+
 def shrink(msg: str) -> str:
     """Raccourcit un message trop long en enlevant les skills."""
     for marker in ("\n# Skill: ",):
@@ -274,6 +284,11 @@ def run_opencode(message: str, args) -> tuple[bool, str, dict]:
                              timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return False, f"timeout après {args.timeout}s", {}
+    except OSError as exc:
+        # « Argument list too long » : le message ne passe pas en argument.
+        # On le dit clairement au lieu de planter tout le script.
+        return False, (f"opencode n'a pas pu être lancé ({exc}) : message de "
+                       f"{len(message.encode('utf-8')) // 1024} Ko"), {}
     if res.returncode and not args.text_output and re.search(
             r"format|unknown (option|argument)|unrecognized", res.stderr, re.I):
         # vieil opencode sans --format json : on lit la sortie texte
@@ -409,11 +424,17 @@ def holes_phase(calls: Calls, d: Path, sec: dict, args, parser,
     # +1 pour la passe avec plus de contexte
     for _ in range(args.retries + 2):
         msg = prompt + (MORE_CONTEXT.format(draft=condensed) if more else "")
+        if more and len(msg.encode("utf-8")) > MAX_INLINE:
+            msg = prompt         # le contexte en plus ne tient pas : sans lui
         if previous or errors:
             msg += HOLE_RETRY.format(previous=previous or "(nothing)",
-                                     errors="\n".join(f"- {e}" for e in errors)
+                                     errors="\n".join(f"- {short_error(e)}"
+                                                       for e in errors)
                                      or "- missing answers",
                                      pending=", ".join(pending))
+        if len(msg.encode("utf-8")) > MAX_INLINE:
+            return answers, [f"prompt des expressions trop long "
+                             f"({len(msg.encode('utf-8')) // 1024} Ko)"]
         ok, text, _, _, _ = calls.call(msg, holes=True)
         if args.dry_run:
             return {}, []
@@ -467,7 +488,7 @@ def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
             msg += RETRY_TEXT.format(
                 previous=(previous if previous is not draft
                           else "(no SQL in your answer)"),
-                errors="\n".join(f"- {e}" for e in errors),
+                errors="\n".join(f"- {short_error(e)}" for e in errors),
                 allowed=", ".join(sorted(sec.get("views", {}))) or "none")
         msg = shrink(msg)
         if len(msg.encode("utf-8")) > MAX_INLINE:

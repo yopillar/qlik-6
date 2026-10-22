@@ -28,6 +28,64 @@ from dataclasses import dataclass, field
 ORD = "_qlik_order"
 
 
+# Au-delà de ce nombre de colonnes, les prompts ne listent que celles que le
+# code Qlik utilise. Une table de 300 colonnes, répétée dans les faits, le
+# brouillon et chaque trou, faisait passer un prompt de 2 000 à 45 000
+# tokens, et dépasser la taille maximale d'un argument de ligne de commande.
+FEW_COLUMNS = 30
+
+
+def used_columns(columns: list[str], code: str) -> list[str]:
+    """Colonnes de la liste citées dans un bout de code Qlik ou SQL, dans
+    l'ordre de la liste. La comparaison ignore la casse, mais on renvoie les
+    noms tels qu'ils sont dans la liste."""
+    words = {w.lower() for t in re.findall(
+        r"\[([^\]]+)\]|\"([^\"]+)\"|`([^`]+)`|([^\W\d][\w.]*)", code)
+        for w in t if w}
+    return [c for c in columns if c.lower() in words]
+
+
+def safe_where(cond: str) -> str:
+    """Condition à écrire après WHERE, protégée d'un piège de Spark.
+
+    Hors mode ANSI, WHERE n'est pas un mot réservé : « FROM t WHERE (x) »
+    est lu comme l'alias de table WHERE avec une colonne renommée en x. Sur
+    une table d'une colonne, le filtre disparaît sans erreur ; sinon Spark
+    se plaint d'un nombre de colonnes (ASSIGNMENT_ARITY_MISMATCH). Le cas se
+    présente avec un trou à compléter, (/*TODO(model):h1*/ true), ou une
+    réponse du modèle réduite à un nom de colonne. Une paire de parenthèses
+    en plus suffit à l'éviter."""
+    c = cond.strip()
+    if c.startswith("(") and _closing(c, 0) == len(c) - 1:
+        return f"({c})"
+    return c
+
+
+def _closing(text: str, start: int) -> int:
+    """Position de la parenthèse qui ferme text[start] (ou -1)."""
+    depth = 0
+    for k in range(start, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def columns_text(columns: list[str], code: str, extra: str = "") -> str:
+    """Liste de colonnes pour un prompt : complète si elle est courte, sinon
+    réduite à celles que le code utilise, avec le nombre des autres."""
+    if len(columns) <= FEW_COLUMNS:
+        return ", ".join(columns + ([extra] if extra else []))
+    used = used_columns(columns, code)
+    rest = len(columns) - len(used)
+    return ", ".join(used + ([extra] if extra else [])) + (
+        f" (+ {rest} other columns not used here: they exist, keep them with "
+        "`*` and never list them)")
+
+
 class Untranslatable(Exception):
     """Levée quand on ne sait pas traduire un élément Qlik à coup sûr."""
 
@@ -1044,6 +1102,7 @@ class SectionTranslator:
         self.notes: list[str] = []
         self.todos: list[str] = []
         self.holes: list[dict] = []        # expressions laissées au modèle
+        self.todo_code: list[str] = []     # code Qlik laissé au modèle
         self.derived_types: dict[str, str] = {}   # colonnes calculées en date
         self.counter: dict[str, int] = {}
         self.technical: list[str] = []         # colonnes AutoNumber / Hash
@@ -1092,6 +1151,9 @@ class SectionTranslator:
             else:
                 raise Untranslatable(f"instruction {inst.kind}")
         except Untranslatable as exc:
+            # le code Qlik des instructions laissées au modèle : il sert à ne
+            # mettre dans le prompt que les colonnes qu'elles utilisent
+            self.todo_code.append(text)
             self.placeholder(inst, line, str(exc))
 
     # Une expression qu'on ne sait pas traduire ne bloque pas toute
@@ -1132,9 +1194,11 @@ class SectionTranslator:
         # requête finale reste explicite et check.py peut les vérifier.
         cols = None if {"join", "keep", "concatenate"} & inst.constructs \
             else self.ctx.graph_schema(table)
+        must = columns_text(cols, "\n".join(self.todo_code), ORD) \
+            if cols else ""
         body = (f"-- TODO(model): l.{line} : {reason}\n"
                 f"-- (code Qlik complet dans le prompt)\n"
-                + (f"-- must produce: {', '.join(cols + [ORD])}\n" if cols else "")
+                + (f"-- must produce: {must}\n" if cols else "")
                 + (f"SELECT * FROM {src}" if src else "SELECT NULL AS todo"))
         self.add(table, body, f"l.{line} : à traduire par le modèle", cols)
 
@@ -1280,7 +1344,8 @@ class SectionTranslator:
             key = self.dedup_field if q else f"{alias_}.{self.dedup_field}"
             source = (f"(SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY "
                       f"{key} ORDER BY {alias_}.{ORD}) "
-                      f"AS __rn\n  FROM {src} {alias_} WHERE {where_sql}) d "
+                      f"AS __rn\n  FROM {src} {alias_} WHERE "
+                      f"{safe_where(where_sql)}) d "
                       f"WHERE __rn = 1)")
             where_sql = None
         sql = ("SELECT " + ",\n       ".join(select)
@@ -1288,7 +1353,7 @@ class SectionTranslator:
         for j in joins:
             sql += "\n" + j
         if where_sql:
-            sql += f"\nWHERE {where_sql}"
+            sql += f"\nWHERE {safe_where(where_sql)}"
         if group_sql:
             sql += "\nGROUP BY " + ", ".join(group_sql)
         if first:
@@ -1745,15 +1810,15 @@ class SectionTranslator:
         # nom.
         statement = [c for c in self.ctes if "TODO(model): l." in c.sql]
         todo = statement or [c for c in self.ctes if "TODO(model)" in c.sql]
-        todo_text = "\n".join(c.sql for c in todo)
+        todo_text = "\n".join([c.sql for c in todo] + self.todo_code)
         read = {c.name for c in self.ctes
                 if re.search(rf"\b{re.escape(c.name)}\b", todo_text)}
         for k, c in enumerate(self.ctes):
             body = _indent(c.sql, 2)
             if condensed and c not in todo:
                 if c.name in read:
-                    known = ", ".join(c.columns + [ORD]) if c.columns is not None \
-                        else "unknown (see the Qlik code)"
+                    known = columns_text(c.columns, todo_text, ORD) \
+                        if c.columns is not None else "unknown (see the Qlik code)"
                     body = f"  -- already translated; columns: {known}\n  ..."
                 else:
                     body = "  -- already translated, not read by your CTEs\n  ..."
@@ -1763,6 +1828,9 @@ class SectionTranslator:
         if cols:
             cols = list(dict.fromkeys(cols))
         sel = ",\n       ".join([ident(c) for c in cols] + [ORD]) if cols else "*"
+        if condensed and cols and len(cols) > FEW_COLUMNS:
+            # le SELECT final est écrit par l'outil, pas par le modèle
+            sel = f"...  -- {len(cols)} columns + {ORD}, listed by the tool"
         out.append(f"SELECT {sel}\nFROM {final}")
         return "\n".join(out) + "\n", cols
 

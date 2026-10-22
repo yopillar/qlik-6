@@ -261,6 +261,11 @@ def insert_entries(text: str, section: str,
             end -= 1
     body = [l for l in lines[head + 1:end]
             if l.strip() and not l.lstrip().startswith("#")]
+    if not body:
+        # section nouvelle ou vide : on prend l'indentation du reste du
+        # fichier, pour que toutes les sections se ressemblent
+        body = [l for l in lines if l.strip() and l[0].isspace()
+                and not l.lstrip().startswith("#")]
     ind = [len(l) - len(l.lstrip()) for l in body]
     lvl0 = ind[0] if ind else 2
     lvl1 = next((i for i in ind if i > lvl0), lvl0 + 2)
@@ -297,17 +302,59 @@ def write_io(blocks: dict) -> bool:
     return True
 
 
-def schema_text(why: str, lines: list) -> str:
+# Synonymes de types, pour reprendre le vocabulaire des schémas existants.
+SYNONYMS = {"int": ("int", "integer"), "bigint": ("bigint", "long"),
+            "double": ("double", "float"), "decimal": ("decimal", "numeric"),
+            "string": ("string", "varchar", "text", "str"),
+            "date": ("date",), "timestamp": ("timestamp", "datetime"),
+            "boolean": ("boolean", "bool")}
+
+
+def schema_style(conf: IoConf, base: Path) -> dict:
+    """Forme des schémas existants, pour écrire les nouveaux de la même
+    façon : clé englobante (columns:), indentation, et vocabulaire des types
+    tel qu'il est écrit (STRING, INTEGER…). Sans schéma existant : la forme
+    du socle, « columns: » puis « NomCol: TYPE » en majuscules."""
+    style = {"wrap": "columns", "indent": 3, "types": {}}
+    found = False
+    for e in conf.inputs:
+        p = base / e.schema_file if e.schema_file else None
+        if not p or not p.exists():
+            continue
+        for t in e.types.values():
+            if t:
+                style["types"].setdefault(str(t).lower(), str(t))
+        if not found:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"^(\w+):[ \t]*(#.*)?\n(?:[ \t]*(?:#.*)?\n)*([ \t]+)\S",
+                          text, re.M)
+            if m and m.group(1) in ("columns", "fields", "schema"):
+                style["wrap"], style["indent"] = m.group(1), len(m.group(3))
+            else:
+                style["wrap"], style["indent"] = None, 0
+            found = True
+    return style
+
+
+def type_text(t: str, style: dict) -> str:
+    """Écrit un type du kit (string, date…) dans le vocabulaire du projet."""
+    for syn in SYNONYMS.get(t, (t,)):
+        if syn in style["types"]:
+            return style["types"][syn]
+    return t.upper()
+
+
+def schema_text(why: str, lines: list, style: dict) -> str:
     today = dt.date.today().isoformat()
     body = [f"# Créé par tools/fill_conf.py le {today} ({why}).",
-            "# Les types suivis de « à vérifier » ont été devinés.", ""]
-    if not lines:
-        body.append("# Aucune colonne connue : déposer le fichier dans "
-                    "data/input/ et relancer, ou les écrire à la main.")
-    width = max((len(yaml_key(c)) + len(t or "") for c, t, _ in lines),
-                default=0) + 3
-    body += [f"{(yaml_key(c) + ': ' + (t or '')).ljust(width)}  # {note}"
-             for c, t, note in lines]
+            "# Les types suivis de « à vérifier » ont été devinés."]
+    pad = " " * style["indent"] if style["wrap"] else ""
+    if style["wrap"]:
+        body.append(f"{style['wrap']}:")
+    rows = [(pad + yaml_key(c) + ": " + type_text(t, style), note)
+            for c, t, note in lines]
+    width = max((len(r) for r, _ in rows), default=0) + 2
+    body += [f"{r.ljust(width)}# {note}" for r, note in rows]
     return "\n".join(body) + "\n"
 
 
@@ -335,6 +382,7 @@ def main(argv=None) -> int:
     schema_dir = next((str(Path(e.schema_file).parent) for e in conf.inputs
                        if e.schema_file), "schemas")
     base = schema_base(conf)
+    style = schema_style(conf, base)
     in_prefix = var_prefix(conf, "input", "${entrees}")
     out_prefix = var_prefix(conf, "output", "${sorties}")
 
@@ -342,8 +390,15 @@ def main(argv=None) -> int:
     reads: dict[str, dict] = {}      # nom -> path, colonnes, star, scripts
     writes: dict[str, dict] = {}     # nom -> path, colonnes, scripts
     hints: dict[str, Counter] = {}
+    failed: list[str] = []
     for script in scripts:
-        _, _, insts, _, _, schemas = analyze_script(script)
+        # Un script qu'on n'arrive pas à analyser ne doit pas empêcher de
+        # compléter la conf pour les autres : on le signale et on continue.
+        try:
+            _, _, insts, _, _, schemas = analyze_script(script)
+        except Exception as exc:
+            failed.append(f"{script.name} : {type(exc).__name__}: {exc}")
+            continue
         for i in insts:
             text = strip_comments(i.text)
             for col, c in type_hints(text).items():
@@ -356,7 +411,12 @@ def main(argv=None) -> int:
                 if "*" not in cols and "?" not in cols:
                     w["columns"] = list(dict.fromkeys(w["columns"] + cols))
             elif i.kind == "load" and i.sources:
-                cols, star = columns_read(text)
+                try:
+                    cols, star = columns_read(text)
+                except Exception as exc:
+                    failed.append(f"{script.name} l.{i.stmt.first_line} : "
+                                  f"{type(exc).__name__}: {exc}")
+                    cols, star = [], False
                 for src in i.sources[:1]:
                     r = reads.setdefault(io_name(src), {
                         "path": src, "columns": [], "star": False,
@@ -397,7 +457,11 @@ def main(argv=None) -> int:
                  f"{INPUT_DIR}/{file_stem(r['path'])}"]
         cols, types, fmt, origin = [], {}, None, None
         for loc in found:
-            cols, types, fmt = file_columns(loc)
+            try:
+                cols, types, fmt = file_columns(loc)
+            except Exception as exc:          # fichier illisible
+                warnings.append(f"{name} : {loc} illisible ({exc})")
+                cols, types, fmt = [], {}, None
             if fmt:
                 origin = loc
                 break
@@ -468,12 +532,13 @@ def main(argv=None) -> int:
         if target.exists() and not args.draft:
             continue                 # jamais d'écrasement d'un vrai schéma
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(schema_text(why, lines), encoding="utf-8")
+        target.write_text(schema_text(why, lines, style), encoding="utf-8")
         created.append(target)
 
     verb = "proposé(s) dans" if args.draft else "ajouté(s) dans"
     print(f"conf : {len(new_inputs)} entrée(s), {len(new_outputs)} sortie(s) "
-          f"et {len(created)} schéma(s) {verb} {where}")
+          f"et {len(created)} schéma(s) {verb} {where} "
+          f"({(DRAFT if args.draft else IO_FILE).resolve()})")
     for name, _, _ in new_inputs + new_outputs:
         print(f"  + {name}")
     for target in created:
@@ -488,6 +553,8 @@ def main(argv=None) -> int:
               "commentaire dans les schémas).")
     for w in warnings:
         print(f"⚠ {w}")
+    for f in failed:
+        print(f"⚠ non analysé, entrées et sorties à vérifier à la main : {f}")
     return 0
 
 

@@ -207,6 +207,13 @@ def check_section(section: dict, query_path: Path,
                                           re.I)}
     allowed = ctes | {v.lower() for v in section.get("views", {})}
     unknown = []
+    # Hors mode ANSI, « FROM t WHERE (x) » est lu comme l'alias WHERE avec une
+    # colonne renommée en x : le filtre disparaît sans erreur.
+    if re.search(r"\bFROM\s+[\w`.]+\s+WHERE\s*\(\s*[\w`.]+\s*\)",
+                 code_no_idents.replace("``", "x"), re.I):
+        errors.append("« FROM table WHERE (colonne) » : Spark lit WHERE comme "
+                      "un alias de table et ignore le filtre. Écrire "
+                      "« WHERE colonne » ou « WHERE ((colonne)) »")
     for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)(\s*\()?",
                          code_no_idents, re.I):
         if m.group(2):

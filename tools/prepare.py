@@ -38,7 +38,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import IoConf, resolve_location  # noqa: E402
-from qlik2sql import (SectionContext, translate_section,  # noqa: E402
+from qlik2sql import (FEW_COLUMNS, SectionContext,  # noqa: E402
+                      translate_section, used_columns,
                       view_name)
 
 # Skill à joindre au prompt selon ce qu'on trouve dans la partie à compléter.
@@ -1194,6 +1195,8 @@ helper CTEs before them if needed (new names). Be concise.
 9. Every view and CTE carries the technical column `_qlik_order`
    (array<bigint>, Qlik load order). Keep it in every CTE you write; use
    `ORDER BY _qlik_order` for Peek, Previous, FirstValue, LastValue.
+10. Wide tables: only the columns the Qlik code uses are listed. The others
+   exist: keep them with `*` (or `alias.*`), never list or invent them.
 
 # Draft query (to complete)
 Already translated CTEs are summarised by their columns (`...`): you can
@@ -1232,6 +1235,7 @@ If information is missing to translate an expression safely, answer
   `OVER (ORDER BY …)` for Peek, Previous, RowNo and running totals.
 - Use only the columns listed for each expression; types in parentheses
   come from conf/schema (a column without type: see the Qlik statement).
+  On wide tables only the columns the expression uses are listed.
 
 # Expressions
 {holes}
@@ -1240,9 +1244,18 @@ If information is missing to translate an expression safely, answer
 
 def hole_block(h: dict) -> str:
     types = h.get("types") or {}
-    cols = ", ".join(f"{c} ({types[c]})" if c in types else c
-                     for c in h["columns"]) if h.get("columns") else \
-        "unknown (see the Qlik statement)"
+    if h.get("columns"):
+        # Sur une table large, seulement les colonnes que l'expression cite :
+        # la liste complète était répétée pour chaque trou.
+        shown = h["columns"] if len(h["columns"]) <= FEW_COLUMNS \
+            else used_columns(h["columns"], h["qlik"])
+        cols = ", ".join(f"{c} ({types[c]})" if c in types else c
+                         for c in shown)
+        if len(shown) < len(h["columns"]):
+            cols += (f" (+ {len(h['columns']) - len(shown)} other columns, "
+                     "not used by this expression)")
+    else:
+        cols = "unknown (see the Qlik statement)"
     pre = f" (prefix them with `{h['qualifier']}.`)" if h.get("qualifier") else ""
     lines = [f"### {h['id']} — l.{h['line']}, "
              + (f"column `{h['alias']}`" if h.get("alias") else "WHERE condition")
@@ -1282,10 +1295,18 @@ def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
         out.append("- Existing views: " + ", ".join(
             f"`{k}` (= {v.get('path') or 'table ' + v['table']})"
             for k, v in views.items()))
+        code = "\n".join(strip_comments(i.text) for i in insts)
         for k, v in views.items():
             if v.get("types"):
-                out.append(f"- Column types of `{k}` (conf/schema): "
-                           + ", ".join(f"{c} {t}" for c, t in v["types"].items()))
+                types = v["types"]
+                shown = list(types) if len(types) <= FEW_COLUMNS \
+                    else used_columns(list(types), code)
+                if shown:
+                    rest = len(types) - len(shown)
+                    out.append(f"- Column types of `{k}` (conf/schema): "
+                               + ", ".join(f"{c} {types[c]}" for c in shown)
+                               + (f" (+ {rest} other columns, not used by "
+                                  "this code)" if rest else ""))
     out.append(f"- Tables in this section, in script order: "
                f"{' -> '.join(sec['tables'])} (final: **{sec['table']}**)")
     for inst in insts:
@@ -1307,7 +1328,12 @@ def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
         out.append(f"- Context (loop / condition / SUB call): {c}")
     cols = sec.get("columns") or []
     if cols and "*" not in cols and "?" not in cols:
-        out.append(f"- Expected output columns, in order: {cols}")
+        if len(cols) <= FEW_COLUMNS:
+            out.append(f"- Expected output columns, in order: {cols}")
+        else:
+            out.append(f"- Expected output: {len(cols)} columns. The final "
+                       "SELECT, written by the tool, lists them: keep the "
+                       "columns you do not compute with `*`.")
     unresolved = sorted({m for i in insts for m in re.findall(
         r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))} - SYSTEM_VARS)
     for name in unresolved:

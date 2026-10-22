@@ -74,8 +74,19 @@ def main(argv=None) -> int:
     # On complète conf/io.yml et les schémas avant de traduire, puisque la
     # traduction s'en sert (colonnes des LOAD *, types des dates). Seulement
     # des ajouts : ce qui est déjà déclaré n'est jamais modifié.
+    conf_state = "non touchée (--no-conf)"
     if not args.no_conf:
-        run("fill_conf.py", str(folder), *[f"--var={v}" for v in args.var])
+        if not Path("conf").is_dir():
+            # Tous les chemins du kit partent du dossier courant : lancé
+            # ailleurs qu'à la racine du projet, il écrirait un conf/ et un
+            # src/ à côté des vrais.
+            print(f"⚠ pas de dossier conf/ dans {Path.cwd()} : migrate.py se "
+                  "lance depuis la racine du projet. Un conf/io.yml va être "
+                  "créé ici.")
+        rc = run("fill_conf.py", str(folder), *[f"--var={v}" for v in args.var])
+        conf_state = (f"complétée ({Path('conf/io.yml').resolve()})" if rc == 0
+                      else "PAS complétée, voir le message de fill_conf.py "
+                           "plus haut")
 
     summary, stopped = [], False
     for script in scripts:
@@ -134,12 +145,13 @@ def main(argv=None) -> int:
     run("orchestrate.py")      # régénère src/<nom-projet>/job.py
 
     print(f"\n{'=' * 70}\nRÉSUMÉ")
+    print(f"Conf : {conf_state}")
     for name, state, to_fix in summary:
         print(f"- {name} : {state}")
         for sid in to_fix[:15]:
             print(f"    à corriger : {WORK / Path(name).stem / sid}/query.sql")
     ready = sum("assemblé" in state for _, state, _ in summary)
-    print(f"\nJob du projet : python {project_dir() / 'job.py'} "
+    print(f"\nJob du projet : {(project_dir() / 'job.py').resolve()} "
           f"({'contient les scripts assemblés' if ready else 'aucun script assemblé pour l’instant'})")
     print(f"Journal : {WORK / 'journal.csv'}")
     if not compare:
