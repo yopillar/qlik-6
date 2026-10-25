@@ -42,7 +42,8 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import CONF, IO_FILE, IoConf, _load_yaml, resolve_location  # noqa: E402
+from conf import (CONF, IO_FILE, IoConf, _load_yaml,  # noqa: E402
+                  find_scripts, resolve_location)
 from prepare import (INPUT_DIR, analyze_script, file_stem,  # noqa: E402
                      mask_strings, norm_path, strip_comments)
 from qlik2sql import Untranslatable, split_statement, tokenize_expr  # noqa: E402
@@ -360,7 +361,7 @@ def schema_text(why: str, lines: list, style: dict) -> str:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("path", type=Path, help="un .qvs ou le dossier script_qvd/")
+    p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
     p.add_argument("--var", action="append", default=[], metavar="NOM=VALEUR",
                    help="valeur d'une variable des locations, pour aller lire "
                         "les fichiers de données (ex. --var entrees=data/input)")
@@ -368,10 +369,10 @@ def main(argv=None) -> int:
                    help="ne rien modifier, écrire un brouillon dans conf/draft/")
     args = p.parse_args(argv)
     variables = dict(v.split("=", 1) for v in args.var if "=" in v)
-    scripts = sorted(args.path.glob("*.qvs")) if args.path.is_dir() \
-        else [args.path]
+    scripts = find_scripts(args.path)
     if not scripts:
-        print(f"Aucun .qvs dans {args.path}")
+        print(f"Aucun script Qlik dans {args.path} (.qvs, .txt ou sans "
+              "extension)")
         return 1
 
     conf = IoConf()

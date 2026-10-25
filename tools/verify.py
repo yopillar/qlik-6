@@ -32,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
-from conf import resolve_location  # noqa: E402
+from conf import resolve_location, work_dir  # noqa: E402
 from job_template import project_dir  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
@@ -63,6 +63,7 @@ def main(argv=None) -> int:
                         "(ex. --var sorties=data/output), sinon "
                         "l'environnement")
     args = p.parse_args(argv)
+    args.workdir = work_dir(args.workdir)
     variables = dict(v.split("=", 1) for v in args.var if "=" in v)
 
     mpath = args.workdir / "manifest.json"

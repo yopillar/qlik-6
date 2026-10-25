@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
+from conf import work_dir  # noqa: E402
 from check import check_section, get_parser  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 
@@ -621,6 +622,7 @@ def main(argv=None) -> int:
 
     if args.selftest:
         return selftest(args)
+    args.workdir = work_dir(args.workdir)
 
     mpath = args.workdir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8"))

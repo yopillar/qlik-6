@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from conf import work_dir  # noqa: E402
 from job_template import project_dir  # noqa: E402
 
 
@@ -38,6 +39,7 @@ def main(argv=None) -> int:
     p.add_argument("--partial", action="store_true",
                    help="assembler même si des tables ne sont pas validées")
     args = p.parse_args(argv)
+    args.workdir = work_dir(args.workdir)
 
     manifest = json.loads((args.workdir / "manifest.json").read_text(
         encoding="utf-8"))

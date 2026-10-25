@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
+from conf import work_dir  # noqa: E402
 
 FORBIDDEN = ("CREATE", "INSERT", "DELETE", "UPDATE", "MERGE", "DROP",
              "ALTER", "TRUNCATE", "CACHE", "REFRESH")
@@ -267,6 +268,7 @@ def main(argv=None) -> int:
                    help="passer en escalade les tables validées que le contrôle "
                         "refuse (utilisé par migrate.py avant l'assemblage)")
     args = p.parse_args(argv)
+    args.workdir = work_dir(args.workdir)
     parser = get_parser() if args.parse else None
     mpath = args.workdir / "manifest.json"
     manifest = json.loads(mpath.read_text(encoding="utf-8"))

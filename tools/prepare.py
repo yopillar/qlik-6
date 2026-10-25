@@ -17,7 +17,7 @@
 
 Usage :
     python tools/prepare.py script_qvd/ventes.qvs
-    python tools/prepare.py --collect script_qvd/*.qvs   # recensement du projet
+    python tools/prepare.py --collect script_qvd/        # recensement du projet
 
 Sorties dans work/<script>/ :
     manifest.json, rapport.md
@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import IoConf, resolve_location  # noqa: E402
+from conf import IoConf, find_scripts, resolve_location  # noqa: E402
 from qlik2sql import (FEW_COLUMNS, SectionContext,  # noqa: E402
                       translate_section, used_columns,
                       view_name)
@@ -1817,6 +1817,10 @@ def main(argv=None) -> int:
                         "script dans work/stores.json")
     p.add_argument("--skills", type=Path, default=Path(".opencode/skills"))
     args = p.parse_args(argv)
+    # un dossier de scripts est accepté aussi : on prend ce qu'il contient
+    args.scripts = [s for path in args.scripts for s in find_scripts(path)]
+    if not args.scripts:
+        p.error("aucun script Qlik trouvé (.qvs, .txt ou sans extension)")
     out_root = args.out or Path("work")
     stores_path = out_root / "stores.json"
     if args.collect:

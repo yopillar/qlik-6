@@ -59,7 +59,7 @@ def main(argv=None) -> int:
     argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
     if not STORES.exists():
         print(f"{STORES} absent : lance d'abord migrate.py (ou "
-              "prepare.py --collect script_qvd/*.qvs).")
+              "prepare.py --collect script_qvd/).")
         return 1
     io = json.loads(STORES.read_text(encoding="utf-8"))
     order, cycles = order_scripts(io)

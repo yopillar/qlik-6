@@ -13,7 +13,7 @@ sont marqués `TODO(model)` dans une requête par ailleurs déjà écrite.
 
 ```
 mon-projet/
-├── script_qvd/               scripts .qvs à traduire                      (à fournir)
+├── script_qvd/               scripts Qlik à traduire (.qvs, .txt ou sans extension) (à fournir)
 ├── conf/io.yml               entrées / sorties : format, location, schéma (à fournir)
 ├── conf/schema/*.yml         colonnes et types des entrées                (à fournir)
 ├── data/input/               données lues (si absentes de conf/io.yml)    (à fournir)
@@ -55,6 +55,15 @@ d'autre à toucher.
 
 Toutes les commandes se lancent depuis la racine du projet : les chemins
 (`conf/`, `src/`, `work/`, `data/`) partent du dossier courant.
+
+Deux sortes d'arguments, à ne pas confondre :
+- `migrate.py`, `prepare.py` et `fill_conf.py` prennent un script Qlik ou
+  le dossier `script_qvd/`. Les scripts sans extension ou en `.txt` sont
+  pris aussi.
+- `check.py`, `translate.py`, `assemble.py` et `verify.py` prennent le
+  dossier de travail d'un script, `work/<script>`, créé par `prepare.py`. Si
+  on leur passe le script lui-même (`script_qvd/ventes.qvs`) ou juste son
+  nom (`ventes`), ils retrouvent `work/ventes` tout seuls.
 
 ```bash
 python tools/migrate.py script_qvd/ventes.qvs --pilot 3   # la 1re fois, puis on relit

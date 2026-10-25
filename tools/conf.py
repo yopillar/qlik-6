@@ -24,6 +24,48 @@ CONF = Path("conf")
 IO_FILE = CONF / "io.yml"
 
 
+# ---------------------------------------------------------------------------
+# Chemins du projet, communs à tous les outils (tous partent du dossier
+# courant, donc de la racine du projet).
+# ---------------------------------------------------------------------------
+WORK = Path("work")
+# Selon l'export, un script Qlik n'a pas toujours l'extension .qvs : on prend
+# aussi les .txt et les fichiers sans extension.
+SCRIPT_SUFFIXES = (".qvs", ".txt", "")
+
+
+def find_scripts(path: Path) -> list[Path]:
+    """Scripts Qlik désignés par path : le fichier lui-même, ou ceux du
+    dossier (.qvs, .txt ou sans extension, casse ignorée, fichiers cachés
+    exclus)."""
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return sorted(p for p in path.iterdir()
+                      if p.is_file() and not p.name.startswith(".")
+                      and p.suffix.lower() in SCRIPT_SUFFIXES)
+    return []
+
+
+def work_dir(path: Path) -> Path:
+    """Dossier de travail d'un script, work/<script>, créé par prepare.py.
+
+    check, translate, assemble et verify travaillent sur ce dossier, pas sur
+    le script. On accepte quand même le chemin du script
+    (script_qvd/ventes.qvs) ou son seul nom (ventes) : on retrouve work/ventes.
+    Sinon, on s'arrête avec un message qui dit quoi passer, plutôt qu'un
+    FileNotFoundError sur manifest.json."""
+    if (path / "manifest.json").is_file():
+        return path
+    cand = WORK / (path.stem if path.is_file() else path.name)
+    if (cand / "manifest.json").is_file():
+        return cand
+    raise SystemExit(
+        f"{path} : pas de manifest.json. Cet outil prend le dossier de "
+        f"travail d'un script, {WORK}/<script> (ex. {WORK}/ventes), créé par "
+        "prepare.py : lancer d'abord migrate.py, ou prepare.py sur le script.")
+
+
 def resolve_location(location: str, variables: dict | None = None) -> str:
     """Remplace les ${var} d'une location (${entrees}, ${sorties}…).
 
