@@ -1,23 +1,23 @@
 """Range un script traduit dans le projet.
 
-Les requêtes vont dans src/<nom-projet>/sql/, et la description du script
-(entrées, étapes, sorties) dans work/<script>/assembly.json, qu'orchestrate.py
-relit ensuite pour écrire le job.
+Les requetes vont dans src/<nom-projet>/sql/, et la description du script
+(entrees, etapes, sorties) dans work/<script>/assembly.json, qu'orchestrate.py
+relit ensuite pour ecrire le job.
 
-Le job lit et écrit par nom, avec read_input() et write_output() de
-spark-foundation-core : chaque fichier lu ou écrit par le script doit donc
-être déclaré dans conf/io.yml. Sinon on refuse d'assembler, plutôt que de
+Le job lit et ecrit par nom, avec read_input() et write_output() de
+spark-foundation-core : chaque fichier lu ou ecrit par le script doit donc
+etre declare dans conf/io.yml. Sinon on refuse d'assembler, plutot que de
 produire un job qui plantera au premier read_input().
 
-Chaque section validée (statut ok ou deterministic) donne un fichier
-src/<nom-projet>/sql/<script>__NN_<table>.sql, numéroté dans l'ordre du
-script. Le préfixe <script>__ est là parce que tous les scripts partagent le
-même dossier sql/ et que deux scripts peuvent très bien avoir une table du
-même nom. Le modèle n'intervient pas ici, ce n'est que de la copie.
+Chaque section validee (statut ok ou deterministic) donne un fichier
+src/<nom-projet>/sql/<script>__NN_<table>.sql, numerote dans l'ordre du
+script. Le prefixe <script>__ est la parce que tous les scripts partagent le
+meme dossier sql/ et que deux scripts peuvent tres bien avoir une table du
+meme nom. Le modele n'intervient pas ici, ce n'est que de la copie.
 
 Usage :
     python tools/assemble.py work/ventes
-    python tools/assemble.py work/ventes --partial   # saute les tables non validées
+    python tools/assemble.py work/ventes --partial   # saute les tables non validees
 """
 
 from __future__ import annotations
@@ -36,26 +36,29 @@ from job_template import project_dir  # noqa: E402
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("workdir", type=Path, help="work/<script>")
-    p.add_argument("--partial", action="store_true",
-                   help="assembler même si des tables ne sont pas validées")
+    p.add_argument(
+        "--partial",
+        action="store_true",
+        help="assembler meme si des tables ne sont pas validees",
+    )
     args = p.parse_args(argv)
     args.workdir = work_dir(args.workdir)
 
-    manifest = json.loads((args.workdir / "manifest.json").read_text(
-        encoding="utf-8"))
+    manifest = json.loads((args.workdir / "manifest.json").read_text(encoding="utf-8"))
     secs = [s for s in manifest["sections"] if s["status"] != "skip"]
-    pending = [s["id"] for s in secs
-               if s["status"] not in ("ok", "deterministic")]
+    pending = [s["id"] for s in secs if s["status"] not in ("ok", "deterministic")]
     if pending and not args.partial:
-        print(f"{len(pending)} table(s) non validée(s) : {pending[:8]}…\n"
-              "Assemblage annulé (--partial pour forcer).")
+        print(
+            f"{len(pending)} table(s) non validee(s) : {pending[:8]}...\n"
+            "Assemblage annule (--partial pour forcer)."
+        )
         return 1
 
     stem = Path(manifest["script"]).stem
     out = project_dir() / "sql"
 
-    # On vérifie tout avant de copier quoi que ce soit, pour ne pas laisser
-    # un script à moitié assemblé dans sql/.
+    # On verifie tout avant de copier quoi que ce soit, pour ne pas laisser
+    # un script a moitie assemble dans sql/.
     inputs, read_paths, undeclared = {}, set(), []
     for s in secs:
         if s["id"] in pending:
@@ -66,15 +69,18 @@ def main(argv=None) -> int:
                 if src.get("io"):
                     inputs[view] = src["io"]
                 else:
-                    undeclared.append(f"entrée {Path(src['path']).name}")
-        if s.get("outputs", {}).get(s["table"]) and \
-                not s.get("output_io", {}).get(s["table"]):
+                    undeclared.append(f"entree {Path(src['path']).name}")
+        if s.get("outputs", {}).get(s["table"]) and not s.get("output_io", {}).get(
+            s["table"]
+        ):
             undeclared.append(f"sortie {Path(s['outputs'][s['table']]).name}")
     if undeclared:
-        print(f"{stem} : pas déclarés dans conf/io.yml, assemblage annulé : "
-              f"{', '.join(sorted(set(undeclared)))}\n"
-              "  (python tools/fill_conf.py script_qvd/ les ajoute)")
-        # un ancien assembly.json ferait entrer une version périmée du script
+        print(
+            f"{stem} : pas declares dans conf/io.yml, assemblage annule : "
+            f"{', '.join(sorted(set(undeclared)))}\n"
+            "  (python tools/fill_conf.py script_qvd/ les ajoute)"
+        )
+        # un ancien assembly.json ferait entrer une version perimee du script
         # dans le job
         (args.workdir / "assembly.json").unlink(missing_ok=True)
         return 1
@@ -90,20 +96,39 @@ def main(argv=None) -> int:
         name = f"{stem}__{k:02d}_{s['id'].split('_', 1)[1]}.sql"
         shutil.copyfile(args.workdir / s["id"] / "query.sql", out / name)
         output = s.get("outputs", {}).get(s["table"])
-        # Le script relit-il le fichier qu'il écrit ? Le job devra alors
-        # couper la lignée avant d'écrire.
-        steps.append([name, s["view"], s.get("output_io", {}).get(s["table"]),
-                      output in read_paths])
+        # Le script relit-il le fichier qu'il ecrit ? Le job devra alors
+        # couper la lignee avant d'ecrire.
+        steps.append(
+            [
+                name,
+                s["view"],
+                s.get("output_io", {}).get(s["table"]),
+                output in read_paths,
+            ]
+        )
 
     if not any(st[2] for st in steps):
-        print("⚠ aucune sortie : aucun STORE du script n'a été rattaché à une "
-              "table (voir les notes de work/<script>/rapport.md)")
-    (args.workdir / "assembly.json").write_text(json.dumps(
-        {"script": manifest["script"], "inputs": dict(sorted(inputs.items())),
-         "steps": steps, "partial": bool(pending)},
-        indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"{stem} : {len(steps)} requête(s) dans {out}/"
-          + (f", {len(pending)} ignorée(s)" if pending else ""))
+        print(
+            "[!] aucune sortie : aucun STORE du script n'a ete rattache a une "
+            "table (voir les notes de work/<script>/rapport.md)"
+        )
+    (args.workdir / "assembly.json").write_text(
+        json.dumps(
+            {
+                "script": manifest["script"],
+                "inputs": dict(sorted(inputs.items())),
+                "steps": steps,
+                "partial": bool(pending),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"{stem} : {len(steps)} requete(s) dans {out}/"
+        + (f", {len(pending)} ignoree(s)" if pending else "")
+    )
     return 0
 
 

@@ -12,8 +12,10 @@ def test_reader_runs_after_writer_whatever_the_extension():
 
 
 def test_cycle_is_broken_and_reported():
-    io = {"a": {"reads": ["y"], "writes": ["x"]},
-          "b": {"reads": ["x"], "writes": ["y"]}}
+    io = {
+        "a": {"reads": ["y"], "writes": ["x"]},
+        "b": {"reads": ["x"], "writes": ["y"]},
+    }
     order, cycles = order_scripts(io)
     assert [s for s, _ in order] == ["a", "b"]
     assert cycles == ["a"]

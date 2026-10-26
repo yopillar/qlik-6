@@ -19,7 +19,7 @@ a RECURSIVE Peek, such as a running total.
 | `Peek('x', -2)` | `lag(x, 2) OVER (ORDER BY _qlik_order)` |
 | `Above(x)` | `lag(x) OVER (...)` |
 | `RowNo()` / `RecNo()` | `row_number() OVER (ORDER BY _qlik_order)` |
-| `If(id = Previous(id), …)` | same, with `lag(id) OVER (...)` |
+| `If(id = Previous(id), ...)` | same, with `lag(id) OVER (...)` |
 
 - A running total `If(id = Previous(id), Peek('total') + x, x)` is a
   cumulative sum: `sum(x) OVER (PARTITION BY id ORDER BY _qlik_order ROWS

@@ -3,9 +3,9 @@ description: Translates the few Qlik expressions or CTEs that tools/prepare.py c
 mode: all
 temperature: 0
 # model: <provider>/<ornith>
-# Aucun outil n'est nécessaire : tout est dans le message. Les outils sont
-# retirés de la liste proposée au modèle (tools) ET refusés (permission) :
-# un modèle faible qui voit un outil « read » tente de s'en servir, perd du
+# Aucun outil n'est necessaire : tout est dans le message. Les outils sont
+# retires de la liste proposee au modele (tools) ET refuses (permission) :
+# un modele faible qui voit un outil "read" tente de s'en servir, perd du
 # temps (plusieurs minutes) ou l'appelle avec des arguments invalides.
 tools:
   read: false
@@ -48,4 +48,4 @@ You have no tools and need none: never try to read, list or write files.
   more context. Never guess.
 - Think in English. SQL comments in French.
 - Keep every already translated part exactly as it is.
-- A string containing an apostrophe uses double quotes: "l'été". Never ''.
+- A string containing an apostrophe uses double quotes: "l'ete". Never ''.

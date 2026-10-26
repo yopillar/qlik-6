@@ -17,7 +17,7 @@ never write files. Think in English; SQL comments in French. Answer with one
   ApplyMap returns x itself. First value wins for duplicate keys.
 - `ORDER BY` only matters for `Peek`, `Previous`, `RowNo`, `Above`.
 - Booleans are -1 (true) and 0 (false); any non-zero number is true.
-- `'l''été'` in Qlik is `"l'été"` in Spark SQL (never `''` in Spark).
+- `'l''ete'` in Qlik is `"l'ete"` in Spark SQL (never `''` in Spark).
 - `STORE` writes, `DROP TABLE` frees memory (not translated).
 - `Date(x, 'fmt')`, `Num(x, 'fmt')` are display formats only: keep the type.
 - `AddMonths(d, n)` is `add_months(d, n)` (plural). `add_month`, `month_add`

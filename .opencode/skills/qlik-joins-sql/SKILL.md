@@ -22,7 +22,7 @@ columns into one column.
 - The joined LOAD is a CTE selecting only its columns, then joined.
 - "keys NOT computable" in the prompt: list the columns with the same name
   in both tables yourself, and add `-- TODO: verify join keys`.
-- "AUCUN champ commun / PRODUIT CARTÉSIEN": Qlik does a cross join ->
+- "AUCUN champ commun / PRODUIT CARTESIEN": Qlik does a cross join ->
   `CROSS JOIN` + `-- TODO: cross join in Qlik, check it is intended`.
 - Duplicated keys multiply rows, in Qlik as in Spark: never deduplicate.
 - `UNION ALL` matches columns BY POSITION in Spark 3.5: list them explicitly

@@ -1,5 +1,5 @@
-# conf de démo, indentée à 3 espaces
-# référentiel des sites : ajouté par fill_conf.py (nom avec #)
+# conf de demo, indentee a 3 espaces
+# referentiel des sites : ajoute par fill_conf.py (nom avec #)
 inputs:
    ventes:
        format: csv
