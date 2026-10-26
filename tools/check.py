@@ -124,7 +124,18 @@ class SparkChecker:
                     cols.append("CAST(NULL AS ARRAY<BIGINT>) AS _qlik_order")
                     self.spark.sql(f"SELECT {', '.join(cols)} WHERE false") \
                         .createOrReplaceTempView(name)
-                self.spark.sql(sql).schema       # on demande juste le schéma
+                schema = self.spark.sql(sql).schema   # rien n'est exécuté
+                # Types des colonnes produites, tels que Spark les écrira :
+                # fill_conf.py s'en sert pour le schéma d'un fichier relu par
+                # un autre script. Sûrs seulement si toutes les colonnes lues
+                # sont typées (sinon une colonne recopiée vaut STRING par
+                # défaut).
+                section["output_types"] = {
+                    f.name: f.dataType.simpleString().upper()
+                    for f in schema.fields if f.name != "_qlik_order"}
+                section["output_types_sure"] = all(
+                    set(v["columns"]) - {"_qlik_order"}
+                    <= set(v.get("types") or {}) for v in views.values())
                 return None
             except Exception as exc:
                 msg = str(exc).splitlines()[0]
@@ -202,6 +213,15 @@ def check_section(section: dict, query_path: Path,
     if re.search(r"\w''\w", strip_sql_comments(raw)):
         errors.append("apostrophe doublée '' dans une chaîne : en Spark SQL elle "
                       "disparaît ; écrire \"l'été\" (guillemets doubles)")
+
+    # Noms de fonctions de date qui ressemblent à Spark sans en être : le
+    # modèle les écrit par analogie avec AddMonths ou d'autres SQL.
+    for bad in re.findall(r"\b(add_month|month_add|addmonths?|dateadd|"
+                          r"date_add_months|add_years?|addyears)\s*\(",
+                          code_no_idents, re.I):
+        errors.append(f"fonction {bad}() inconnue de Spark : AddMonths(d, n) "
+                      "s'écrit add_months(d, n), AddYears(d, n) "
+                      "add_months(d, 12 * n)")
 
     # vues et CTE lues par la requête
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents,
@@ -308,7 +328,8 @@ def main(argv=None) -> int:
         for w in warnings:
             print(f"    info    {w}")
         failed += bool(errors)
-    if changed:
+    if changed or parser:
+        # avec --parse, les types de sortie calculés par Spark sont gardés
         mpath.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
                          encoding="utf-8")
     return 1 if failed else 0

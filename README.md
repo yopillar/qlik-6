@@ -91,7 +91,23 @@ python src/<nom-projet>/job.py --from ventes    # reprendre après un échec
 python src/<nom-projet>/job.py --only ventes    # un seul script
 ```
 
-- Les scripts tournent dans l'ordre de leurs dépendances : un script qui lit
+Sur le cluster, depuis la racine du projet (la commande est rappelée en tête
+de `job.py`) :
+
+```bash
+spark-submit --name <nom-projet> --deploy-mode client \
+    --py-files <archive de spark-foundation-core, s'il n'est pas installé> \
+    src/<nom-projet>/job.py [--from <script> | --only <script>]
+```
+
+En mode client, le driver lit les requêtes dans `src/<nom-projet>/sql/`. Le
+mode cluster demanderait d'envoyer aussi ce dossier et `conf/` : pas prévu
+pour l'instant. Les réglages SQL dont dépendent les requêtes (sensibilité à
+la casse, ANSI désactivé, `timeParserPolicy=CORRECTED`) sont posés par le
+job au début de `run()`, il n'y a donc pas de `--conf` à passer.
+
+- Les scripts tournent dans l'ordre de leurs dépendances (et `migrate.py`
+  les traite dans ce même ordre) : un script qui lit
   un fichier écrit par un autre passe après lui, comme avec l'enchaînement
   des tâches de rechargement dans Qlik. L'ordre est calculé à partir de
   `work/stores.json`, qui recense ce que chaque script lit et écrit.
@@ -110,7 +126,15 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
   scripts puissent avoir une table du même nom.
 - Chaque `STORE` du script Qlik devient une écriture. Un `STORE` qu'on
   n'arrive à rattacher à aucune table est signalé dans le rapport et à
-  l'assemblage.
+  l'assemblage. La boucle qui écrit toutes les tables
+  (`FOR i = NoOfTables()-1 TO 0`, `LET vTable = TableName($(i))`) est
+  déroulée sur les tables présentes à ce moment.
+- Les tables encore en mémoire à la fin du script, sans `STORE`, forment le
+  modèle de données de l'app : c'est le résultat d'une app de restitution.
+  Elles sont écrites aussi, sous le nom `<script>_<table>`.
+- Une sortie est toujours écrite sans « # » dans son nom :
+  `STORE T INTO [clients#hist.qvd]` donne la sortie `clientshist`, et un
+  script qui relit `clients#hist.qvd` la lit sous ce nom.
 - Seuls les scripts entièrement validés entrent dans le job. Les autres sont
   listés par `orchestrate.py`, qui prévient aussi si un script du job dépend
   de l'un d'eux.
@@ -119,7 +143,8 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
 
 - Les expressions : `If`, `&`, arithmétique, comparaisons, `like`, texte
   (`Index` avec n-ième occurrence, `SubField`, `KeepChar`…), dates (`Date#`
-  avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths`…), nombres,
+  avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths` avec ses
+  deux modes…), nombres,
   `IsNum`, `Match`/`WildMatch`/`Pick`, `RangeSum`, agrégations.
 - Les booléens façon Qlik : vrai vaut -1, faux vaut 0, et dans une condition
   tout nombre non nul est vrai.
@@ -191,8 +216,13 @@ technique `_qlik_order` (`array<bigint>`) :
 - elle est écrite dans chaque sortie, si bien que le script suivant récupère
   exactement le même ordre, comme avec un QVD.
 
-À savoir : `compare.py` ne vérifie pas l'ordre des lignes, il ignore cette
-colonne et compare le contenu sans tenir compte de l'ordre.
+`compare.py` compare d'abord le contenu sans tenir compte de l'ordre. Si
+le contenu est identique, il trie la sortie Spark sur `_qlik_order` et la
+compare ligne à ligne avec l'export Qlik, qui est dans l'ordre de
+chargement. Un écart d'ordre donne le verdict « identique, ordre
+différent » : il est signalé, mais ne compte comme un écart qu'avec
+`--strict-order` (`compare.py` ou `verify.py`), tant que la règle d'ordre
+après un `JOIN` n'est pas confirmée.
 
 Pour des données d'entrée converties depuis des QVD, le plus sûr est d'y
 ajouter le numéro de ligne d'origine dans une colonne `_qlik_order`. À
@@ -211,7 +241,7 @@ python tools/conf.py      # pour voir ce qui a été compris de conf/io.yml
 ```
 
 ```yaml
-input:
+inputs:
   sites:
     format: csv
     schema_file: schemas/sites.yml
@@ -223,7 +253,7 @@ outputs:
 
 Comme le socle ne lit et n'écrit que par nom, tout fichier lu ou écrit par
 un script doit être déclaré dans `conf/io.yml`. Une lecture se cherche dans
-`input`, une écriture dans `outputs`. Un fichier produit par un script et lu
+`inputs`, une écriture dans `outputs`. Un fichier produit par un script et lu
 par un autre doit donc apparaître dans les deux sections, avec la même
 location : `read_input()` ne lit que ce qui est déclaré en entrée. Le rapport liste ceux qui
 manquent, et `assemble.py` refuse d'assembler un script tant qu'il en reste.
@@ -263,16 +293,44 @@ D'où viennent les informations :
 
 - Les entrées et sorties viennent des `FROM` et des `STORE` des scripts,
   nommées d'après les fichiers Qlik, avec le même préfixe de location
-  (`${entrees}/…`) que ce qu'il y a déjà dans `io.yml`.
+  (`${entrees}/…`) que ce qu'il y a déjà dans `io.yml`. Les sections
+  s'appellent `inputs` et `outputs`, comme dans le socle. Les tables du
+  modèle de données (voir le job) sont ajoutées aux `outputs`.
+- Le format d'une entrée est celui que Qlik lit : `(txt, …)` ou un `.csv`
+  donne `csv`, avec le vrai nom du fichier dans la location (« # »
+  compris) ; un QVD est supposé converti en Parquet sous le même nom. Les
+  options du CSV (séparateur, en-tête, encodage) sont notées en commentaire
+  sous l'entrée, à reporter selon la syntaxe du socle.
+- Les scripts sont lus quel que soit leur encodage (UTF-16, UTF-8 avec ou
+  sans BOM, Windows-1252).
 - Les colonnes sont celles que les scripts lisent. Si le fichier de données
   est là (dans `data/input/` ou à sa location), on prend toutes ses
   colonnes, et on signale celles que les scripts lisent mais qui n'y sont
-  pas.
-- Les types sont lus dans le fichier quand c'est un Parquet : ceux-là sont
-  sûrs. Sinon ils sont suggérés d'après l'usage (`Year(col)` donne `date`,
-  `Sum(col)` ou un calcul donne `double`, `Date#(col)` ou `Upper(col)` donne
-  `string`), ou en dernier recours d'après le nom (`date_…`). Chaque type
-  porte en commentaire d'où il vient. Sans aucun indice, la colonne est mise
+  pas. Pour un fichier écrit par un autre script, on prend toutes les
+  colonnes de son `STORE`, dans l'ordre, même celles que le lecteur
+  n'utilise pas.
+- Les types, du plus sûr au moins sûr :
+  1. les métadonnées du Parquet, trouvé dans `data/input/` ou à sa location
+     (variables passées par `--var`). Si une location contient une variable
+     inconnue, `fill_conf.py` le dit : c'est la cause habituelle d'un
+     Parquet non lu ;
+  2. pour un fichier écrit par un autre script du projet, les types de la
+     requête Spark qui l'écrit, calculés par `check.py --parse` : ce sont
+     exactement ceux du Parquet que le job écrira. Ce fichier n'est donc
+     déclaré en entrée qu'une fois son auteur traduit (`migrate.py` traite
+     les auteurs d'abord et relance `fill_conf.py` avant chaque script) ;
+  3. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
+     entier, décimal à point, sinon texte. Une date en texte ou un décimal
+     à virgule restent en `string`, que Spark lirait mal sans options ;
+  4. le script Qlik : la fonction qui reçoit la colonne (`Year(col)` donne
+     `date`, `Sum(col)` donne `double`, `Trim(col)` ou `Date#(col)` donne
+     `string`) ou la constante à laquelle elle est comparée (`= 'OK'`,
+     `> 0`, `>= '01/01/2024'`), sinon le nom (`date_…`) ;
+  5. le même champ ailleurs : dans Qlik, un nom de champ désigne la même
+     donnée dans toutes les tables. Une colonne sans type sûr prend celui du
+     champ du même nom connu par 1 ou 2, ou déjà déclaré dans un schéma.
+  Chaque type porte en commentaire d'où il vient, et « à vérifier » dès
+  qu'il est deviné (4 et 5). Sans aucun indice, la colonne est mise
   en `string`, le type que le kit suppose de toute façon, avec le
   commentaire « type inconnu ». Une entrée dont on ne connaît aucune colonne
   (`LOAD *` sans le fichier) est déclarée sans schéma, et c'est signalé.
@@ -290,7 +348,10 @@ python tools/verify.py work/ventes --no-run --var sorties=data/output
 ```
 
 Pour la comparaison, l'export Qlik de `data/qlik_outputs/` peut porter le
-nom de la sortie dans `io.yml` ou celui du fichier de sa location.
+nom de la sortie dans `io.yml` ou celui du fichier de sa location. Dans un
+export CSV, Qlik écrit les dates au `DateFormat` du script (`29/12/2024`) :
+la comparaison les relit avec ce format, que `prepare.py` garde dans le
+manifest.
 
 ## Le modèle ne traduit que des petits morceaux
 
@@ -398,6 +459,27 @@ Une table en `escalade` n'est jamais retraduite automatiquement, pour ne
 pas écraser une correction manuelle (`translate.py --retry-escalated` si on
 veut la refaire exprès).
 
+## Tests
+
+```bash
+pip install pyspark pyyaml pandas pyarrow pytest
+python -m pytest -m "not spark"     # rapide, sans Spark
+python -m pytest                    # tout, Spark et Java requis
+```
+
+`tests/demo/` est un petit projet complet : deux scripts chaînés
+(`synthese.txt` lit la sortie de `ventes.qvs`), un calendrier sans
+extension (`Min`/`Max` de dates, `LET` avec `Peek`, `AUTOGENERATE`,
+`WeekYear`), un `io.yml` à 3 espaces avec des commentaires, et les exports
+Qlik attendus. Chaque test le copie dans un dossier temporaire. Le cas de la
+table de 322 colonnes est construit par le test lui-même.
+
+Les tests marqués `spark` lancent `migrate.py` de bout en bout avec un faux
+`spark_foundation` (`tests/fakelib/`), qui reproduit l'API vue dans le job
+`dp_test` : `pipeline(nom)`, `read_input(nom)`, `write_output(df, nom)`. Ce
+ne sont que des hypothèses sur le vrai socle. Sans pyspark, ces tests sont
+sautés.
+
 ## Les outils
 
 | Outil | Rôle |
@@ -423,8 +505,8 @@ veut la refaire exprès).
   table d'une autre section, boucles sur `FileList`, `SQL SELECT` avec
   jointure ou `WHERE` (le dialecte dépend de la base).
 - L'ordre des lignes après un `JOIN` : Qlik ne le documente pas. La règle
-  « la gauche, puis les lignes sans correspondance » reste à confirmer, et
-  `compare.py` ne vérifie pas l'ordre, il faudra donc le contrôler à part.
+  « la gauche, puis les lignes sans correspondance » reste à confirmer sur
+  de vrais exports, avec `verify.py --strict-order`.
 - Avec `FieldValue('F', RecNo())`, les valeurs sont numérotées dans l'ordre
   trié, alors que Qlik suit l'ordre de chargement.
 - `Date(x)` appliqué à un nombre (date Qlik en jours) n'est pas converti.
@@ -440,7 +522,8 @@ veut la refaire exprès).
   compléter à la main.
 - L'ordre entre scripts ne tient compte que des fichiers, pas des tables en
   base de données.
-- Testé avec Spark 4.0 en local (la cible est la 3.5.8) et une version
+- Tests pytest passés en local avec PySpark 3.5.8 (la cible) et 4.0.1,
+  Java 21, et une version
   bouchonnée de `spark-foundation-core` qui reproduit l'API vue dans le job
   `dp_test`. Pas encore testé avec le vrai socle ni avec un vrai opencode.
 - Ce qu'on suppose du socle sans l'avoir vérifié : `@pipeline` passe à

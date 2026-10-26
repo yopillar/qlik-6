@@ -1,0 +1,8 @@
+Synthese:
+LOAD Region, Sum(MontantTTC) as Total, Count(Produit) as NbLignes
+FROM [lib://out/ventes_enrichies#v2.qvd] (qvd)
+GROUP BY Region;
+STORE Synthese INTO [lib://out/synthese.qvd] (qvd);
+EXIT SCRIPT;
+Ignore: LOAD * INLINE [a
+1];

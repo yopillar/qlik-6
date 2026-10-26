@@ -9,11 +9,14 @@ Le résultat va dans work/<script>/comparaison.md, dans le manifest (champ
 
 Code retour : 0 si tout est identique, 1 s'il y a des écarts, 2 si le job
 n'a pas pu tourner, 3 si aucune sortie n'avait d'export Qlik pour comparer.
+Un écart dans l'ordre des lignes est signalé (« identique, ordre
+différent ») mais ne compte comme écart qu'avec --strict-order.
 
 Usage :
     python tools/verify.py work/ventes            # lance le job puis compare
     python tools/verify.py work/ventes --no-run   # compare seulement
     python tools/verify.py work/ventes --var sorties=data/output
+    python tools/verify.py work/ventes --strict-order
 
 Les locations de conf/io.yml contiennent des variables (${sorties}…) que
 le socle résout à l'exécution. Pour retrouver les fichiers, on les prend
@@ -62,6 +65,9 @@ def main(argv=None) -> int:
                    help="valeur d'une variable des locations de conf/io.yml "
                         "(ex. --var sorties=data/output), sinon "
                         "l'environnement")
+    p.add_argument("--strict-order", action="store_true",
+                   help="un écart dans l'ordre des lignes compte comme un "
+                        "écart")
     args = p.parse_args(argv)
     args.workdir = work_dir(args.workdir)
     variables = dict(v.split("=", 1) for v in args.var if "=" in v)
@@ -70,6 +76,8 @@ def main(argv=None) -> int:
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     stem = Path(manifest["script"]).stem
     job = project_dir() / "job.py"
+    # formats du script, pour relire les dates d'un export Qlik en CSV
+    date_formats = [manifest.get("date_format"), manifest.get("timestamp_format")]
 
     job_failed = False
     if not args.no_run:
@@ -111,20 +119,23 @@ def main(argv=None) -> int:
             else:
                 # Les clés AutoNumber / Hash ne peuvent pas avoir les mêmes
                 # valeurs que dans Qlik, on les sort de la comparaison.
-                # _qlik_order aussi, Qlik n'a pas cette colonne. Conséquence :
-                # l'ordre des lignes n'est pas vérifié ici.
+                # _qlik_order n'est pas comparée comme une colonne : elle sert
+                # à vérifier l'ordre des lignes.
                 tech = sec.get("technical_columns", [])
-                ok, detail = compare_files(ref, Path(out_path),
-                                           ignore=list(args.ignore) + tech
-                                           + ["_qlik_order"])
+                ok, detail, order = compare_files(
+                    ref, Path(out_path), ignore=list(args.ignore) + tech,
+                    date_formats=date_formats, strict_order=args.strict_order)
                 if tech:
                     detail = (f"Colonnes techniques exclues (AutoNumber/Hash) : "
                               f"{', '.join(tech)}\n\n") + detail
                 verdict = "identique" if ok else "différent"
+                if ok and order == "différent":
+                    verdict = "identique, ordre différent"
                 n_ok += ok
                 n_ko += not ok
             sec["compare"] = verdict
-            if verdict == "identique":
+            # le contenu suffit, que l'ordre des lignes soit le bon ou non
+            if verdict.startswith("identique"):
                 verified.update(sec.get("hole_answers", {}))
             print(f"  {sec['id']:<35} {table:<25} {verdict}")
             report += [f"## {sec['id']} — {table} : {verdict}", "", detail, ""]

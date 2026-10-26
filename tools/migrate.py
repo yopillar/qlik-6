@@ -6,7 +6,10 @@
 
 Avant tout, fill_conf.py ajoute dans conf/io.yml et dans les schémas ce
 qui manque pour les scripts du dossier (jamais de modification de
-l'existant, --no-conf pour s'en passer). Puis, pour chaque script :
+l'existant, --no-conf pour s'en passer). Un fichier écrit par un script et
+relu par un autre n'est déclaré en entrée qu'une fois son auteur traduit,
+avec les types exacts de la requête Spark qui l'écrit : fill_conf.py est
+donc relancé avant chaque script. Puis, pour chaque script :
   1. prepare.py    découpe le script et traduit en SQL tout ce qu'on sait
                    traduire sans le modèle (le reste est marqué TODO(model))
   2. translate.py  fait compléter les TODO par le modèle, une table par
@@ -35,6 +38,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 from conf import WORK, find_scripts  # noqa: E402
 from job_template import project_dir  # noqa: E402
+from orchestrate import STORES, order_scripts  # noqa: E402
 
 
 def run(script: str, *args: str) -> int:
@@ -71,6 +75,13 @@ def main(argv=None) -> int:
     # data/output.
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, find_scripts(folder)))
+    # On traite les scripts dans l'ordre de leurs dépendances, comme le job :
+    # verify.py lance un script seul, et il doit trouver les fichiers écrits
+    # par ceux dont il dépend.
+    if STORES.exists():
+        rank = {s: i for i, (s, _) in enumerate(order_scripts(
+            json.loads(STORES.read_text(encoding="utf-8")))[0])}
+        scripts.sort(key=lambda s: rank.get(s.name, len(rank)))
     # On complète conf/io.yml et les schémas avant de traduire, puisque la
     # traduction s'en sert (colonnes des LOAD *, types des dates). Seulement
     # des ajouts : ce qui est déjà déclaré n'est jamais modifié.
@@ -91,6 +102,11 @@ def main(argv=None) -> int:
     summary, stopped = [], False
     for script in scripts:
         print(f"\n{'#' * 70}\n# {script.name}\n{'#' * 70}")
+        if not args.no_conf:
+            # Les fichiers écrits par un script déjà traduit sont déclarés
+            # maintenant, avec les types exacts de sa requête Spark.
+            run("fill_conf.py", str(folder), "--quiet",
+                *[f"--var={v}" for v in args.var])
         if run("prepare.py", str(script)):
             summary.append((script.name, "échec de la préparation", []))
             continue
