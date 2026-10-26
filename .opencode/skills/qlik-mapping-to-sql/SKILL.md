@@ -20,14 +20,14 @@ and, for each ApplyMap, the key expression and the default value.
 
 ```sql
 WITH
--- l.9 : mapping des libellés clients (clients actifs)
+-- l.9 : mapping des libelles clients (clients actifs)
 map_clients AS (
   SELECT id_client AS map_key, MIN(libelle_client) AS map_value
   FROM clients
   WHERE actif = 1
   GROUP BY id_client
 ),
--- l.51 : libellé client via MAP_CLIENTS, défaut 'Inconnu'
+-- l.51 : libelle client via MAP_CLIENTS, defaut 'Inconnu'
 step_2 AS (
   SELECT c.*, COALESCE(m.map_value, 'Inconnu') AS libelle_client
   FROM step_1 c

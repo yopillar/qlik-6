@@ -38,9 +38,10 @@ def spark_side(rows, order):
 
 def test_order_checked_on_qlik_order():
     qlik = pd.DataFrame({"a": ["x", "y", "z"]})
-    # fichier écrit dans le désordre, mais _qlik_order donne le bon ordre
-    ok, report, order = compare(qlik, spark_side(["z", "x", "y"], [3, 1, 2]),
-                                6, ["_qlik_order"])
+    # fichier ecrit dans le desordre, mais _qlik_order donne le bon ordre
+    ok, report, order = compare(
+        qlik, spark_side(["z", "x", "y"], [3, 1, 2]), 6, ["_qlik_order"]
+    )
     assert ok and order == "identique"
 
 
@@ -48,14 +49,14 @@ def test_order_gap_reported_and_strict():
     qlik = pd.DataFrame({"a": ["x", "y"]})
     spark = spark_side(["x", "y"], [2, 1])
     ok, report, order = compare(qlik, spark, 6, ["_qlik_order"])
-    assert ok and order == "différent"
+    assert ok and order == "different"
     assert any("position 1" in line for line in report)
     ok, _, order = compare(qlik, spark, 6, ["_qlik_order"], strict_order=True)
-    assert not ok and order == "différent"
+    assert not ok and order == "different"
 
 
 def test_order_array_compared_element_by_element():
-    # [1, 10] passe après [1, 2] : tri numérique, pas sur le texte
+    # [1, 10] passe apres [1, 2] : tri numerique, pas sur le texte
     qlik = pd.DataFrame({"a": ["x", "y"]})
     spark = pd.DataFrame({"a": ["y", "x"], "_qlik_order": [[1, 10], [1, 2]]})
     assert compare(qlik, spark, 6, ["_qlik_order"])[2] == "identique"
@@ -63,4 +64,4 @@ def test_order_array_compared_element_by_element():
 
 def test_order_not_checked_without_column():
     qlik = pd.DataFrame({"a": ["x"]})
-    assert compare(qlik, pd.DataFrame({"a": ["x"]}), 6, [])[2] == "non vérifié"
+    assert compare(qlik, pd.DataFrame({"a": ["x"]}), 6, [])[2] == "non verifie"

@@ -16,8 +16,9 @@ def test_find_scripts_skips_hidden_and_other_files(tmp_path):
 
 def test_resolve_location_prefers_given_variables(monkeypatch):
     monkeypatch.setenv("sorties", "/env")
-    assert resolve_location("${sorties}/x", {"sorties": "data/output"}) == \
-        "data/output/x"
+    assert (
+        resolve_location("${sorties}/x", {"sorties": "data/output"}) == "data/output/x"
+    )
     assert resolve_location("${sorties}/x") == "/env/x"
     assert resolve_location("${inconnue}/x") == "${inconnue}/x"
 
@@ -27,6 +28,8 @@ def test_io_conf_reads_three_space_indent_and_schemas(project, monkeypatch):
     conf = IoConf(Path("conf/io.yml"))
     assert not conf.problems
     ventes = conf.find("lib://data/ventes.csv", "input")
+    assert ventes is not None
     assert ventes.columns == ["Site", "Produit", "Montant"]
     assert ventes.types["Montant"] == "DOUBLE"
-    assert conf.find("lib://out/synthese.qvd", "output").name == "synthese"
+    synthese = conf.find("lib://out/synthese.qvd", "output")
+    assert synthese is not None and synthese.name == "synthese"
