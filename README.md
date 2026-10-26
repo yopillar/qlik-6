@@ -91,7 +91,8 @@ python src/<nom-projet>/job.py --from ventes    # reprendre après un échec
 python src/<nom-projet>/job.py --only ventes    # un seul script
 ```
 
-- Les scripts tournent dans l'ordre de leurs dépendances : un script qui lit
+- Les scripts tournent dans l'ordre de leurs dépendances (et `migrate.py`
+  les traite dans ce même ordre) : un script qui lit
   un fichier écrit par un autre passe après lui, comme avec l'enchaînement
   des tâches de rechargement dans Qlik. L'ordre est calculé à partir de
   `work/stores.json`, qui recense ce que chaque script lit et écrit.
@@ -191,8 +192,13 @@ technique `_qlik_order` (`array<bigint>`) :
 - elle est écrite dans chaque sortie, si bien que le script suivant récupère
   exactement le même ordre, comme avec un QVD.
 
-À savoir : `compare.py` ne vérifie pas l'ordre des lignes, il ignore cette
-colonne et compare le contenu sans tenir compte de l'ordre.
+`compare.py` compare d'abord le contenu sans tenir compte de l'ordre. Si
+le contenu est identique, il trie la sortie Spark sur `_qlik_order` et la
+compare ligne à ligne avec l'export Qlik, qui est dans l'ordre de
+chargement. Un écart d'ordre donne le verdict « identique, ordre
+différent » : il est signalé, mais ne compte comme un écart qu'avec
+`--strict-order` (`compare.py` ou `verify.py`), tant que la règle d'ordre
+après un `JOIN` n'est pas confirmée.
 
 Pour des données d'entrée converties depuis des QVD, le plus sûr est d'y
 ajouter le numéro de ligne d'origine dans une colonne `_qlik_order`. À
@@ -267,7 +273,9 @@ D'où viennent les informations :
 - Les colonnes sont celles que les scripts lisent. Si le fichier de données
   est là (dans `data/input/` ou à sa location), on prend toutes ses
   colonnes, et on signale celles que les scripts lisent mais qui n'y sont
-  pas.
+  pas. Pour un fichier écrit par un autre script, on prend toutes les
+  colonnes de son `STORE`, dans l'ordre, même celles que le lecteur
+  n'utilise pas.
 - Les types sont lus dans le fichier quand c'est un Parquet : ceux-là sont
   sûrs. Sinon ils sont suggérés d'après l'usage (`Year(col)` donne `date`,
   `Sum(col)` ou un calcul donne `double`, `Date#(col)` ou `Upper(col)` donne
@@ -290,7 +298,10 @@ python tools/verify.py work/ventes --no-run --var sorties=data/output
 ```
 
 Pour la comparaison, l'export Qlik de `data/qlik_outputs/` peut porter le
-nom de la sortie dans `io.yml` ou celui du fichier de sa location.
+nom de la sortie dans `io.yml` ou celui du fichier de sa location. Dans un
+export CSV, Qlik écrit les dates au `DateFormat` du script (`29/12/2024`) :
+la comparaison les relit avec ce format, que `prepare.py` garde dans le
+manifest.
 
 ## Le modèle ne traduit que des petits morceaux
 
@@ -398,6 +409,27 @@ Une table en `escalade` n'est jamais retraduite automatiquement, pour ne
 pas écraser une correction manuelle (`translate.py --retry-escalated` si on
 veut la refaire exprès).
 
+## Tests
+
+```bash
+pip install pyspark pyyaml pandas pyarrow pytest
+python -m pytest -m "not spark"     # rapide, sans Spark
+python -m pytest                    # tout, Spark et Java requis
+```
+
+`tests/demo/` est un petit projet complet : deux scripts chaînés
+(`synthese.txt` lit la sortie de `ventes.qvs`), un calendrier sans
+extension (`Min`/`Max` de dates, `LET` avec `Peek`, `AUTOGENERATE`,
+`WeekYear`), un `io.yml` à 3 espaces avec des commentaires, et les exports
+Qlik attendus. Chaque test le copie dans un dossier temporaire. Le cas de la
+table de 322 colonnes est construit par le test lui-même.
+
+Les tests marqués `spark` lancent `migrate.py` de bout en bout avec un faux
+`spark_foundation` (`tests/fakelib/`), qui reproduit l'API vue dans le job
+`dp_test` : `pipeline(nom)`, `read_input(nom)`, `write_output(df, nom)`. Ce
+ne sont que des hypothèses sur le vrai socle. Sans pyspark, ces tests sont
+sautés.
+
 ## Les outils
 
 | Outil | Rôle |
@@ -423,8 +455,8 @@ veut la refaire exprès).
   table d'une autre section, boucles sur `FileList`, `SQL SELECT` avec
   jointure ou `WHERE` (le dialecte dépend de la base).
 - L'ordre des lignes après un `JOIN` : Qlik ne le documente pas. La règle
-  « la gauche, puis les lignes sans correspondance » reste à confirmer, et
-  `compare.py` ne vérifie pas l'ordre, il faudra donc le contrôler à part.
+  « la gauche, puis les lignes sans correspondance » reste à confirmer sur
+  de vrais exports, avec `verify.py --strict-order`.
 - Avec `FieldValue('F', RecNo())`, les valeurs sont numérotées dans l'ordre
   trié, alors que Qlik suit l'ordre de chargement.
 - `Date(x)` appliqué à un nombre (date Qlik en jours) n'est pas converti.

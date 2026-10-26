@@ -35,6 +35,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 from conf import WORK, find_scripts  # noqa: E402
 from job_template import project_dir  # noqa: E402
+from orchestrate import STORES, order_scripts  # noqa: E402
 
 
 def run(script: str, *args: str) -> int:
@@ -71,6 +72,13 @@ def main(argv=None) -> int:
     # data/output.
     folder = args.path if args.path.is_dir() else args.path.parent
     run("prepare.py", "--collect", *map(str, find_scripts(folder)))
+    # On traite les scripts dans l'ordre de leurs dépendances, comme le job :
+    # verify.py lance un script seul, et il doit trouver les fichiers écrits
+    # par ceux dont il dépend.
+    if STORES.exists():
+        rank = {s: i for i, (s, _) in enumerate(order_scripts(
+            json.loads(STORES.read_text(encoding="utf-8")))[0])}
+        scripts.sort(key=lambda s: rank.get(s.name, len(rank)))
     # On complète conf/io.yml et les schémas avant de traduire, puisque la
     # traduction s'en sert (colonnes des LOAD *, types des dates). Seulement
     # des ajouts : ce qui est déjà déclaré n'est jamais modifié.

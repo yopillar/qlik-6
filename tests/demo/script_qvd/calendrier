@@ -1,0 +1,14 @@
+SET DateFormat='DD/MM/YYYY';
+Dates:
+LOAD DateVente FROM [lib://data/ventes_dates.csv] (txt, utf8, embedded labels, delimiter is ',');
+Bornes:
+LOAD Min(DateVente) as MinDate, Max(DateVente) as MaxDate RESIDENT Dates;
+LET vMin = Num(Peek('MinDate', 0, 'Bornes'));
+LET vMax = Num(Peek('MaxDate', 0, 'Bornes'));
+Calendrier:
+LOAD Date($(vMin) + RecNo() - 1) as Jour,
+     Year($(vMin) + RecNo() - 1) as Annee,
+     WeekYear($(vMin) + RecNo() - 1) as AnneeSemaine
+AUTOGENERATE $(vMax) - $(vMin) + 1;
+DROP TABLE Bornes;
+STORE Calendrier INTO [lib://out/calendrier.qvd] (qvd);

@@ -1739,8 +1739,13 @@ def prepare(script: Path, out_root: Path, skills_dir: Path,
                      + ", ".join(sorted(missing_conf)))
     unresolved = sorted({m for i in insts for m in re.findall(
         r"\$\(#?([A-Za-z_][\w.]*)", strip_comments(i.text))} - SYSTEM_VARS)
+    # Les formats de date servent aussi à verify.py : un export Qlik en CSV
+    # écrit les dates dans le DateFormat du script, pas en ISO.
     manifest = {"script": script.name, "notes": notes,
-                "unresolved_variables": unresolved, "sections": sections}
+                "unresolved_variables": unresolved,
+                "date_format": env.vars.get("DateFormat"),
+                "timestamp_format": env.vars.get("TimestampFormat"),
+                "sections": sections}
     (base / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     write_report(base, manifest, len(text.splitlines()))

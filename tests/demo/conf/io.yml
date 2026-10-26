@@ -1,0 +1,17 @@
+# conf de démo, indentée à 3 espaces
+input:
+   sites:
+       format: csv
+       schema_file: schemas/sites.yml
+       location: ${entrees}/sites.csv   # référentiel
+   ventes:
+       format: csv
+       schema_file: schemas/ventes.yml
+       location: ${entrees}/ventes.csv
+   ventes_dates:
+       format: csv
+       schema_file: schemas/ventes_dates.yml
+       location: ${entrees}/ventes_dates.csv
+outputs:
+   synthese:
+       location: ${sorties}/synthese

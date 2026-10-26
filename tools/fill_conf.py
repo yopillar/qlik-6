@@ -472,7 +472,11 @@ def main(argv=None) -> int:
             warnings.append(f"{name} : colonnes lues par les scripts mais "
                             f"absentes de {origin} : {', '.join(absent)}")
         if not cols:
-            cols = r["columns"] or (writes.get(name) or {}).get("columns", [])
+            # Fichier produit par un autre script : le STORE donne toutes ses
+            # colonnes, dans l'ordre. Le lecteur n'en utilise souvent qu'une
+            # partie, et un LOAD * qui suivrait en perdrait.
+            written = (writes.get(name) or {}).get("columns", [])
+            cols = list(dict.fromkeys(written + r["columns"]))
         lines = []
         for c in cols:
             if c in types:
