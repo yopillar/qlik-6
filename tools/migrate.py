@@ -6,7 +6,10 @@
 
 Avant tout, fill_conf.py ajoute dans conf/io.yml et dans les schémas ce
 qui manque pour les scripts du dossier (jamais de modification de
-l'existant, --no-conf pour s'en passer). Puis, pour chaque script :
+l'existant, --no-conf pour s'en passer). Un fichier écrit par un script et
+relu par un autre n'est déclaré en entrée qu'une fois son auteur traduit,
+avec les types exacts de la requête Spark qui l'écrit : fill_conf.py est
+donc relancé avant chaque script. Puis, pour chaque script :
   1. prepare.py    découpe le script et traduit en SQL tout ce qu'on sait
                    traduire sans le modèle (le reste est marqué TODO(model))
   2. translate.py  fait compléter les TODO par le modèle, une table par
@@ -99,6 +102,11 @@ def main(argv=None) -> int:
     summary, stopped = [], False
     for script in scripts:
         print(f"\n{'#' * 70}\n# {script.name}\n{'#' * 70}")
+        if not args.no_conf:
+            # Les fichiers écrits par un script déjà traduit sont déclarés
+            # maintenant, avec les types exacts de sa requête Spark.
+            run("fill_conf.py", str(folder), "--quiet",
+                *[f"--var={v}" for v in args.var])
         if run("prepare.py", str(script)):
             summary.append((script.name, "échec de la préparation", []))
             continue

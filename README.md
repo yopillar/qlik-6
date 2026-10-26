@@ -309,18 +309,28 @@ D'où viennent les informations :
   pas. Pour un fichier écrit par un autre script, on prend toutes les
   colonnes de son `STORE`, dans l'ordre, même celles que le lecteur
   n'utilise pas.
-- Les types viennent des fichiers trouvés dans `data/input/` ou à leur
-  location (variables passées par `--var`), dans cet ordre :
-  1. les métadonnées du Parquet : sûres ;
-  2. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
+- Les types, du plus sûr au moins sûr :
+  1. les métadonnées du Parquet, trouvé dans `data/input/` ou à sa location
+     (variables passées par `--var`). Si une location contient une variable
+     inconnue, `fill_conf.py` le dit : c'est la cause habituelle d'un
+     Parquet non lu ;
+  2. pour un fichier écrit par un autre script du projet, les types de la
+     requête Spark qui l'écrit, calculés par `check.py --parse` : ce sont
+     exactement ceux du Parquet que le job écrira. Ce fichier n'est donc
+     déclaré en entrée qu'une fois son auteur traduit (`migrate.py` traite
+     les auteurs d'abord et relance `fill_conf.py` avant chaque script) ;
+  3. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
      entier, décimal à point, sinon texte. Une date en texte ou un décimal
-     à virgule restent en `string`, que Spark lirait mal sans options.
-  Sans fichier, le type est deviné d'après l'usage dans le script
-  (`Year(col)` donne `date`, `Sum(col)` donne `double`, `Trim(col)` donne
-  `string`), ou en dernier recours d'après le nom (`date_…`), avec « à
-  vérifier » en commentaire. Chaque type porte en commentaire d'où il
-  vient. Si une location contient une variable inconnue, `fill_conf.py` le
-  dit : c'est la cause habituelle d'un Parquet non lu. Sans aucun indice, la colonne est mise
+     à virgule restent en `string`, que Spark lirait mal sans options ;
+  4. le script Qlik : la fonction qui reçoit la colonne (`Year(col)` donne
+     `date`, `Sum(col)` donne `double`, `Trim(col)` ou `Date#(col)` donne
+     `string`) ou la constante à laquelle elle est comparée (`= 'OK'`,
+     `> 0`, `>= '01/01/2024'`), sinon le nom (`date_…`) ;
+  5. le même champ ailleurs : dans Qlik, un nom de champ désigne la même
+     donnée dans toutes les tables. Une colonne sans type sûr prend celui du
+     champ du même nom connu par 1 ou 2, ou déjà déclaré dans un schéma.
+  Chaque type porte en commentaire d'où il vient, et « à vérifier » dès
+  qu'il est deviné (4 et 5). Sans aucun indice, la colonne est mise
   en `string`, le type que le kit suppose de toute façon, avec le
   commentaire « type inconnu ». Une entrée dont on ne connaît aucune colonne
   (`LOAD *` sans le fichier) est déclarée sans schéma, et c'est signalé.

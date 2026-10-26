@@ -1,3 +1,4 @@
+import pytest
 import yaml
 
 SCRIPTS = ("script_qvd/calendrier", "script_qvd/synthese.txt",
@@ -35,12 +36,9 @@ def test_hash_kept_in_input_removed_in_output(project):
     sites = conf["inputs"]["sites2024"]
     assert sites["location"] == "${entrees}/sites#2024.csv"
     assert sites["format"] == "csv"
-    # une sortie est renommée sans #, et le script suivant la relit là
+    # une sortie est renommée sans #
     assert conf["outputs"]["ventes_enrichiesv2"]["location"] == \
         "${sorties}/ventes_enrichiesv2"
-    assert conf["inputs"]["ventes_enrichiesv2"]["location"] == \
-        "${sorties}/ventes_enrichiesv2"
-    assert conf["inputs"]["ventes_enrichiesv2"]["format"] == "parquet"
     assert not any("#" in k for s in conf.values() for k in s)
     assert not any("#" in v["location"] for v in conf["outputs"].values())
 
@@ -64,12 +62,45 @@ def test_model_tables_become_outputs(project):
     assert "ventes_ventes" not in conf["outputs"]
 
 
-def test_schema_of_produced_file_has_all_stored_columns(project):
+def test_produced_file_waits_for_its_writer(project):
+    # synthese relit ce que ventes écrit : tant que ventes n'est pas
+    # traduit, on ne fige pas un schéma deviné
+    res = fill(project)
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert "ventes_enrichiesv2" not in conf["inputs"]
+    assert "En attente" in res.stdout and "ventes_enrichiesv2" in res.stdout
+
+
+@pytest.mark.spark
+def test_produced_file_gets_exact_spark_types(project):
     fill(project)
+    project.run("prepare.py", "script_qvd/ventes.qvs")
+    project.run("check.py", "work/ventes", "--parse")
+    project.run("fill_conf.py", "script_qvd/")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    # relue sous son nom sans #, là où ventes l'écrit
+    assert conf["inputs"]["ventes_enrichiesv2"] == {
+        "format": "parquet", "schema_file": "schemas/ventes_enrichiesv2.yml",
+        "location": "${sorties}/ventes_enrichiesv2"}
     schema = yaml.safe_load((project / "conf/schemas/ventes_enrichiesv2.yml")
                             .read_text(encoding="utf-8"))
-    assert list(schema["columns"]) == ["Site", "Produit", "MontantTTC",
-                                       "Region", "Taille"]
+    # toutes les colonnes du STORE, dans l'ordre, avec les types de Spark
+    assert schema["columns"] == {"Site": "STRING", "Produit": "STRING",
+                                 "MontantTTC": "DOUBLE", "Region": "STRING",
+                                 "Taille": "STRING"}
+
+
+def test_types_from_script_comparisons_and_shared_fields(project):
+    (project / "script_qvd/c.qvs").write_text(
+        "C:\nLOAD Statut, Qte, DateCde, Site FROM [lib://src/c.qvd] (qvd)\n"
+        "WHERE Statut = 'OK' and Qte > 0 and DateCde >= '01/01/2024';\n")
+    project.run("prepare.py", "--collect", *SCRIPTS, "script_qvd/c.qvs")
+    project.run("fill_conf.py", "script_qvd/")
+    text = (project / "conf/schemas/c.yml").read_text(encoding="utf-8")
+    assert "Statut: STRING" in text and "comparé à un texte" in text
+    assert "Qte: DOUBLE" in text and "DateCde: DATE" in text
+    # Site n'a aucun indice ici, mais c'est le même champ que dans ventes
+    assert "Site: STRING" in text and "même champ que dans" in text
 
 
 def test_types_from_csv_values(project):

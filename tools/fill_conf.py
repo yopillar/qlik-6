@@ -22,11 +22,12 @@ D'où viennent les informations :
   - les colonnes : celles que les scripts lisent dans chaque fichier. Si le
     fichier est présent dans data/input/ (ou à sa location), on prend toutes
     ses colonnes, y compris celles que les scripts n'utilisent pas.
-  - les types : lus dans les métadonnées du Parquet, sinon déduits des
-    valeurs du CSV. Sans fichier, devinés d'après l'usage dans
-    les scripts (Year(col) donne date, Sum(col) donne double, Date#(col)
-    donne string…) ou d'après le nom. Sans aucun indice, on met string, le
-    type que le kit suppose de toute façon.
+  - les types : lus dans les métadonnées du Parquet ; pour un fichier
+    écrit par un autre script, ceux de la requête Spark qui l'écrit ;
+    sinon déduits des valeurs du CSV. Sans fichier, devinés d'après le
+    script (Year(col) donne date, x > 0 donne double, Trim(col) donne
+    string…), le nom, ou le champ du même nom dans une autre table. Sans
+    aucun indice, on met string, le type que le kit suppose de toute façon.
     Chaque type porte en commentaire d'où il vient.
 
 Usage :
@@ -46,8 +47,8 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import (CONF, IO_FILE, IoConf, _load_yaml,  # noqa: E402
-                  find_scripts, resolve_location)
+from conf import (CONF, IO_FILE, WORK, IoConf, io_key,  # noqa: E402
+                  _load_yaml, find_scripts, resolve_location)
 from prepare import (INPUT_DIR, analyze_script, file_stem,  # noqa: E402
                      mask_strings, norm_path, output_stem, source_format,
                      strip_comments)
@@ -160,6 +161,22 @@ def type_hints(text: str) -> dict[str, Counter]:
         for t, funcs in HINTS.items():
             if func in funcs:
                 hints.setdefault(col, Counter())[f"{t}:{m.group(1)}()"] += 1
+    # Comparaison à une constante : x = 'abc' (texte), x > 0 (nombre),
+    # x >= '01/01/2024' (date). Dans les deux sens.
+    lit = r"('[^']*'|-?\d+(?:\.\d+)?)"
+    op = r"\s*(?:=|<>|<=|>=|<|>)\s*"
+    for m in re.finditer(name + op + lit + "|" + lit + op + name
+                         + r"(?!\s*\(|[\w.])", masked):
+        col = (m.group(1) or m.group(4)).strip("[]\"")
+        value = text[m.start(2 if m.group(1) else 3):
+                     m.end(2 if m.group(1) else 3)]
+        if re.fullmatch(r"\d+", col):
+            continue
+        kind = ("date:comparé à une date" if re.fullmatch(
+                    r"'\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}'", value)
+                else "string:comparé à un texte" if value.startswith("'")
+                else "double:comparé à un nombre")
+        hints.setdefault(col, Counter())[kind] += 1
     # lookahead / lookbehind pour attraper les deux côtés de « a * b ». Un
     # nom suivi de « ( » est une fonction (x / Count(y)), pas une colonne.
     for m in re.finditer(name + r"(?=\s*[*/])|(?<=[*/])\s*" + name
@@ -439,12 +456,61 @@ def schema_text(why: str, lines: list, style: dict) -> str:
     return "\n".join(body) + "\n"
 
 
+def propagate_types(schemas_out: dict, conf: IoConf) -> None:
+    """Dans Qlik, un même nom de champ désigne la même donnée dans toutes
+    les tables (c'est ce qui les relie). Une colonne dont le type n'est que
+    deviné prend donc celui du champ du même nom dont le type est connu
+    ailleurs : lu dans un Parquet, calculé par Spark, ou déjà déclaré dans
+    un schéma existant."""
+    known: dict[str, tuple[str, str]] = {}
+    for e in conf.inputs + conf.outputs:
+        for c, typ in (e.types or {}).items():
+            if typ:
+                known.setdefault(c, (str(typ).lower(), f"schéma de {e.name}"))
+    for schema_file, (_, lines) in schemas_out.items():
+        for c, typ, note in lines:
+            if not note.endswith("à vérifier") and \
+                    not note.startswith("type inconnu"):
+                known[c] = (typ, Path(schema_file).stem)
+    for schema_file, (why, lines) in schemas_out.items():
+        for k, (c, typ, note) in enumerate(lines):
+            guessed = note.endswith("à vérifier") or \
+                note.startswith("type inconnu")
+            if guessed and c in known and known[c][1] != Path(schema_file).stem:
+                lines[k] = (c, known[c][0],
+                            f"même champ que dans {known[c][1]} (Qlik relie "
+                            "les champs du même nom), à vérifier")
+
+
+def writer_types(path: str, writer: str
+                 ) -> tuple[dict[str, str], bool] | None:
+    """Types des colonnes d'un fichier écrit par un autre script, tels que
+    Spark les calcule pour la requête qui l'écrit (check.py --parse les
+    garde dans le manifest). Ce sont les types exacts du Parquet que le job
+    écrira. None si ce script n'a pas encore été traduit et contrôlé."""
+    mpath = WORK / Path(writer).stem / "manifest.json"
+    if not mpath.exists():
+        return None
+    for sec in json.loads(mpath.read_text(encoding="utf-8"))["sections"]:
+        if not sec.get("output_types"):
+            continue
+        for table, location in sec.get("outputs", {}).items():
+            io_name_ = sec.get("output_io", {}).get(table) or ""
+            names = {io_key(location), io_key(io_name_)}
+            if io_key(path) in names:
+                return sec["output_types"], sec.get("output_types_sure", False)
+    return None
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
     p.add_argument("--var", action="append", default=[], metavar="NOM=VALEUR",
                    help="valeur d'une variable des locations, pour aller lire "
                         "les fichiers de données (ex. --var entrees=data/input)")
+    p.add_argument("--quiet", action="store_true",
+                   help="n'afficher que ce qui est ajouté (migrate.py le "
+                        "relance avant chaque script)")
     p.add_argument("--draft", action="store_true",
                    help="ne rien modifier, écrire un brouillon dans conf/draft/")
     args = p.parse_args(argv)
@@ -520,6 +586,7 @@ def main(argv=None) -> int:
 
     produced = {norm_path(w["path"]) for w in writes.values()} | set(writes)
     new_inputs, new_outputs, schemas_out, warnings = [], [], {}, []
+    waiting: list[str] = []          # fichiers dont l'auteur n'est pas traduit
     unknown_vars: set[str] = set()
 
     for name, w in sorted(writes.items()):
@@ -540,6 +607,20 @@ def main(argv=None) -> int:
         # QVD/produits.qvd lit bien la source, pas sa propre sortie.
         is_produced = norm_path(r["path"]) in produced or bool(
             name in writes and writes[name]["scripts"] - r["scripts"])
+        # Fichier écrit par un autre script : ses types exacts sont ceux de
+        # la requête Spark qui l'écrit. migrate.py traite ce script avant, et
+        # relance fill_conf.py avant chaque script : on attend donc qu'il
+        # soit traduit plutôt que de figer un schéma deviné.
+        written_by = sorted((writes.get(name) or {}).get("scripts", set())
+                            - r["scripts"])
+        exact = next(filter(None, (writer_types(r["path"], w)
+                                   for w in written_by)), None) \
+            if is_produced and not entry else None
+        if is_produced and not entry and written_by and exact is None \
+                and not args.draft:
+            waiting.append(f"{name} (lu par {', '.join(sorted(r['scripts']))}"
+                           f", écrit par {', '.join(written_by)})")
+            continue
         if entry and entry.columns:
             missing = [c for c in r["columns"] if c not in entry.columns]
             if missing:
@@ -584,6 +665,13 @@ def main(argv=None) -> int:
             # partie, et un LOAD * qui suivrait en perdrait.
             written = (writes.get(name) or {}).get("columns", [])
             cols = list(dict.fromkeys(written + r["columns"]))
+        if exact and not fmt:
+            out_types, sure = exact
+            cols = list(dict.fromkeys(list(out_types) + cols))
+            for c, typ in out_types.items():
+                if sure or typ != "STRING":
+                    types.setdefault(c, typ)
+            how = f"type de la requête Spark qui l'écrit ({written_by[0]})"
         lines = []
         for c in cols:
             if c in types:
@@ -631,6 +719,7 @@ def main(argv=None) -> int:
         new_inputs.append((name, props, why if fmt else
                            why + " ; format à vérifier", comments))
 
+    propagate_types(schemas_out, conf)
     blocks = {sections["input"]: [entry_lines(n, pr, w, c)
                                   for n, pr, w, c in new_inputs],
               sections["output"]: [entry_lines(n, pr, w)
@@ -656,6 +745,8 @@ def main(argv=None) -> int:
         target.write_text(schema_text(why, lines, style), encoding="utf-8")
         created.append(target)
 
+    if args.quiet and not (new_inputs or new_outputs or created):
+        return 0
     verb = "proposé(s) dans" if args.draft else "ajouté(s) dans"
     print(f"conf : {len(new_inputs)} entrée(s), {len(new_outputs)} sortie(s) "
           f"et {len(created)} schéma(s) {verb} {where} "
@@ -665,7 +756,8 @@ def main(argv=None) -> int:
     for target in created:
         print(f"  + {target}")
     guessed = sum(1 for _, lines in schemas_out.values()
-                  for _, _, n in lines if n.startswith("deviné"))
+                  for _, _, n in lines
+                  if n.endswith("à vérifier") and not n.startswith("type inconnu"))
     unknown = sum(1 for _, lines in schemas_out.values()
                   for _, _, n in lines if n.startswith("type inconnu"))
     if guessed or unknown:
@@ -674,6 +766,12 @@ def main(argv=None) -> int:
               "commentaire dans les schémas). Pour des types sûrs, il faut "
               "que fill_conf trouve le Parquet : dans data/input/, ou à sa "
               "location avec les variables passées par --var.")
+    if args.quiet:
+        return 0
+    if waiting:
+        print("En attente, déclarés avec leurs types exacts quand le script "
+              "qui les écrit aura été traduit (migrate.py s'en charge) : "
+              + " ; ".join(waiting))
     if unknown_vars:
         print("⚠ Parquet non lus, types devinés : variable(s) "
               f"{', '.join('${' + v + '}' for v in sorted(unknown_vars))} "
