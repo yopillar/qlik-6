@@ -13,16 +13,20 @@ on ne modifie jamais ce qui existe.
 Avec --draft, rien n'est touché : tout est écrit dans conf/draft/.
 
 D'où viennent les informations :
-  - les entrées et les sorties : les FROM et les STORE des scripts. Un
-    fichier écrit par un script et relu par un autre est ajouté dans les
-    deux sections, avec la même location.
+  - les entrées et les sorties : les FROM et les STORE des scripts, plus
+    les tables du modèle de données (encore là à la fin du script, sans
+    STORE). Un fichier écrit par un script et relu par un autre est ajouté
+    dans les deux sections, avec la même location. Une sortie est toujours
+    nommée sans « # ».
+  - le format d'une entrée : celui que Qlik lit (txt -> csv, qvd -> parquet)
   - les colonnes : celles que les scripts lisent dans chaque fichier. Si le
     fichier est présent dans data/input/ (ou à sa location), on prend toutes
     ses colonnes, y compris celles que les scripts n'utilisent pas.
-  - les types : lus dans le fichier quand c'est un Parquet, donc sûrs.
-    Sinon, suggérés d'après l'usage dans les scripts (Year(col) donne date,
-    Sum(col) donne double, Date#(col) donne string…) ou d'après le nom. Sans
-    aucun indice, on met string, le type que le kit suppose de toute façon.
+  - les types : lus dans le Parquet, sinon dans l'en-tête du QVD, sinon
+    déduits des valeurs du CSV. Sans fichier, devinés d'après l'usage dans
+    les scripts (Year(col) donne date, Sum(col) donne double, Date#(col)
+    donne string…) ou d'après le nom. Sans aucun indice, on met string, le
+    type que le kit suppose de toute façon.
     Chaque type porte en commentaire d'où il vient.
 
 Usage :
@@ -45,7 +49,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conf import (CONF, IO_FILE, IoConf, _load_yaml,  # noqa: E402
                   find_scripts, resolve_location)
 from prepare import (INPUT_DIR, analyze_script, file_stem,  # noqa: E402
-                     mask_strings, norm_path, strip_comments)
+                     mask_strings, norm_path, output_stem, source_format,
+                     strip_comments)
 from qlik2sql import Untranslatable, split_statement, tokenize_expr  # noqa: E402
 
 DRAFT = CONF / "draft"           # sortie de --draft
@@ -83,8 +88,33 @@ def yaml_key(name: str) -> str:
 
 def io_name(path: str) -> str:
     """Nom proposé pour une entrée ou une sortie : le nom du fichier Qlik,
-    en minuscules, avec « _ » à la place des caractères spéciaux."""
-    return re.sub(r"\W", "_", file_stem(path).lower(), flags=re.ASCII)
+    en minuscules, sans « # », avec « _ » à la place des autres caractères
+    spéciaux. C'est la même clé que celle de IoConf.find()."""
+    return re.sub(r"[\W_]+", "_", file_stem(path).replace("#", "").lower(),
+                  flags=re.ASCII).strip("_")
+
+
+def source_file(path: str, spec: str | None) -> str:
+    """Nom de fichier d'une entrée dans sa location : un CSV garde son vrai
+    nom, extension et « # » compris ; un QVD, supposé converti en Parquet,
+    perd son extension."""
+    if source_format(path, spec)[0] == "csv":
+        return re.split(r"[\\/]", path)[-1]
+    return file_stem(path)
+
+
+def csv_options_note(options: dict[str, str]) -> str | None:
+    """Options de lecture CSV vues dans le script Qlik, en commentaire : on
+    ne connaît pas encore la clé du socle pour les passer (hypothèse à
+    confirmer), et une clé inconnue pourrait faire refuser io.yml."""
+    if not options:
+        return None
+    shown = {"sep": "séparateur", "header": "en-tête", "encoding": "encodage",
+             "quote": "guillemets"}
+    parts = [f"{shown[k]} {json.dumps(v, ensure_ascii=False)}"
+             for k, v in options.items()]
+    return ("options Qlik : " + ", ".join(parts)
+            + " (à passer au socle selon sa syntaxe)")
 
 
 def columns_read(text: str) -> tuple[list[str], bool]:
@@ -130,8 +160,10 @@ def type_hints(text: str) -> dict[str, Counter]:
         for t, funcs in HINTS.items():
             if func in funcs:
                 hints.setdefault(col, Counter())[f"{t}:{m.group(1)}()"] += 1
-    # lookahead / lookbehind pour attraper les deux côtés de « a * b »
-    for m in re.finditer(name + r"(?=\s*[*/])|(?<=[*/])\s*" + name, masked):
+    # lookahead / lookbehind pour attraper les deux côtés de « a * b ». Un
+    # nom suivi de « ( » est une fonction (x / Count(y)), pas une colonne.
+    for m in re.finditer(name + r"(?=\s*[*/])|(?<=[*/])\s*" + name
+                         + r"(?!\s*\(|[\w.])", masked):
         col = (m.group(1) or m.group(2)).strip("[]\"")
         if not re.fullmatch(r"\d+", col):
             hints.setdefault(col, Counter())["double:calcul"] += 1
@@ -146,7 +178,7 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
         # dans un calendrier, n'a pas d'autre indice, et c'est justement là
         # que le type compte.
         if re.search(r"(^|[_ ])(date|dt)([_ ]|$)|^date", col, re.I):
-            return "date", "suggéré d'après le nom, à vérifier"
+            return "date", "deviné d'après le nom de la colonne, à vérifier"
         return "string", "type inconnu : string par défaut, à vérifier"
     by_type: dict[str, list[str]] = {}
     for key in counter:
@@ -155,19 +187,22 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
     for t in PRIORITY:
         if t in by_type:
             others = [x for x in by_type if x != t]
-            note = f"suggéré : {', '.join(sorted(set(by_type[t])))}"
+            note = ("deviné d'après l'usage dans le script : "
+                    f"{', '.join(sorted(set(by_type[t])))}")
             if others:
                 note += f" (aussi vu en {', '.join(others)})"
             return t, note + ", à vérifier"
     return "string", "type inconnu : string par défaut, à vérifier"
 
 
-def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None]:
-    """Colonnes et types d'un fichier de données présent sur le disque.
-    Renvoie aussi son format (parquet ou csv), ou None si on ne l'a pas
-    trouvé."""
+def file_columns(location: str
+                 ) -> tuple[list[str], dict[str, str], str | None, str]:
+    """Colonnes et types d'un fichier de données présent sur le disque, son
+    format (parquet ou csv, None si on ne l'a pas trouvé) et d'où viennent
+    les types, pour le commentaire du schéma."""
     path = Path(location)
-    candidates = [path] + [path.with_suffix(s) for s in (".parquet", ".csv")]
+    candidates = [path] + [path.with_name(path.name + s)
+                           for s in (".parquet", ".csv")]
     for p in candidates:
         if not p.exists():
             continue
@@ -177,7 +212,7 @@ def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None]:
             try:
                 import pyarrow.parquet as pq
             except ImportError:
-                return [], {}, "parquet"
+                return [], {}, "parquet", ""
             schema = pq.read_schema(parquet[0])
             types = {}
             for f in schema:
@@ -185,19 +220,101 @@ def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None]:
                 types[f.name] = next((t for a, t in ARROW_TYPES
                                       if arrow.startswith(a)), "string")
             cols = [c for c in schema.names if c != "_qlik_order"]
-            return cols, types, "parquet"
-        csv = [p] if p.suffix == ".csv" and p.is_file() else \
-            sorted(p.glob("*.csv")) if p.is_dir() else []
-        if csv:
-            # un CSV ne porte pas de types : on ne prend que l'en-tête
-            head = csv[0].read_text(encoding="utf-8-sig",
-                                    errors="replace").splitlines()[:1]
-            sep = max((";", ",", "\t", "|"),
-                      key=lambda s: head[0].count(s)) if head else ","
-            cols = [c.strip().strip('"') for c in head[0].split(sep)] \
-                if head else []
-            return cols, {}, "csv"
-    return [], {}, None
+            return cols, types, "parquet", f"lu dans le Parquet {parquet[0]}"
+        csv_files = [p] if p.suffix.lower() in (".csv", ".txt", ".tsv") \
+            and p.is_file() else sorted(p.glob("*.csv")) if p.is_dir() else []
+        if csv_files:
+            cols, types, n = csv_types(csv_files[0])
+            return cols, types, "csv", (f"déduit des {n} première(s) ligne(s) "
+                                        f"de {csv_files[0]}")
+    return [], {}, None, ""
+
+
+CSV_SAMPLE = 5000            # lignes lues pour deviner les types d'un CSV
+
+
+def csv_types(path: Path) -> tuple[list[str], dict[str, str], int]:
+    """En-tête d'un CSV et types déduits de ses valeurs (sur place : rien
+    n'en sort du poste). On ne retient que des types sûrs à la lecture :
+    entier, décimal à point. Une date en texte (29/12/2024) ou un décimal à
+    virgule restent en string, car Spark ne les lirait pas sans options ; le
+    kit lit déjà comme une date un texte au DateFormat du script."""
+    import csv as csv_mod
+    with path.open(encoding="utf-8-sig", errors="replace", newline="") as f:
+        head = f.readline()
+        sep = max((";", ",", "\t", "|"), key=head.count) if head else ","
+        f.seek(0)
+        rows = csv_mod.reader(f, delimiter=sep)
+        cols = [c.strip() for c in next(rows, [])]
+        seen: dict[int, set] = {k: set() for k in range(len(cols))}
+        n = 0
+        for row in rows:
+            if n >= CSV_SAMPLE:
+                break
+            n += 1
+            for k, v in enumerate(row[:len(cols)]):
+                v = v.strip()
+                if v:
+                    seen[k].add("bigint" if re.fullmatch(r"-?\d{1,18}", v)
+                                else "double" if re.fullmatch(
+                                    r"-?\d*\.\d+([eE][-+]?\d+)?", v)
+                                else "string")
+    types = {}
+    for k, c in enumerate(cols):
+        kinds = seen[k]
+        if kinds and kinds <= {"bigint"}:
+            types[c] = "bigint"
+        elif kinds and kinds <= {"bigint", "double"}:
+            types[c] = "double"
+        elif kinds:
+            types[c] = "string"
+    return cols, types, n
+
+
+# Types Qlik d'un champ de QVD : étiquettes de l'en-tête ($date…) puis le
+# type du NumberFormat, du plus précis au plus général.
+# Un champ date porte $date et $timestamp, un horodatage $timestamp seul.
+QVD_TAGS = (("$date", "date"), ("$timestamp", "timestamp"),
+            ("$integer", "bigint"), ("$numeric", "double"),
+            ("$text", "string"), ("$ascii", "string"))
+QVD_FORMATS = {"TIMESTAMP": "timestamp", "DATE": "date", "INTEGER": "bigint",
+               "REAL": "double", "FIX": "double", "MONEY": "double",
+               "ASCII": "string"}
+
+
+def qvd_fields(path: Path) -> tuple[list[str], dict[str, str]]:
+    """Colonnes et types d'un QVD, lus dans son en-tête XML (le début du
+    fichier, en clair). Qlik y note pour chaque champ ce qu'il contient :
+    $integer, $numeric, $date, $timestamp, $text. Un champ sans étiquette
+    mélange texte et nombres : string."""
+    import xml.etree.ElementTree as ET
+    head = b""
+    with path.open("rb") as f:
+        while b"</QvdTableHeader>" not in head:
+            chunk = f.read(65536)
+            if not chunk:
+                return [], {}
+            head += chunk
+    xml = head[:head.index(b"</QvdTableHeader>") + len(b"</QvdTableHeader>")]
+    root = ET.fromstring(xml.decode("utf-8", errors="replace").lstrip("\ufeff"))
+    cols, types = [], {}
+    for fh in root.iter("QvdFieldHeader"):
+        name = fh.findtext("FieldName") or ""
+        tags = {(s.text or "").lower() for s in fh.iter("String")}
+        fmt = (fh.findtext("NumberFormat/Type") or "").upper()
+        cols.append(name)
+        types[name] = next((t for tag, t in QVD_TAGS if tag in tags), None) \
+            or QVD_FORMATS.get(fmt) or "string"
+    return cols, types
+
+
+def find_qvd(candidates: list[str]) -> Path | None:
+    for c in candidates:
+        p = Path(c)
+        for q in (p, p.with_name(p.name + ".qvd")):
+            if q.suffix.lower() == ".qvd" and q.is_file():
+                return q
+    return None
 
 
 def var_prefix(conf: IoConf, kind: str, default: str) -> str:
@@ -226,12 +343,21 @@ def schema_base(conf: IoConf) -> Path:
     return IO_FILE.parent
 
 
-def entry_lines(name: str, props: dict, why: str) -> list[tuple[int, str]]:
+def yaml_value(value: str) -> str:
+    """Valeur YAML : entre guillemets si elle contient un « # » (sinon pris
+    pour un commentaire après une espace) ou un « : »."""
+    return json.dumps(value, ensure_ascii=False) \
+        if re.search(r"#|: |^[\s'\"]|\s$", value) else value
+
+
+def entry_lines(name: str, props: dict, why: str,
+                comments=()) -> list[tuple[int, str]]:
     """Lignes d'une entrée, avec leur niveau (0 : la clé, 1 : ses
-    propriétés)."""
+    propriétés et les commentaires)."""
     today = dt.date.today().isoformat()
     return [(0, f"{yaml_key(name)}:  # ajouté le {today} : {why}")] + \
-        [(1, f"{k}: {v}") for k, v in props.items()]
+        [(1, f"{k}: {yaml_value(str(v))}") for k, v in props.items()] + \
+        [(1, f"# {c}") for c in comments if c]
 
 
 def insert_entries(text: str, section: str,
@@ -378,7 +504,7 @@ def main(argv=None) -> int:
     conf = IoConf()
     raw = _load_yaml(IO_FILE) if IO_FILE.exists() else {}
     sections = {k: next((s for s in raw if kind in str(s).lower()), default)
-                for k, kind, default in (("input", "input", "input"),
+                for k, kind, default in (("input", "input", "inputs"),
                                          ("output", "output", "outputs"))}
     schema_dir = next((str(Path(e.schema_file).parent) for e in conf.inputs
                        if e.schema_file), "schemas")
@@ -396,7 +522,7 @@ def main(argv=None) -> int:
         # Un script qu'on n'arrive pas à analyser ne doit pas empêcher de
         # compléter la conf pour les autres : on le signale et on continue.
         try:
-            _, _, insts, _, _, schemas = analyze_script(script)
+            _, _, insts, _, tables, schemas = analyze_script(script)
         except Exception as exc:
             failed.append(f"{script.name} : {type(exc).__name__}: {exc}")
             continue
@@ -421,10 +547,22 @@ def main(argv=None) -> int:
                 for src in i.sources[:1]:
                     r = reads.setdefault(io_name(src), {
                         "path": src, "columns": [], "star": False,
-                        "scripts": set()})
+                        "scripts": set(),
+                        "spec": i.source_specs.get(src)})
                     r["columns"] = list(dict.fromkeys(r["columns"] + cols))
                     r["star"] |= star
                     r["scripts"].add(script.name)
+
+        # Tables du modèle de données (encore là à la fin, sans STORE) :
+        # prepare.py les écrit en sortie <script>_<table>.
+        for key, t in tables.items():
+            for _, path, fmt, _ in t["stored"]:
+                if fmt == "modele":
+                    cols = schemas.get(key) or []
+                    writes.setdefault(io_name(path), {
+                        "path": path, "scripts": {script.name},
+                        "model": t["name"],
+                        "columns": [c for c in cols if c not in "*?"]})
 
     produced = {norm_path(w["path"]) for w in writes.values()} | set(writes)
     new_inputs, new_outputs, schemas_out, warnings = [], [], {}, []
@@ -432,13 +570,21 @@ def main(argv=None) -> int:
     for name, w in sorted(writes.items()):
         if conf.find(w["path"], "output"):
             continue
+        # une sortie est toujours écrite sans « # » dans son nom
         new_outputs.append((name, {
-            "location": f"{out_prefix}/{file_stem(w['path'])}"},
-            f"STORE dans {', '.join(sorted(w['scripts']))}"))
+            "location": f"{out_prefix}/{output_stem(w['path'])}"},
+            (f"table {w['model']} du modèle de données de "
+             f"{', '.join(sorted(w['scripts']))} (pas de STORE dans Qlik)"
+             if w.get("model") else
+             f"STORE dans {', '.join(sorted(w['scripts']))}")))
 
     for name, r in sorted(reads.items()):
         entry = conf.find(r["path"], "input")
-        is_produced = norm_path(r["path"]) in produced or name in writes
+        # Produit par un STORE : même chemin, ou même nom écrit par un AUTRE
+        # script. Un script qui lit Sources/produits.qvd et écrit
+        # QVD/produits.qvd lit bien la source, pas sa propre sortie.
+        is_produced = norm_path(r["path"]) in produced or bool(
+            name in writes and writes[name]["scripts"] - r["scripts"])
         if entry and entry.columns:
             missing = [c for c in r["columns"] if c not in entry.columns]
             if missing:
@@ -451,21 +597,38 @@ def main(argv=None) -> int:
         else:
             out = conf.find(r["path"], "output")
             location = out.location if out else (
-                f"{out_prefix}/{file_stem(r['path'])}" if is_produced
-                else f"{in_prefix}/{file_stem(r['path'])}")
+                f"{out_prefix}/{output_stem(r['path'])}" if is_produced
+                else f"{in_prefix}/{source_file(r['path'], r['spec'])}")
         # le fichier de données, s'il est là, donne les vraies colonnes
-        found = [resolve_location(location, variables),
-                 f"{INPUT_DIR}/{file_stem(r['path'])}"]
-        cols, types, fmt, origin = [], {}, None, None
+        found = list(dict.fromkeys([
+            resolve_location(location, variables),
+            f"{INPUT_DIR}/{source_file(r['path'], r['spec'])}",
+            f"{INPUT_DIR}/{file_stem(r['path'])}"]))
+        cols, types, fmt, origin, how = [], {}, None, None, ""
         for loc in found:
             try:
-                cols, types, fmt = file_columns(loc)
+                cols, types, fmt, how = file_columns(loc)
             except Exception as exc:          # fichier illisible
                 warnings.append(f"{name} : {loc} illisible ({exc})")
-                cols, types, fmt = [], {}, None
+                cols, types, fmt, how = [], {}, None, ""
             if fmt:
                 origin = loc
                 break
+        # Le QVD d'origine, s'il est là (ou l'export Qlik d'un fichier
+        # produit par un autre script) : Qlik y a noté le type de chaque
+        # champ. Il donne aussi les colonnes d'un LOAD *.
+        # Pas pour un CSV : une colonne DATE dans son schéma ferait lire à
+        # Spark des dates au format ISO, et 29/12/2024 deviendrait null.
+        qvd = None if fmt in ("parquet", "csv") else find_qvd(
+            found + [f"{INPUT_DIR}/{Path(r['path']).name}",
+                     f"data/qlik_outputs/{file_stem(r['path'])}"])
+        qvd_types = {}
+        if qvd:
+            try:
+                qcols, qvd_types = qvd_fields(qvd)
+                cols = cols or qcols
+            except Exception as exc:
+                warnings.append(f"{name} : en-tête de {qvd} illisible ({exc})")
         from_file = bool(cols)
         absent = [c for c in r["columns"] if from_file and c not in cols]
         if absent:
@@ -479,8 +642,12 @@ def main(argv=None) -> int:
             cols = list(dict.fromkeys(written + r["columns"]))
         lines = []
         for c in cols:
-            if c in types:
-                t, note = types[c], f"lu dans {origin}"
+            if fmt == "parquet" and c in types:
+                t, note = types[c], how                        # sûr
+            elif c in qvd_types:
+                t, note = qvd_types[c], f"lu dans l'en-tête de {qvd}"
+            elif c in types:
+                t, note = types[c], how
             else:
                 t, note = suggest(c, hints.get(c))
             lines.append((c, t, note))
@@ -489,6 +656,13 @@ def main(argv=None) -> int:
                + (", produit par un autre script" if is_produced else ""))
         if r["star"] and not from_file:
             why += " ; LOAD * : colonnes incomplètes sans le fichier"
+        # Format : celui du fichier trouvé, sinon celui que Qlik lit (txt ->
+        # csv, qvd -> parquet), sinon parquet, à vérifier.
+        qlik_fmt, options = source_format(r["path"], r["spec"])
+        if is_produced:
+            qlik_fmt, options = "parquet", {}      # écrit par le job
+        fmt = fmt or qlik_fmt
+        comments = [csv_options_note(options)] if fmt == "csv" else []
         if not lines:
             # Aucune colonne connue (LOAD * sans le fichier) : un schéma vide
             # risquerait de faire planter la lecture par le socle. On déclare
@@ -499,7 +673,8 @@ def main(argv=None) -> int:
             if not entry:
                 new_inputs.append((name, {"format": fmt or "parquet",
                                           "location": location},
-                                   why + " ; pas de schéma, colonnes inconnues"))
+                                   why + " ; pas de schéma, colonnes inconnues",
+                                   comments))
             continue
         schemas_out[schema_file] = (why, lines)
         if entry and entry.schema_file:
@@ -514,9 +689,10 @@ def main(argv=None) -> int:
         props = {"format": fmt or "parquet", "schema_file": schema_file,
                  "location": location}
         new_inputs.append((name, props, why if fmt else
-                           why + " ; format à vérifier"))
+                           why + " ; format à vérifier", comments))
 
-    blocks = {sections["input"]: [entry_lines(n, pr, w) for n, pr, w in new_inputs],
+    blocks = {sections["input"]: [entry_lines(n, pr, w, c)
+                                  for n, pr, w, c in new_inputs],
               sections["output"]: [entry_lines(n, pr, w)
                                    for n, pr, w in new_outputs]}
     if args.draft:
@@ -544,18 +720,20 @@ def main(argv=None) -> int:
     print(f"conf : {len(new_inputs)} entrée(s), {len(new_outputs)} sortie(s) "
           f"et {len(created)} schéma(s) {verb} {where} "
           f"({(DRAFT if args.draft else IO_FILE).resolve()})")
-    for name, _, _ in new_inputs + new_outputs:
+    for name, *_ in new_inputs + new_outputs:
         print(f"  + {name}")
     for target in created:
         print(f"  + {target}")
     guessed = sum(1 for _, lines in schemas_out.values()
-                  for _, _, n in lines if n.startswith("suggéré"))
+                  for _, _, n in lines if n.startswith("deviné"))
     unknown = sum(1 for _, lines in schemas_out.values()
                   for _, _, n in lines if n.startswith("type inconnu"))
     if guessed or unknown:
-        print(f"Types à vérifier : {guessed} suggéré(s) d'après les scripts, "
+        print(f"Types à vérifier : {guessed} deviné(s) d'après les scripts, "
               f"{unknown} inconnu(s) mis en string (repérables à leur "
-              "commentaire dans les schémas).")
+              "commentaire dans les schémas). Pour des types sûrs, déposer "
+              "les fichiers d'entrée (Parquet, QVD ou CSV) dans data/input/ "
+              "et relancer : ils sont lus avant toute supposition.")
     for w in warnings:
         print(f"⚠ {w}")
     for f in failed:

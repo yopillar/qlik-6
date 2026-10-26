@@ -704,12 +704,30 @@ def _translate_function(name, a, raw, distinct, ctx: ExprCtx) -> str:
         m = a[1] if k > 1 else "1"
         d = a[2] if k > 2 else "1"
         return f"make_date({a[0]}, {m}, {d})"
-    if n == "addmonths":
-        need(2)
-        return f"add_months({a[0]}, {a[1]})"
-    if n == "addyears":
-        need(2)
-        return f"add_months({a[0]}, 12 * ({a[1]}))"
+    if n in ("addmonths", "addyears"):
+        # Qlik AddMonths(date, n, mode) et Spark add_months(date, n) ne se
+        # recouvrent qu'en partie. Communs : fin de mois ramenée au dernier
+        # jour (31/01 + 1 mois donne 28/02), n négatif. Différences :
+        #   - le mode 1 de Qlik compte depuis la fin du mois (28/02 + 1 mois
+        #     donne 31/03) : add_months ne le connaît pas ;
+        #   - add_months renvoie toujours une date et perd l'heure d'un
+        #     horodatage : on ne traduit pas dans ce cas plutôt que de la
+        #     perdre sans le dire ;
+        #   - le nom Spark est add_months, au pluriel. add_month, month_add
+        #     ou dateadd n'existent pas (check.py les refuse).
+        need(2, 3)
+        if isinstance(a[0], TsSql):
+            raise Untranslatable(f"{name}() sur un horodatage : add_months "
+                                 "perdrait l'heure")
+        months = a[1] if n == "addmonths" else f"12 * ({a[1]})"
+        mode = a[2].strip() if k == 3 else "0"
+        if mode == "0":
+            return f"add_months({a[0]}, {months})"
+        if mode == "1":
+            # même écart avec le dernier jour du mois qu'au départ
+            return (f"date_sub(last_day(add_months({a[0]}, {months})), "
+                    f"datediff(last_day({a[0]}), {a[0]}))")
+        raise Untranslatable(f"{name}() avec un mode non constant ({mode})")
     if n in ("monthstart", "yearstart"):
         need(1)
         return f"trunc({a[0]}, {'MM' if n == 'monthstart' else 'YYYY'!r})"

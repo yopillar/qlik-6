@@ -1,9 +1,6 @@
 # conf de démo, indentée à 3 espaces
-input:
-   sites:
-       format: csv
-       schema_file: schemas/sites.yml
-       location: ${entrees}/sites.csv   # référentiel
+# référentiel des sites : ajouté par fill_conf.py (nom avec #)
+inputs:
    ventes:
        format: csv
        schema_file: schemas/ventes.yml

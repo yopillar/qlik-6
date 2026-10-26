@@ -1,7 +1,7 @@
 // Ventes par site
 SET DateFormat='DD/MM/YYYY';
 MapRegion:
-Mapping LOAD Site, Region FROM [lib://data/sites.csv] (txt, utf8, embedded labels, delimiter is ',');
+Mapping LOAD Site, Region FROM [lib://data/sites#2024.csv] (txt, utf8, embedded labels, delimiter is ',');
 
 Ventes:
 LOAD
@@ -13,4 +13,4 @@ LOAD
 FROM [lib://data/ventes.csv] (txt, utf8, embedded labels, delimiter is ',')
 WHERE Montant > 0;
 
-STORE Ventes INTO [lib://out/ventes_enrichies.qvd] (qvd);
+STORE Ventes INTO [lib://out/ventes_enrichies#v2.qvd] (qvd);

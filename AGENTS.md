@@ -20,4 +20,7 @@ never write files. Think in English; SQL comments in French. Answer with one
 - `'l''été'` in Qlik is `"l'été"` in Spark SQL (never `''` in Spark).
 - `STORE` writes, `DROP TABLE` frees memory (not translated).
 - `Date(x, 'fmt')`, `Num(x, 'fmt')` are display formats only: keep the type.
+- `AddMonths(d, n)` is `add_months(d, n)` (plural). `add_month`, `month_add`
+  and `dateadd` do not exist in Spark. `AddYears(d, n)` is
+  `add_months(d, 12 * n)`.
 - An empty string `''` is not null in Qlik.

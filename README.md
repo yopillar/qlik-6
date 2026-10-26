@@ -91,6 +91,21 @@ python src/<nom-projet>/job.py --from ventes    # reprendre après un échec
 python src/<nom-projet>/job.py --only ventes    # un seul script
 ```
 
+Sur le cluster, depuis la racine du projet (la commande est rappelée en tête
+de `job.py`) :
+
+```bash
+spark-submit --name <nom-projet> --deploy-mode client \
+    --py-files <archive de spark-foundation-core, s'il n'est pas installé> \
+    src/<nom-projet>/job.py [--from <script> | --only <script>]
+```
+
+En mode client, le driver lit les requêtes dans `src/<nom-projet>/sql/`. Le
+mode cluster demanderait d'envoyer aussi ce dossier et `conf/` : pas prévu
+pour l'instant. Les réglages SQL dont dépendent les requêtes (sensibilité à
+la casse, ANSI désactivé, `timeParserPolicy=CORRECTED`) sont posés par le
+job au début de `run()`, il n'y a donc pas de `--conf` à passer.
+
 - Les scripts tournent dans l'ordre de leurs dépendances (et `migrate.py`
   les traite dans ce même ordre) : un script qui lit
   un fichier écrit par un autre passe après lui, comme avec l'enchaînement
@@ -111,7 +126,15 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
   scripts puissent avoir une table du même nom.
 - Chaque `STORE` du script Qlik devient une écriture. Un `STORE` qu'on
   n'arrive à rattacher à aucune table est signalé dans le rapport et à
-  l'assemblage.
+  l'assemblage. La boucle qui écrit toutes les tables
+  (`FOR i = NoOfTables()-1 TO 0`, `LET vTable = TableName($(i))`) est
+  déroulée sur les tables présentes à ce moment.
+- Les tables encore en mémoire à la fin du script, sans `STORE`, forment le
+  modèle de données de l'app : c'est le résultat d'une app de restitution.
+  Elles sont écrites aussi, sous le nom `<script>_<table>`.
+- Une sortie est toujours écrite sans « # » dans son nom :
+  `STORE T INTO [clients#hist.qvd]` donne la sortie `clientshist`, et un
+  script qui relit `clients#hist.qvd` la lit sous ce nom.
 - Seuls les scripts entièrement validés entrent dans le job. Les autres sont
   listés par `orchestrate.py`, qui prévient aussi si un script du job dépend
   de l'un d'eux.
@@ -120,7 +143,8 @@ python src/<nom-projet>/job.py --only ventes    # un seul script
 
 - Les expressions : `If`, `&`, arithmétique, comparaisons, `like`, texte
   (`Index` avec n-ième occurrence, `SubField`, `KeepChar`…), dates (`Date#`
-  avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths`…), nombres,
+  avec conversion du format, `WeekYear`, `MakeDate`, `AddMonths` avec ses
+  deux modes…), nombres,
   `IsNum`, `Match`/`WildMatch`/`Pick`, `RangeSum`, agrégations.
 - Les booléens façon Qlik : vrai vaut -1, faux vaut 0, et dans une condition
   tout nombre non nul est vrai.
@@ -217,7 +241,7 @@ python tools/conf.py      # pour voir ce qui a été compris de conf/io.yml
 ```
 
 ```yaml
-input:
+inputs:
   sites:
     format: csv
     schema_file: schemas/sites.yml
@@ -229,7 +253,7 @@ outputs:
 
 Comme le socle ne lit et n'écrit que par nom, tout fichier lu ou écrit par
 un script doit être déclaré dans `conf/io.yml`. Une lecture se cherche dans
-`input`, une écriture dans `outputs`. Un fichier produit par un script et lu
+`inputs`, une écriture dans `outputs`. Un fichier produit par un script et lu
 par un autre doit donc apparaître dans les deux sections, avec la même
 location : `read_input()` ne lit que ce qui est déclaré en entrée. Le rapport liste ceux qui
 manquent, et `assemble.py` refuse d'assembler un script tant qu'il en reste.
@@ -269,18 +293,38 @@ D'où viennent les informations :
 
 - Les entrées et sorties viennent des `FROM` et des `STORE` des scripts,
   nommées d'après les fichiers Qlik, avec le même préfixe de location
-  (`${entrees}/…`) que ce qu'il y a déjà dans `io.yml`.
+  (`${entrees}/…`) que ce qu'il y a déjà dans `io.yml`. Les sections
+  s'appellent `inputs` et `outputs`, comme dans le socle. Les tables du
+  modèle de données (voir le job) sont ajoutées aux `outputs`.
+- Le format d'une entrée est celui que Qlik lit : `(txt, …)` ou un `.csv`
+  donne `csv`, avec le vrai nom du fichier dans la location (« # »
+  compris) ; un QVD est supposé converti en Parquet sous le même nom. Les
+  options du CSV (séparateur, en-tête, encodage) sont notées en commentaire
+  sous l'entrée, à reporter selon la syntaxe du socle.
+- Les scripts sont lus quel que soit leur encodage (UTF-16, UTF-8 avec ou
+  sans BOM, Windows-1252).
 - Les colonnes sont celles que les scripts lisent. Si le fichier de données
   est là (dans `data/input/` ou à sa location), on prend toutes ses
   colonnes, et on signale celles que les scripts lisent mais qui n'y sont
   pas. Pour un fichier écrit par un autre script, on prend toutes les
   colonnes de son `STORE`, dans l'ordre, même celles que le lecteur
   n'utilise pas.
-- Les types sont lus dans le fichier quand c'est un Parquet : ceux-là sont
-  sûrs. Sinon ils sont suggérés d'après l'usage (`Year(col)` donne `date`,
-  `Sum(col)` ou un calcul donne `double`, `Date#(col)` ou `Upper(col)` donne
-  `string`), ou en dernier recours d'après le nom (`date_…`). Chaque type
-  porte en commentaire d'où il vient. Sans aucun indice, la colonne est mise
+- Les types viennent des fichiers posés dans `data/input/` (ou à leur
+  location), dans cet ordre :
+  1. les métadonnées d'un Parquet : sûres ;
+  2. l'en-tête d'un QVD, où Qlik note ce que contient chaque champ
+     (`$date`, `$timestamp`, `$integer`, `$numeric`, `$text`). Pour un
+     fichier écrit par un autre script, l'export QVD de
+     `data/qlik_outputs/` sert de la même façon. L'en-tête donne aussi les
+     colonnes d'un `LOAD *` ;
+  3. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
+     entier, décimal à point, sinon texte. Une date en texte ou un décimal
+     à virgule restent en `string`, que Spark lirait mal sans options.
+  Sans fichier, le type est deviné d'après l'usage dans le script
+  (`Year(col)` donne `date`, `Sum(col)` donne `double`, `Trim(col)` donne
+  `string`), ou en dernier recours d'après le nom (`date_…`), avec « à
+  vérifier » en commentaire. Chaque type porte en commentaire d'où il
+  vient. Sans aucun indice, la colonne est mise
   en `string`, le type que le kit suppose de toute façon, avec le
   commentaire « type inconnu ». Une entrée dont on ne connaît aucune colonne
   (`LOAD *` sans le fichier) est déclarée sans schéma, et c'est signalé.

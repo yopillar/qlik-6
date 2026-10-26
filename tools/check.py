@@ -203,6 +203,15 @@ def check_section(section: dict, query_path: Path,
         errors.append("apostrophe doublée '' dans une chaîne : en Spark SQL elle "
                       "disparaît ; écrire \"l'été\" (guillemets doubles)")
 
+    # Noms de fonctions de date qui ressemblent à Spark sans en être : le
+    # modèle les écrit par analogie avec AddMonths ou d'autres SQL.
+    for bad in re.findall(r"\b(add_month|month_add|addmonths?|dateadd|"
+                          r"date_add_months|add_years?|addyears)\s*\(",
+                          code_no_idents, re.I):
+        errors.append(f"fonction {bad}() inconnue de Spark : AddMonths(d, n) "
+                      "s'écrit add_months(d, n), AddYears(d, n) "
+                      "add_months(d, 12 * n)")
+
     # vues et CTE lues par la requête
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents,
                                           re.I)}

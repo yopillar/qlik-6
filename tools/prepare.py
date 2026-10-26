@@ -29,6 +29,7 @@ Sorties dans work/<script>/ :
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -287,6 +288,8 @@ class Inst:
     target: str | None = None
     resident: str | None = None
     sources: list[str] = field(default_factory=list)
+    # spécification de format Qlik de chaque source, « txt, delimiter is ';' »
+    source_specs: dict[str, str] = field(default_factory=dict)
     constructs: set[str] = field(default_factory=set)
     fields: list[str] = field(default_factory=list)
     applymaps: list[dict] = field(default_factory=list)
@@ -402,6 +405,46 @@ def let_value(expr: str) -> str | None:
     return None
 
 
+def live_tables(out: list[Inst]) -> list[str]:
+    """Tables présentes à ce point de l'exécution, dans l'ordre de création,
+    comme les numérote TableName(). Les tables de mapping n'en font pas
+    partie. On construit le graphe sur une copie : analyze() modifie les
+    instructions."""
+    tables, _ = build_graph(copy.deepcopy(out))
+    return [t["name"] for t in tables.values()
+            if not t["dropped"] and not t["mapping"]]
+
+
+def table_functions(text: str, out: list[Inst]) -> str:
+    """Remplace NoOfTables() et TableName(n) par leur valeur. C'est ce que
+    fait la boucle classique qui écrit toutes les tables :
+        FOR i = NoOfTables()-1 TO 0 STEP -1
+          LET vTable = TableName($(i));
+          STORE [$(vTable)] INTO [lib://QVD/$(vTable).qvd] (qvd);
+    Sans ça, on ne voit qu'un STORE vers « $(vTable).qvd »."""
+    if not re.search(r"\b(NoOfTables|TableName)\s*\(", text, re.I):
+        return text
+    names = live_tables(out)
+    text = re.sub(r"\bNoOfTables\s*\(\s*\)", str(len(names)), text, flags=re.I)
+
+    def name(m):
+        n = int_value(m.group(1))
+        return f"'{names[n]}'" if n is not None and 0 <= n < len(names) \
+            else m.group(0)
+    return re.sub(r"\bTableName\s*\(([^()]*)\)", name, text, flags=re.I)
+
+
+def int_value(expr: str) -> int | None:
+    """Valeur d'une expression entière faite de nombres, + - * et
+    parenthèses (NoOfTables()-1 une fois remplacé), sinon None."""
+    if not re.fullmatch(r"[\d\s+\-*()]+", expr) or not re.search(r"\d", expr):
+        return None
+    try:
+        return int(eval(expr, {"__builtins__": {}}))   # chiffres et + - * seuls
+    except Exception:
+        return None
+
+
 def eval_condition(cond: str) -> bool | None:
     """Évalue une condition simple entre littéraux, une fois les variables
     remplacées."""
@@ -478,6 +521,10 @@ def run_stmt(st, env, ctx, subs, out, notes, depth):
         if m:
             name = m.group(2)
             rhs = env.expand(m.group(3))
+            if w == "LET":
+                rhs = table_functions(rhs, out)
+                n = int_value(rhs)
+                rhs = str(n) if n is not None else rhs
             if w == "SET":
                 env.vars[name] = unquote(rhs)
             else:
@@ -515,18 +562,20 @@ def run_stmt(st, env, ctx, subs, out, notes, depth):
 
 
 def run_for(node, env, ctx, subs, out, notes, depth):
-    head = env.expand(node.stmt.clean)
+    head = table_functions(env.expand(node.stmt.clean), out)
     body = node.branches[0][1]
     values, var = None, None
     m = re.match(r"\s*FOR\s+EACH\s+(\w+)\s+IN\s+(.*)$", head, re.I)
     if m and not re.search(r"\w\s*\(", m.group(2)):
         var = m.group(1)
         values = [unquote(v) for v in split_top(m.group(2))]
-    m2 = re.match(r"\s*FOR\s+(\w+)\s*=\s*(-?\d+)\s+TO\s+(-?\d+)"
-                  r"(?:\s+STEP\s+(-?\d+))?\s*$", head, re.I)
-    if m2:
+    m2 = re.match(r"\s*FOR\s+(\w+)\s*=\s*(.+?)\s+TO\s+(.+?)"
+                  r"(?:\s+STEP\s+(.+?))?\s*$", head, re.I)
+    bounds = [int_value(x) for x in m2.group(2, 3)] + \
+        [int_value(m2.group(4) or "1")] if m2 else [None]
+    if None not in bounds:
         var = m2.group(1)
-        a, b, s = int(m2.group(2)), int(m2.group(3)), int(m2.group(4) or 1)
+        a, b, s = bounds
         values = [str(v) for v in range(a, b + (1 if s > 0 else -1), s)] if s else None
     if values is not None and len(values) <= MAX_UNROLL:
         for v in values:
@@ -725,11 +774,14 @@ def analyze(inst: Inst) -> None:
                 inst.warnings.append(f"table de base de données {table} : "
                                      "supposée exportée en Parquet dans "
                                      f"data/input/{table}")
-    for fm in re.finditer(r"\bFROM\s+(\[[^\]]+\]|'[^']*'|[^\s;(]+)", body, re.I):
+    for fm in re.finditer(r"\bFROM\s+(\[[^\]]+\]|'[^']*'|[^\s;(]+)"
+                          r"(?:\s*\(([^)]*)\))?", body, re.I):
         if re.search(r"\bLOAD\b", masked[:fm.start()], re.I) and \
                 not re.search(r"\bSELECT\b", masked[:fm.start()], re.I):
-            inst.sources.append(resolve_path(unquote(strip_name(fm.group(1))),
-                                             inst.directory))
+            src = resolve_path(unquote(strip_name(fm.group(1))), inst.directory)
+            inst.sources.append(src)
+            if fm.group(2):
+                inst.source_specs[src] = fm.group(2).strip()
     if re.search(r"\bINLINE\b", masked, re.I):
         inst.constructs.add("inline")
     if re.search(r"\bSELECT\b", masked, re.I):
@@ -1102,6 +1154,74 @@ def file_stem(path: str) -> str:
     return re.sub(r"\.(qvd|txt|csv|parquet|xlsx?)$", "", name, flags=re.I)
 
 
+def output_stem(path: str) -> str:
+    """Nom de fichier d'une sortie : celui du fichier Qlik, sans le « # ».
+    Une entrée garde son vrai nom de fichier, # compris ; une sortie est
+    toujours renommée sans."""
+    return file_stem(path).replace("#", "")
+
+
+# Format Qlik (1er mot de la spécification, sinon extension) -> format du
+# socle. Un QVD est supposé converti en Parquet, sous le même nom.
+QLIK_FORMATS = {"txt": "csv", "csv": "csv", "tsv": "csv", "qvd": "parquet",
+                "parquet": "parquet", "ooxml": "excel", "biff": "excel",
+                "xlsx": "excel", "xls": "excel", "json": "json", "xml": "xml"}
+CODEPAGES = {"utf8": "UTF-8", "unicode": "UTF-16", "ansi": "windows-1252",
+             "oem": "IBM850", "1252": "windows-1252", "28591": "ISO-8859-1",
+             "28605": "ISO-8859-15", "65001": "UTF-8", "1200": "UTF-16LE"}
+
+
+def source_format(path: str, spec: str | None = None
+                  ) -> tuple[str | None, dict[str, str]]:
+    """Format d'un fichier lu par Qlik, et ses options de lecture CSV
+    (sep, header, encoding, quote) d'après la spécification Qlik :
+        (txt, codepage is 28591, embedded labels, delimiter is ';', msq)
+    Renvoie (None, {}) si on ne sait pas."""
+    # découpage qui respecte les guillemets : delimiter is ','
+    parts = split_top(spec or "")
+    words = [w.lower() for w in parts]
+    ext = Path(re.split(r"[\\/]", path)[-1]).suffix.lower()[1:]
+    fmt = QLIK_FORMATS.get(words[0] if words else "") or QLIK_FORMATS.get(ext)
+    options: dict[str, str] = {}
+    if fmt != "csv":
+        return fmt, options
+    for orig in parts:
+        low = orig.lower()
+        m = re.match(r"delimiter\s+is\s+(.+)$", low)
+        if m:
+            sep = unquote(orig[m.start(1):].strip())
+            options["sep"] = {"\\t": "\t", "tab": "\t", "spaces": " "}.get(
+                sep.lower(), sep)
+        elif low in ("embedded labels", "no labels"):
+            options["header"] = "true" if low == "embedded labels" else "false"
+        elif low in ("msq", "no quotes"):
+            options["quote"] = '"' if low == "msq" else ""
+        else:
+            cp = re.sub(r"^codepage\s+is\s+", "", low)
+            if cp in CODEPAGES:
+                options["encoding"] = CODEPAGES[cp]
+    if ext == "tsv" and "sep" not in options:
+        options["sep"] = "\t"
+    return fmt, options
+
+
+def add_model_outputs(script: Path, tables: dict) -> list[str]:
+    """Les tables encore là à la fin du script forment le modèle de données
+    de l'app Qlik : c'est le résultat d'une app de restitution, même sans
+    aucun STORE. On les écrit comme des sorties, sous le nom
+    <script>_<table>, pour qu'elles ne se perdent pas à la migration.
+    Renvoie les noms des tables ajoutées."""
+    added = []
+    for t in tables.values():
+        if t["mapping"] or t["dropped"] or t["stored"]:
+            continue
+        name = re.sub(r"[\W_]+", "_", f"{script.stem}_{t['name']}".replace(
+            "#", ""), flags=re.ASCII).strip("_")
+        t["stored"].append((t["name"], f"{name}.qvd", "modele", None))
+        added.append(t["name"])
+    return added
+
+
 def is_output(path: str, stored: dict) -> bool:
     """Vrai si le fichier est écrit par un STORE, de ce script ou d'un autre
     script du projet."""
@@ -1114,10 +1234,11 @@ def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
 
     On prend d'abord l'entrée de conf/io.yml qui a le même nom (dans les
     sorties si le fichier est écrit par un STORE, dans les entrées sinon).
-    S'il n'y en a pas, règle fixe : data/output/<nom> pour un fichier écrit
-    par un STORE, data/input/<nom> sinon, en Parquet."""
+    S'il n'y en a pas, règle fixe : data/output/<nom sans #> pour un
+    fichier écrit par un STORE, en Parquet ; data/input/<nom> sinon, au
+    format que Qlik lit (un CSV garde son nom complet)."""
     output = store or is_output(path, stored)
-    # Une lecture se cherche dans la section input, une écriture dans
+    # Une lecture se cherche dans la section inputs, une écriture dans
     # outputs : read_input() ne lit que ce qui est déclaré en entrée, même
     # si le fichier est produit par un autre script du projet.
     entry = conf.find(path, "output" if store else "input") if conf else None
@@ -1130,8 +1251,14 @@ def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
             # traduction, mais sans entrée, le script ne pourra pas
             # s'assembler.
             return written.location, written.format, None
-    return f"{OUTPUT_DIR if output else INPUT_DIR}/{file_stem(path)}", \
-        "parquet", None
+    if output:
+        return f"{OUTPUT_DIR}/{output_stem(path)}", "parquet", None
+    fmt, _ = source_format(path)
+    if fmt == "csv":
+        # un CSV se lit sous son vrai nom, extension comprise
+        name = re.split(r"[\\/]", path)[-1]
+        return f"{INPUT_DIR}/{name}", "csv", None
+    return f"{INPUT_DIR}/{file_stem(path)}", fmt or "parquet", None
 
 
 def map_path(path: str, stored: dict, conf: IoConf | None = None,
@@ -1354,10 +1481,23 @@ def mapping_code(insts) -> str:
                      for l in strip_comments(i.text).splitlines() if l.strip())
 
 
+def read_script(script: Path) -> str:
+    """Texte d'un script Qlik, quel que soit son encodage : UTF-16 (avec
+    BOM, fréquent à l'export), UTF-8 avec ou sans BOM, sinon Windows-1252.
+    Lu en UTF-8 sans précaution, un script UTF-16 ressort vide de toute
+    instruction, sans erreur."""
+    raw = script.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
 def analyze_script(script: Path):
     """Découpe, exécute à blanc et construit le graphe d'un script."""
-    text = script.read_text(encoding="utf-8-sig", errors="replace") \
-        .replace("\r\n", "\n")
+    text = read_script(script).replace("\r\n", "\n")
     stmts = merge_preceding_loads(drop_rem(tokenize(text)))
     tree, warnings = parse_blocks(stmts)
     env, insts, notes = Env(), [], list(warnings)
@@ -1368,6 +1508,11 @@ def analyze_script(script: Path):
         notes.append(f"l.{stop.line}: EXIT SCRIPT : fin du script, les "
                      f"{rest} ligne(s) suivantes ne sont pas traduites")
     tables, schemas = build_graph(insts)
+    model = add_model_outputs(script, tables)
+    if model:
+        notes.append(f"{len(model)} table(s) du modèle de données sans STORE, "
+                     f"écrite(s) en sortie <script>_<table> : "
+                     f"{', '.join(model)}")
     return text, env, insts, notes, tables, schemas
 
 

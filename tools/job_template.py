@@ -70,6 +70,21 @@ scripts concernés.
     python src/{project}/job.py                  # tout
     python src/{project}/job.py --from ventes    # reprendre à un script
     python src/{project}/job.py --only ventes    # un seul script
+
+Sur le cluster, depuis la racine du projet (conf/io.yml et les chemins
+relatifs partent du dossier courant) :
+
+    spark-submit \\
+        --name {project} \\
+        --deploy-mode client \\
+        --py-files <archive de spark-foundation-core, s'il n'est pas installé> \\
+        src/{project}/job.py [--from <script> | --only <script>]
+
+En --deploy-mode client, le driver tourne ici et lit les requêtes dans
+src/{project}/sql/. En mode cluster, il faudrait aussi envoyer ce dossier
+et conf/ (--archives) : non prévu pour l'instant. Les réglages SQL dont
+dépendent les requêtes (casse, ANSI, analyse des dates) sont posés par le
+job lui-même, au début de run() : pas besoin de --conf.
 """
 
 import argparse
@@ -163,6 +178,12 @@ def run(spark: SparkSession, args: list[str]) -> None:
 
     # Qlik est sensible à la casse des noms de champs (IDBid ≠ IdBid)
     spark.conf.set("spark.sql.caseSensitive", "true")
+    # Les requêtes sont vérifiées hors mode ANSI (check.py) : une conversion
+    # impossible y donne null, comme dans Qlik, au lieu d'une erreur.
+    spark.conf.set("spark.sql.ansi.enabled", "false")
+    # Sinon try_to_timestamp lève une erreur sur une date incohérente au
+    # lieu de renvoyer null.
+    spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
     t_all = time.perf_counter()
     failed, skipped = [], []
     for name in names:

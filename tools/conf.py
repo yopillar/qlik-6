@@ -99,6 +99,12 @@ def _stem(text: str) -> str:
                   flags=re.I).lower()
 
 
+def _key(text: str) -> str:
+    """Clé de rapprochement d'un nom de fichier ou d'entrée."""
+    return re.sub(r"[\W_]+", "_", _stem(text).replace("#", ""),
+                  flags=re.ASCII).strip("_")
+
+
 def _load_yaml(path: Path):
     try:
         import yaml
@@ -202,11 +208,16 @@ class IoConf:
 
     def find(self, qlik_path: str, kind: str) -> IoEntry | None:
         """Cherche l'entrée qui correspond à un fichier Qlik, soit par le nom
-        de l'entrée, soit par le nom de fichier de sa location."""
-        stem = _stem(qlik_path)
+        de l'entrée, soit par le nom de fichier de sa location.
+
+        On compare sans le « # » (une sortie est écrite sans) et en
+        ramenant espaces, accents et ponctuation à « _ », comme les noms que
+        fill_conf.py donne aux entrées : Ventes Détail#2024.qvd retrouve
+        l'entrée ventes_d_tail2024."""
+        stem = _key(qlik_path)
         pool = self.inputs if kind == "input" else self.outputs
         for e in pool:
-            if e.name.lower() == stem or _stem(e.location) == stem:
+            if _key(e.name) == stem or _key(e.location) == stem:
                 return e
         return None
 
