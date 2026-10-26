@@ -78,33 +78,37 @@ def test_types_from_csv_values(project):
     assert "Site: STRING" in text and "déduit des 3 première(s)" in text
 
 
-QVD_HEADER = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<QvdTableHeader><TableName>p</TableName><Fields>
-<QvdFieldHeader><FieldName>Code</FieldName><Tags><String>$ascii</String><String>$text</String></Tags></QvdFieldHeader>
-<QvdFieldHeader><FieldName>Prix</FieldName><NumberFormat><Type>REAL</Type></NumberFormat><Tags><String>$numeric</String></Tags></QvdFieldHeader>
-<QvdFieldHeader><FieldName>Stock</FieldName><Tags><String>$numeric</String><String>$integer</String></Tags></QvdFieldHeader>
-<QvdFieldHeader><FieldName>Jour</FieldName><Tags><String>$numeric</String><String>$integer</String><String>$timestamp</String><String>$date</String></Tags></QvdFieldHeader>
-<QvdFieldHeader><FieldName>Maj</FieldName><Tags><String>$numeric</String><String>$timestamp</String></Tags></QvdFieldHeader>
-<QvdFieldHeader><FieldName>Mixte</FieldName><Tags></Tags></QvdFieldHeader>
-</Fields></QvdTableHeader>"""
-
-
-def test_types_and_columns_from_qvd_header(project):
+def test_types_from_parquet_metadata(project):
+    import pandas as pd
     (project / "script_qvd/produits.qvs").write_text(
         "P:\nLOAD * FROM [lib://src/produits.qvd] (qvd);\n"
         "STORE P INTO [lib://qvd/produits.qvd] (qvd);\n")
-    (project / "data/input/produits.qvd").write_bytes(
-        QVD_HEADER.encode() + b"\r\n\x00\x01binaire")
+    (project / "data/input/produits").mkdir()
+    pd.DataFrame({"Code": ["a"], "Prix": [1.5], "Stock": [3],
+                  "Jour": pd.to_datetime(["2024-12-29"]).date}).to_parquet(
+        project / "data/input/produits/part-0.parquet")
     project.run("prepare.py", "--collect", *SCRIPTS, "script_qvd/produits.qvs")
     project.run("fill_conf.py", "script_qvd/")
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    # lit sa source, pas sa propre sortie du même nom
-    assert conf["inputs"]["produits"]["location"] == "${entrees}/produits"
+    # un QVD est lu en Parquet, sous le même nom, depuis sa source (et pas
+    # depuis la sortie du même nom écrite par ce script)
+    assert conf["inputs"]["produits"] == {
+        "format": "parquet", "schema_file": "schemas/produits.yml",
+        "location": "${entrees}/produits"}
     schema = yaml.safe_load((project / "conf/schemas/produits.yml")
                             .read_text(encoding="utf-8"))
     assert schema["columns"] == {"Code": "STRING", "Prix": "DOUBLE",
-                                 "Stock": "BIGINT", "Jour": "DATE",
-                                 "Maj": "TIMESTAMP", "Mixte": "STRING"}
+                                 "Stock": "BIGINT", "Jour": "DATE"}
+
+
+def test_unknown_location_variable_is_reported(project):
+    (project / "conf/io.yml").write_text(
+        "inputs:\n  dummy:\n    location: ${lac}/dummy\n", encoding="utf-8")
+    (project / "script_qvd/p.qvs").write_text(
+        "P:\nLOAD a FROM [lib://src/p.qvd] (qvd);\n")
+    project.run("prepare.py", "--collect", "script_qvd/p.qvs")
+    res = project.run("fill_conf.py", "script_qvd/p.qvs")
+    assert "${lac} inconnue(s)" in res.stdout
 
 
 def test_no_function_name_taken_for_a_column():

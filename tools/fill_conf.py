@@ -22,8 +22,8 @@ D'où viennent les informations :
   - les colonnes : celles que les scripts lisent dans chaque fichier. Si le
     fichier est présent dans data/input/ (ou à sa location), on prend toutes
     ses colonnes, y compris celles que les scripts n'utilisent pas.
-  - les types : lus dans le Parquet, sinon dans l'en-tête du QVD, sinon
-    déduits des valeurs du CSV. Sans fichier, devinés d'après l'usage dans
+  - les types : lus dans les métadonnées du Parquet, sinon déduits des
+    valeurs du CSV. Sans fichier, devinés d'après l'usage dans
     les scripts (Year(col) donne date, Sum(col) donne double, Date#(col)
     donne string…) ou d'après le nom. Sans aucun indice, on met string, le
     type que le kit suppose de toute façon.
@@ -269,52 +269,6 @@ def csv_types(path: Path) -> tuple[list[str], dict[str, str], int]:
         elif kinds:
             types[c] = "string"
     return cols, types, n
-
-
-# Types Qlik d'un champ de QVD : étiquettes de l'en-tête ($date…) puis le
-# type du NumberFormat, du plus précis au plus général.
-# Un champ date porte $date et $timestamp, un horodatage $timestamp seul.
-QVD_TAGS = (("$date", "date"), ("$timestamp", "timestamp"),
-            ("$integer", "bigint"), ("$numeric", "double"),
-            ("$text", "string"), ("$ascii", "string"))
-QVD_FORMATS = {"TIMESTAMP": "timestamp", "DATE": "date", "INTEGER": "bigint",
-               "REAL": "double", "FIX": "double", "MONEY": "double",
-               "ASCII": "string"}
-
-
-def qvd_fields(path: Path) -> tuple[list[str], dict[str, str]]:
-    """Colonnes et types d'un QVD, lus dans son en-tête XML (le début du
-    fichier, en clair). Qlik y note pour chaque champ ce qu'il contient :
-    $integer, $numeric, $date, $timestamp, $text. Un champ sans étiquette
-    mélange texte et nombres : string."""
-    import xml.etree.ElementTree as ET
-    head = b""
-    with path.open("rb") as f:
-        while b"</QvdTableHeader>" not in head:
-            chunk = f.read(65536)
-            if not chunk:
-                return [], {}
-            head += chunk
-    xml = head[:head.index(b"</QvdTableHeader>") + len(b"</QvdTableHeader>")]
-    root = ET.fromstring(xml.decode("utf-8", errors="replace").lstrip("\ufeff"))
-    cols, types = [], {}
-    for fh in root.iter("QvdFieldHeader"):
-        name = fh.findtext("FieldName") or ""
-        tags = {(s.text or "").lower() for s in fh.iter("String")}
-        fmt = (fh.findtext("NumberFormat/Type") or "").upper()
-        cols.append(name)
-        types[name] = next((t for tag, t in QVD_TAGS if tag in tags), None) \
-            or QVD_FORMATS.get(fmt) or "string"
-    return cols, types
-
-
-def find_qvd(candidates: list[str]) -> Path | None:
-    for c in candidates:
-        p = Path(c)
-        for q in (p, p.with_name(p.name + ".qvd")):
-            if q.suffix.lower() == ".qvd" and q.is_file():
-                return q
-    return None
 
 
 def var_prefix(conf: IoConf, kind: str, default: str) -> str:
@@ -566,6 +520,7 @@ def main(argv=None) -> int:
 
     produced = {norm_path(w["path"]) for w in writes.values()} | set(writes)
     new_inputs, new_outputs, schemas_out, warnings = [], [], {}, []
+    unknown_vars: set[str] = set()
 
     for name, w in sorted(writes.items()):
         if conf.find(w["path"], "output"):
@@ -614,21 +569,10 @@ def main(argv=None) -> int:
             if fmt:
                 origin = loc
                 break
-        # Le QVD d'origine, s'il est là (ou l'export Qlik d'un fichier
-        # produit par un autre script) : Qlik y a noté le type de chaque
-        # champ. Il donne aussi les colonnes d'un LOAD *.
-        # Pas pour un CSV : une colonne DATE dans son schéma ferait lire à
-        # Spark des dates au format ISO, et 29/12/2024 deviendrait null.
-        qvd = None if fmt in ("parquet", "csv") else find_qvd(
-            found + [f"{INPUT_DIR}/{Path(r['path']).name}",
-                     f"data/qlik_outputs/{file_stem(r['path'])}"])
-        qvd_types = {}
-        if qvd:
-            try:
-                qcols, qvd_types = qvd_fields(qvd)
-                cols = cols or qcols
-            except Exception as exc:
-                warnings.append(f"{name} : en-tête de {qvd} illisible ({exc})")
+        if not fmt and "${" in found[0]:
+            # Cause la plus fréquente de types devinés : le Parquet existe,
+            # mais sa location contient une variable qu'on ne connaît pas.
+            unknown_vars.add(re.search(r"\$\{(\w+)\}", found[0]).group(1))
         from_file = bool(cols)
         absent = [c for c in r["columns"] if from_file and c not in cols]
         if absent:
@@ -642,11 +586,7 @@ def main(argv=None) -> int:
             cols = list(dict.fromkeys(written + r["columns"]))
         lines = []
         for c in cols:
-            if fmt == "parquet" and c in types:
-                t, note = types[c], how                        # sûr
-            elif c in qvd_types:
-                t, note = qvd_types[c], f"lu dans l'en-tête de {qvd}"
-            elif c in types:
+            if c in types:
                 t, note = types[c], how
             else:
                 t, note = suggest(c, hints.get(c))
@@ -731,9 +671,16 @@ def main(argv=None) -> int:
     if guessed or unknown:
         print(f"Types à vérifier : {guessed} deviné(s) d'après les scripts, "
               f"{unknown} inconnu(s) mis en string (repérables à leur "
-              "commentaire dans les schémas). Pour des types sûrs, déposer "
-              "les fichiers d'entrée (Parquet, QVD ou CSV) dans data/input/ "
-              "et relancer : ils sont lus avant toute supposition.")
+              "commentaire dans les schémas). Pour des types sûrs, il faut "
+              "que fill_conf trouve le Parquet : dans data/input/, ou à sa "
+              "location avec les variables passées par --var.")
+    if unknown_vars:
+        print("⚠ Parquet non lus, types devinés : variable(s) "
+              f"{', '.join('${' + v + '}' for v in sorted(unknown_vars))} "
+              "inconnue(s). Les passer, ex. --var "
+              f"{sorted(unknown_vars)[0]}=/chemin/des/fichiers, puis relancer "
+              "sur des schémas supprimés (un schéma existant n'est jamais "
+              "réécrit).")
     for w in warnings:
         print(f"⚠ {w}")
     for f in failed:

@@ -309,22 +309,18 @@ D'où viennent les informations :
   pas. Pour un fichier écrit par un autre script, on prend toutes les
   colonnes de son `STORE`, dans l'ordre, même celles que le lecteur
   n'utilise pas.
-- Les types viennent des fichiers posés dans `data/input/` (ou à leur
-  location), dans cet ordre :
-  1. les métadonnées d'un Parquet : sûres ;
-  2. l'en-tête d'un QVD, où Qlik note ce que contient chaque champ
-     (`$date`, `$timestamp`, `$integer`, `$numeric`, `$text`). Pour un
-     fichier écrit par un autre script, l'export QVD de
-     `data/qlik_outputs/` sert de la même façon. L'en-tête donne aussi les
-     colonnes d'un `LOAD *` ;
-  3. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
+- Les types viennent des fichiers trouvés dans `data/input/` ou à leur
+  location (variables passées par `--var`), dans cet ordre :
+  1. les métadonnées du Parquet : sûres ;
+  2. les valeurs d'un CSV (5 000 premières lignes, lues sur place) :
      entier, décimal à point, sinon texte. Une date en texte ou un décimal
      à virgule restent en `string`, que Spark lirait mal sans options.
   Sans fichier, le type est deviné d'après l'usage dans le script
   (`Year(col)` donne `date`, `Sum(col)` donne `double`, `Trim(col)` donne
   `string`), ou en dernier recours d'après le nom (`date_…`), avec « à
   vérifier » en commentaire. Chaque type porte en commentaire d'où il
-  vient. Sans aucun indice, la colonne est mise
+  vient. Si une location contient une variable inconnue, `fill_conf.py` le
+  dit : c'est la cause habituelle d'un Parquet non lu. Sans aucun indice, la colonne est mise
   en `string`, le type que le kit suppose de toute façon, avec le
   commentaire « type inconnu ». Une entrée dont on ne connaît aucune colonne
   (`LOAD *` sans le fichier) est déclarée sans schéma, et c'est signalé.
@@ -516,7 +512,8 @@ sautés.
   compléter à la main.
 - L'ordre entre scripts ne tient compte que des fichiers, pas des tables en
   base de données.
-- Testé avec Spark 4.0 en local (la cible est la 3.5.8) et une version
+- Tests pytest passés en local avec PySpark 3.5.8 (la cible) et 4.0.1,
+  Java 21, et une version
   bouchonnée de `spark-foundation-core` qui reproduit l'API vue dans le job
   `dp_test`. Pas encore testé avec le vrai socle ni avec un vrai opencode.
 - Ce qu'on suppose du socle sans l'avoir vérifié : `@pipeline` passe à
