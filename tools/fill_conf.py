@@ -742,7 +742,7 @@ def main(argv=None) -> int:
                     r["scripts"].add(script.name)
 
         # Tables du modele de donnees (encore la a la fin, sans STORE) :
-        # prepare.py les ecrit en sortie <script>_<table>.
+        # prepare.py les ecrit en sortie sous le nom de la table.
         for key, t in tables.items():
             for _, path, store_fmt, _ in t["stored"]:
                 if store_fmt == "modele":
@@ -762,12 +762,13 @@ def main(argv=None) -> int:
     waiting: list[str] = []  # fichiers dont l'auteur n'est pas traduit
     unknown_vars: set[str] = set()
 
-    for name, w in sorted(writes.items()):
+    for _, w in sorted(writes.items()):
         if conf.find(w["path"], "output"):
             continue
+        # une sortie porte le nom du fichier (ou de la table) du script Qlik
         new_outputs.append(
             (
-                name,
+                file_stem(w["path"]),
                 {"location": f"{out_prefix}/{file_stem(w['path'])}"},
                 (
                     f"table {w['model']} du modele de donnees de "
@@ -886,7 +887,9 @@ def main(argv=None) -> int:
             else:
                 t, note = suggest(c, hints.get(c))
             lines.append((c, t, note))
-        schema_file = f"{schema_dir}/{name}.yml"
+        # relu apres un STORE : meme nom que la sortie qu'il relit
+        entry_name = file_stem(writes.get(name, r)["path"]) if is_produced else name
+        schema_file = f"{schema_dir}/{entry_name}.yml"
         why = f"lu par {', '.join(sorted(r['scripts']))}" + (
             ", produit par un autre script" if is_produced else ""
         )
@@ -911,7 +914,7 @@ def main(argv=None) -> int:
             if not entry:
                 new_inputs.append(
                     (
-                        name,
+                        entry_name,
                         {"format": fmt or "parquet", "location": location},
                         why + " ; pas de schema, colonnes inconnues",
                         comments,
@@ -936,7 +939,7 @@ def main(argv=None) -> int:
             "location": location,
         }
         new_inputs.append(
-            (name, props, why if fmt else why + " ; format a verifier", comments)
+            (entry_name, props, why if fmt else why + " ; format a verifier", comments)
         )
 
     propagate_types(schemas_out, conf)

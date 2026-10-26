@@ -58,10 +58,11 @@ Toutes les commandes se lancent depuis la racine du projet : les chemins
 
 Avant tout le reste, `migrate.py` lance `tools/normalize.py`, qui renomme
 les fichiers du projet : les scripts de `script_qvd/` passent en minuscules,
-et dans `data/input/` et `data/qlik_outputs/` le # des noms devient un _.
+et dans `data/input/` et `data/qlik_outputs/` les noms perdent les
+caracteres que Hadoop ne sait pas lire (voir plus bas).
 Si deux fichiers tombent sur le meme nom, rien n'est renomme et on
 s'arrete. `python tools/normalize.py --dry-run` montre ce qui changerait.
-Les fichiers du cluster ne sont pas touches : ceux qui ont un # sont a
+Les fichiers du cluster ne sont pas touches : ceux qui ont ces caracteres sont a
 renommer de la meme facon.
 
 Deux sortes d'arguments, a ne pas confondre :
@@ -139,13 +140,22 @@ job au debut de `run()`, il n'y a donc pas de `--conf` a passer.
   deroulee sur les tables presentes a ce moment.
 - Les tables encore en memoire a la fin du script, sans `STORE`, forment le
   modele de donnees de l'app : c'est le resultat d'une app de restitution.
-  Elles sont ecrites aussi, sous le nom `<script>_<table>`.
-- Un # dans un nom de fichier devient un _, partout et des le debut :
-  Spark et Hadoop le prennent pour un fragment d'URI et coupent le nom.
-  `STORE T INTO [clients#hist.qvd]` donne la sortie `clients_hist`, et un
-  script qui relit `clients#hist.qvd` la lit sous ce nom. Les fichiers de
-  `data/input/` et `data/qlik_outputs/` sont renommes de la meme facon
-  (voir plus bas, `normalize.py`).
+  Elles sont ecrites aussi, sous le nom de la table. Si un autre script a
+  deja une sortie de ce nom, chacun prefixe la sienne par son nom de script
+  (`<script>_<table>`), pour ne pas s'ecraser.
+- Une sortie porte le nom du fichier du `STORE` (sans extension, casse
+  gardee) : `STORE T INTO [lib://qvd/Clients.qvd]` donne la sortie
+  `Clients`. Le fichier relu par un autre script garde ce meme nom en
+  entree.
+- Les noms de fichiers sont rendus lisibles par Spark, partout et des le
+  debut : Hadoop prend le # pour un fragment d'URI et `[ ] { } * ?` pour un
+  motif, et ne retrouve pas le fichier. Les crochets et accolades deviennent
+  des parentheses, `# * ?` des _ : `[anon]-TT#TEST.CSV` devient
+  `(anon)-TT_TEST.CSV`. Jamais de _ en tete de nom : Spark ignore sans rien
+  dire les fichiers qui commencent par _ ou . (comme `_SUCCESS`).
+  `normalize.py` renomme les fichiers de `data/input/` et
+  `data/qlik_outputs/` de la meme facon, et signale ceux qui commencent deja
+  par _ ou .
 - Chaque table Qlik est ecrite dans une table du catalogue,
   `<base>.<script>__<table>` (base `<nom-projet>_qlik` par defaut,
   `--database` pour en changer), puis relue de la. C'est pour OpenLineage :
@@ -317,7 +327,7 @@ D'ou viennent les informations :
   modele de donnees (voir le job) sont ajoutees aux `outputs`.
 - Le format d'une entree est celui que Qlik lit : `(txt, ...)` ou un `.csv`
   donne `csv`, avec le nom complet du fichier dans la location (crochets
-  compris, comme `[anon]-TT_TEST.CSV`) ; un QVD est suppose converti en
+  rendus lisibles, comme `(anon)-TT_TEST.CSV`) ; un QVD est suppose converti en
   Parquet sous le meme nom. Les
   options du CSV (separateur, en-tete, encodage) sont notees en commentaire
   sous l'entree, a reporter selon la syntaxe du socle.

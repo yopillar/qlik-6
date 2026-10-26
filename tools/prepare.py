@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import IoConf, find_scripts, resolve_location  # noqa: E402
+from conf import WORK, IoConf, find_scripts, resolve_location, safe_name  # noqa: E402
 from qlik2sql import (
     FEW_COLUMNS,
     SectionContext,  # noqa: E402
@@ -726,11 +726,11 @@ def strip_name(n: str) -> str:
 
 
 def clean_path(path: str) -> str:
-    """Chemin d'un fichier tel que le kit le manipule : le # devient _.
-    Spark et Hadoop prennent le # pour le debut d'un fragment d'URI, et le
-    nom du fichier est coupe la. On le remplace des la lecture du script,
-    comme normalize.py le fait sur les fichiers eux-memes."""
-    return path.replace("#", "_")
+    """Chemin d'un fichier tel que le kit le manipule (voir conf.safe_name).
+    On le fait des la lecture du script, comme normalize.py sur les fichiers
+    eux-memes, pour que les deux restent d'accord : [anon]-TT#TEST.CSV
+    devient (anon)-TT_TEST.CSV."""
+    return safe_name(path)
 
 
 def read_path(text: str, pos: int) -> tuple[str, int]:
@@ -1474,19 +1474,35 @@ def source_format(
     return fmt, options
 
 
+def other_outputs(script_name: str) -> set[str]:
+    """Noms de sortie deja pris par les autres scripts du projet (STORE et
+    tables du modele), en minuscules, d'apres work/stores.json."""
+    path = WORK / "stores.json"
+    if not path.exists():
+        return set()
+    taken = set()
+    for other, io in json.loads(path.read_text(encoding="utf-8")).items():
+        if other != script_name:
+            taken |= {file_stem(w).lower() for w in io["writes"]}
+            taken |= {safe_name(m).lower() for m in io.get("model", [])}
+    return taken
+
+
 def add_model_outputs(script: Path, tables: dict) -> list[str]:
     """Les tables encore la a la fin du script forment le modele de donnees
     de l'app Qlik : c'est le resultat d'une app de restitution, meme sans
-    aucun STORE. On les ecrit comme des sorties, sous le nom
-    <script>_<table>, pour qu'elles ne se perdent pas a la migration.
+    aucun STORE. On les ecrit comme des sorties, sous le nom de la table
+    dans le script. Si un autre script a deja une sortie de ce nom, on
+    prefixe par le nom du script (<script>_<table>) pour ne pas l'ecraser.
     Renvoie les noms des tables ajoutees."""
     added = []
+    taken = other_outputs(script.name)
     for t in tables.values():
         if t["mapping"] or t["dropped"] or t["stored"]:
             continue
-        name = re.sub(
-            r"[\W_]+", "_", f"{script.stem}_{t['name']}", flags=re.ASCII
-        ).strip("_")
+        name = safe_name(t["name"])
+        if name.lower() in taken:
+            name = f"{script.stem}_{name}"
         t["stored"].append((t["name"], f"{name}.qvd", "modele", None))
         added.append(t["name"])
     return added
@@ -1851,7 +1867,7 @@ def analyze_script(script: Path):
     if model:
         notes.append(
             f"{len(model)} table(s) du modele de donnees sans STORE, "
-            f"ecrite(s) en sortie <script>_<table> : "
+            f"ecrite(s) en sortie sous leur nom : "
             f"{', '.join(model)}"
         )
     return text, env, insts, notes, tables, schemas
@@ -1861,8 +1877,12 @@ def collect_io(script: Path) -> dict:
     """Fichiers lus et ecrits par un script (chemins normalises), plus les
     colonnes connues des fichiers ecrits. Un autre script qui fait un
     "LOAD *" sur l'un d'eux connaitra ainsi ses colonnes."""
-    _, _, insts, _, _, schemas = analyze_script(script)
+    _, _, insts, _, tables, schemas = analyze_script(script)
     writes, columns = set(), {}
+    # tables du modele de donnees : leur nom de sortie doit rester unique
+    model = [
+        t["name"] for t in tables.values() if any(s[2] == "modele" for s in t["stored"])
+    ]
     for i in insts:
         if i.kind == "store" and i.stored:
             writes.add(norm_path(i.stored[1]))
@@ -1870,7 +1890,12 @@ def collect_io(script: Path) -> dict:
             if cols and "*" not in cols and "?" not in cols:
                 columns[file_stem(i.stored[1]).lower()] = cols
     reads = sorted({norm_path(src) for i in insts for src in i.sources})
-    return {"writes": sorted(writes), "reads": reads, "columns": columns}
+    return {
+        "writes": sorted(writes),
+        "reads": reads,
+        "columns": columns,
+        "model": model,
+    }
 
 
 def load_project_stores(path: Path, script_name: str) -> dict:

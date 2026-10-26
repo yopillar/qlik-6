@@ -34,6 +34,31 @@ WORK = Path("work")
 SCRIPT_SUFFIXES = (".qvs", ".txt", "")
 
 
+# Caracteres que Hadoop lit comme un fragment d'URI (#) ou un motif (les
+# autres) : un chemin qui en contient n'est pas retrouve, ni a la lecture ni
+# a la relecture d'une sortie. Les crochets et accolades deviennent des
+# parentheses, qui gardent le nom lisible ; # * ? deviennent des _.
+SAFE_CHARS = str.maketrans(
+    {"[": "(", "]": ")", "{": "(", "}": ")", "#": "_", "*": "_", "?": "_"}
+)
+
+
+def safe_name(name: str) -> str:
+    """Nom de fichier lisible par Spark : [anon]-TT#TEST.CSV devient
+    (anon)-TT_TEST.CSV.
+
+    Le remplacement ne cree jamais de _ en tete de nom : Spark ignore les
+    fichiers qui commencent par _ ou . (comme _SUCCESS), il lirait un
+    fichier vide sans rien dire."""
+    out = []
+    for part in re.split(r"([\\/])", name):  # separateurs gardes tels quels
+        cleaned = part.translate(SAFE_CHARS)
+        if cleaned != part and cleaned.startswith("_") and not part.startswith("_"):
+            cleaned = cleaned.lstrip("_") or cleaned
+        out.append(cleaned)
+    return "".join(out)
+
+
 def find_scripts(path: Path) -> list[Path]:
     """Scripts Qlik designes par path : le fichier lui-meme, ou ceux du
     dossier (.qvs, .txt ou sans extension, casse ignoree, fichiers caches

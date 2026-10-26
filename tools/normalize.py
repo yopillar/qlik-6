@@ -7,10 +7,11 @@ Deux regles, lancees par migrate.py avant tout le reste :
   - les scripts de script_qvd/ passent en minuscules. Le nom du script sert
     partout ensuite (work/<script>, fichiers sql, job), et Ventes.qvs et
     ventes.qvs ne doivent pas donner deux projets differents selon le poste.
-  - dans data/input/ et data/qlik_outputs/, le # des noms de fichiers devient
-    un _. Spark et Hadoop lisent le # comme le debut d'un fragment d'URI et
-    coupent le nom du fichier a cet endroit. Le kit fait la meme chose sur
-    les chemins lus dans les scripts Qlik, donc les deux restent d'accord.
+  - dans data/input/ et data/qlik_outputs/, les noms de fichiers perdent
+    les caracteres que Hadoop ne sait pas lire (voir conf.safe_name) :
+    [anon]-TT#TEST.CSV devient (anon)-TT_TEST.CSV. Le kit fait la meme
+    chose sur les chemins lus dans les scripts Qlik, donc les deux restent
+    d'accord.
 
 Si deux fichiers donnent le meme nom une fois renommes, on s'arrete sans
 rien toucher : c'est a regler a la main.
@@ -21,6 +22,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from conf import safe_name  # noqa: E402
 
 SCRIPTS = Path("script_qvd")
 DATA_DIRS = (Path("data/input"), Path("data/qlik_outputs"))
@@ -36,8 +40,8 @@ def planned_renames() -> list[tuple[Path, Path]]:
     for d in DATA_DIRS:
         if d.is_dir():
             for p in sorted(d.iterdir()):
-                if "#" in p.name:
-                    moves.append((p, p.with_name(p.name.replace("#", "_"))))
+                if safe_name(p.name) != p.name:
+                    moves.append((p, p.with_name(safe_name(p.name))))
     return moves
 
 
@@ -82,6 +86,16 @@ def main(argv=None) -> int:
             rename(old, new)
     if moves and not args.dry_run:
         print(f"{len(moves)} fichier(s) renomme(s).")
+    # Spark ignore sans rien dire un fichier dont le nom commence par _ ou .
+    # (comme _SUCCESS) : il serait lu vide. On ne le renomme pas, on previent.
+    for d in DATA_DIRS:
+        if d.is_dir():
+            for f in sorted(d.iterdir()):
+                if f.is_file() and f.name.startswith(("_", ".")):
+                    print(
+                        f"[!] {f} : Spark ignore les fichiers qui commencent "
+                        "par _ ou ., il sera lu vide. A renommer."
+                    )
     return 0
 
 

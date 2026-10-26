@@ -22,7 +22,7 @@ def test_fill_conf_adds_without_touching_existing(project):
     # sections au pluriel, comme le socle les attend
     assert set(conf) == {"inputs", "outputs"}
     # ajouts a la meme indentation (3 espaces) que le fichier
-    assert "\n   sites_2024:" in after
+    assert "\n   ref_sites_2024:" in after
 
     # relancer n'ajoute rien
     fill(project)
@@ -32,9 +32,9 @@ def test_fill_conf_adds_without_touching_existing(project):
 def test_hash_becomes_underscore(project):
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    # sites#2024.csv : renomme sites_2024.csv, lu en csv sous ce nom
-    sites = conf["inputs"]["sites_2024"]
-    assert sites["location"] == "${entrees}/sites_2024.csv"
+    # [ref]-sites#2024.csv : renomme (ref)-sites_2024.csv, lu en csv sous ce nom
+    sites = conf["inputs"]["ref_sites_2024"]
+    assert sites["location"] == "${entrees}/(ref)-sites_2024.csv"
     assert sites["format"] == "csv"
     # ventes_enrichies#v2.qvd : sortie ventes_enrichies_v2
     assert (
@@ -56,12 +56,24 @@ def test_model_tables_become_outputs(project):
     # modele de donnees de l'app, il doit etre ecrit
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    assert (
-        conf["outputs"]["calendrier_dates"]["location"] == "${sorties}/calendrier_Dates"
-    )
+    # sous le nom de la table dans le script Qlik
+    assert conf["outputs"]["Dates"]["location"] == "${sorties}/Dates"
     # pas les tables supprimees, ni celles qui ont un STORE
-    assert "calendrier_bornes" not in conf["outputs"]
-    assert "ventes_ventes" not in conf["outputs"]
+    assert "Bornes" not in conf["outputs"]
+    assert "Ventes" not in conf["outputs"]
+
+
+def test_model_table_name_taken_by_another_script(project):
+    # deux scripts laissent une table Dates : chacune garde sa sortie
+    (project / "script_qvd/autre.qvs").write_text(
+        "Dates:\nLOAD Jour FROM [lib://src/jours.qvd] (qvd);\n"
+    )
+    project.run("normalize.py")
+    project.run("prepare.py", "--collect", *SCRIPTS, "script_qvd/autre.qvs")
+    project.run("fill_conf.py", "script_qvd/")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert {"calendrier_Dates", "autre_Dates"} <= set(conf["outputs"])
+    assert "Dates" not in conf["outputs"]
 
 
 def test_produced_file_waits_for_its_writer(project):
@@ -115,7 +127,7 @@ def test_types_from_script_comparisons_and_shared_fields(project):
 
 def test_types_from_csv_values(project):
     fill(project)
-    text = (project / "conf/schemas/sites_2024.yml").read_text(encoding="utf-8")
+    text = (project / "conf/schemas/ref_sites_2024.yml").read_text(encoding="utf-8")
     assert "Site: STRING" in text and "deduit des 3 premiere(s)" in text
 
 
