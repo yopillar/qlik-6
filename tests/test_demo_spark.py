@@ -39,9 +39,9 @@ def test_migrate_demo_identical_to_qlik(project):
     )
     # la sortie ventes_enrichies#v2 est ecrite sans le #
     out = pd.read_parquet(project / "data/output/ventes_enrichies_v2")
-    assert "_qlik_order" in out.columns
-    out = out.sort_values("_qlik_order", key=lambda s: s.map(tuple))
-    assert list(out["Produit"]) == ["A", "B", "C"]
+    # _qlik_order ne sert qu'a l'interieur du job : absente des sorties
+    assert "_qlik_order" not in out.columns
+    assert sorted(out["Produit"]) == ["A", "B", "C"]
 
     # la table du modele de donnees (Dates, sans STORE) est ecrite et
     # comparee, dans l'ordre de chargement
@@ -69,13 +69,13 @@ def test_csv_without_header(project):
     # _c0, _c1... et le resultat doit etre celui de Qlik
     (project / "script_qvd/codes.qvs").write_text(
         "Codes:\n"
-        "LOAD @1 as Code, Upper(@3) as Libelle\n"
+        "LOAD @1 as Code, Upper(@3) as Libelle, Null() as Vide\n"
         "FROM [lib://data/codes.csv] (txt, no labels, delimiter is ';');\n"
         "STORE Codes INTO [lib://out/codes_sortie.qvd] (qvd);\n"
     )
     (project / "data/input/codes.csv").write_text("1;x;abc\n2;y;def\n")
     (project / "data/qlik_outputs/codes_sortie.csv").write_text(
-        "Code,Libelle\n1,ABC\n2,DEF\n"
+        "Code,Libelle,Vide\n1,ABC,\n2,DEF,\n"
     )
     res = project.run(
         "migrate.py",
@@ -87,6 +87,15 @@ def test_csv_without_header(project):
     assert "- codes.qvs : assemble dans src/, donnees identiques a Qlik" in (
         res.stdout
     ), res.stdout
+    # Null() donne une colonne void, que Parquet refuse : ecrite en string
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(
+        next((project / "data/output/codes_sortie").glob("*.parquet"))
+    )
+    assert str(schema.field("Vide").type) == "string"
+    out = pd.read_parquet(project / "data/output/codes_sortie")
+    assert out["Vide"].isna().all()
 
 
 def test_job_writes_each_step_as_a_table(project):

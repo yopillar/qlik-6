@@ -243,20 +243,22 @@ technique `_qlik_order` (`array<bigint>`) :
   d'avant), `CONCATENATE` (les lignes ajoutees passent apres), `JOIN`
   (l'ordre de la table de gauche, puis les lignes sans correspondance),
   `GROUP BY` et `DISTINCT` (premiere occurrence).
-- elle est ecrite dans chaque sortie, si bien que le script suivant recupere
-  exactement le meme ordre, comme avec un QVD.
+- elle reste a l'interieur du job (vues et tables intermediaires) et n'est
+  pas ecrite dans les sorties. Un script qui relit la sortie d'un autre
+  renumerote donc ses lignes dans l'ordre de lecture du fichier.
 
-`compare.py` compare d'abord le contenu sans tenir compte de l'ordre. Si
-le contenu est identique, il trie la sortie Spark sur `_qlik_order` et la
-compare ligne a ligne avec l'export Qlik, qui est dans l'ordre de
-chargement. Un ecart d'ordre donne le verdict "identique, ordre
-different" : il est signale, mais ne compte comme un ecart qu'avec
-`--strict-order` (`compare.py` ou `verify.py`), tant que la regle d'ordre
-apres un `JOIN` n'est pas confirmee.
+`compare.py` compare le contenu sans tenir compte de l'ordre. Les sorties
+n'ayant plus `_qlik_order`, l'ordre des lignes n'est pas verifie
+(`--strict-order` ne sert que pour un fichier qui aurait encore cette
+colonne).
 
 Pour des donnees d'entree converties depuis des QVD, le plus sur est d'y
 ajouter le numero de ligne d'origine dans une colonne `_qlik_order`. A
 defaut, l'ordre de lecture d'un fichier Parquet unique convient.
+
+Avant toute ecriture Parquet (sortie ou table intermediaire), une colonne
+toujours nulle (`Null()` dans Qlik), de type `void` que Parquet refuse, est
+passee en `string`.
 
 ## Entrees et sorties : `conf/io.yml`
 
