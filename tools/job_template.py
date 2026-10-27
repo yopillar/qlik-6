@@ -96,11 +96,12 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import NullType
 
 from spark_foundation import pipeline, read_input, write_output
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
-ORDER = "_qlik_order"     # ordre de chargement Qlik, ecrit dans les sorties
+ORDER = "_qlik_order"     # ordre de chargement Qlik, interne au job
 logger = logging.getLogger("{project}")
 
 # Les scripts, dans l'ordre ou ils tournent.
@@ -115,14 +116,33 @@ SCRIPTS = {{
 def with_order(df):
     """Ajoute la colonne _qlik_order, qui porte l'ordre de chargement Qlik.
 
-    Si le fichier vient de ce job, elle y est deja. Sinon on numerote les
-    lignes dans l'ordre de lecture, et il faut le faire avant toute autre
-    operation, sinon l'ordre est perdu."""
+    Si le fichier l'a deja (entree preparee a la main), on la garde. Sinon
+    on numerote les lignes dans l'ordre de lecture, et il faut le faire
+    avant toute autre operation, sinon l'ordre est perdu. Les sorties du job
+    ne l'ont plus (voir for_export)."""
     if ORDER not in df.columns:
         return df.withColumn(ORDER, F.array(F.monotonically_increasing_id()))
     if not dict(df.dtypes)[ORDER].startswith("array"):
         return df.withColumn(ORDER, F.array(F.col(ORDER).cast("bigint")))
     return df
+
+
+def parquet_ready(df):
+    """Une colonne toujours nulle (Null() dans Qlik, NULL AS x en SQL) a le
+    type void, que Parquet refuse : on la passe en string."""
+    void = [f.name for f in df.schema.fields if isinstance(f.dataType, NullType)]
+    if not void:
+        return df
+    return df.select(*[
+        F.col(f"`{{c}}`").cast("string").alias(c) if c in void else F.col(f"`{{c}}`")
+        for c in df.columns
+    ])
+
+
+def for_export(df):
+    """Ce qui part dans une sortie : sans _qlik_order, qui ne sert qu'a
+    l'interieur du job, et sans colonne void."""
+    return parquet_ready(df.drop(ORDER))
 
 
 def table_name(database: str, script: str, view: str) -> str:
@@ -147,7 +167,7 @@ def materialize(spark: SparkSession, df, table: str):
                        "etape gardee en vue temporaire (absente de la lignee)",
                        table)
         return df.localCheckpoint()
-    df.write.mode("overwrite").format("parquet").saveAsTable(table)
+    parquet_ready(df).write.mode("overwrite").format("parquet").saveAsTable(table)
     return spark.table(table)
 
 
@@ -176,7 +196,7 @@ def run_script(spark: SparkSession, name: str, script: dict,
                 df = df.localCheckpoint()
             df.createOrReplaceTempView(view)
             if output:
-                write_output(df, output)
+                write_output(for_export(df), output)
                 # Spark est paresseux : c'est l'ecriture qui declenche le
                 # calcul, donc on ne chronometre que les etapes qui ecrivent.
                 logger.info("%s / %s ecrit en %.1fs", name, output,

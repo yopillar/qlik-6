@@ -51,7 +51,12 @@ def test_csv_options_declared(project):
     # options du lecteur CSV de Spark, d'apres la specification Qlik
     assert conf["inputs"]["ventes"]["format"] == "csv"
     sites = conf["inputs"]["ref_sites_2024"]
-    assert sites["options"] == {"header": True, "encoding": "UTF-8", "sep": ","}
+    assert sites["options"] == {
+        "header": True,
+        "mode": "PERMISSIVE",
+        "encoding": "UTF-8",
+        "sep": ",",
+    }
 
 
 NO_LABELS = (
@@ -69,7 +74,11 @@ def test_csv_without_header_file_absent(project):
     project.run("prepare.py", "--collect", "script_qvd/codes.qvs")
     project.run("fill_conf.py", "script_qvd/codes.qvs")
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    assert conf["inputs"]["codes"]["options"] == {"header": False, "sep": ";"}
+    assert conf["inputs"]["codes"]["options"] == {
+        "header": False,
+        "mode": "PERMISSIVE",
+        "sep": ";",
+    }
     schema = yaml.safe_load(
         (project / "conf/schemas/codes.yml").read_text(encoding="utf-8")
     )
@@ -172,7 +181,7 @@ def test_types_from_script_comparisons_and_shared_fields(project):
 def test_types_from_csv_values(project):
     fill(project)
     text = (project / "conf/schemas/ref_sites_2024.yml").read_text(encoding="utf-8")
-    assert "Site: STRING" in text and "deduit des 3 premiere(s)" in text
+    assert "Site: STRING" in text and "deduit des 3 ligne(s)" in text
 
 
 def test_types_from_parquet_metadata(project):
@@ -232,3 +241,18 @@ def test_no_function_name_taken_for_a_column():
     )
     assert "Count" not in hints and "PurgeChar" not in hints
     assert "x" in hints
+
+
+def test_csv_types_read_the_whole_file(project):
+    # une seule valeur texte, loin dans le fichier, met la colonne en string
+    lines = "".join(f"{k}\n" for k in range(6000)) + "N/A\n"
+    (project / "data/input/gros.csv").write_text("Num\n" + lines)
+    (project / "script_qvd/gros.qvs").write_text(
+        "G: LOAD Num FROM [lib://data/gros.csv] (txt, embedded labels);\n"
+    )
+    project.run("prepare.py", "--collect", "script_qvd/gros.qvs")
+    project.run("fill_conf.py", "script_qvd/gros.qvs")
+    schema = yaml.safe_load(
+        (project / "conf/schemas/gros.yml").read_text(encoding="utf-8")
+    )
+    assert schema["columns"] == {"Num": "STRING"}

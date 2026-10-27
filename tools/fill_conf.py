@@ -185,8 +185,16 @@ def csv_options(options: dict[str, str]) -> dict[str, str | bool]:
     cle options de l'entree. Hypothese : le socle les passe telles quelles a
     spark.read.options(). header vaut true par defaut chez Qlik (embedded
     labels) : on l'ecrit toujours, pour qu'un fichier sans en-tete ne soit
-    jamais lu avec sa premiere ligne en guise de noms de colonnes."""
-    out: dict[str, str | bool] = {"header": options.get("header", "true") == "true"}
+    jamais lu avec sa premiere ligne en guise de noms de colonnes.
+
+    mode PERMISSIVE (le defaut de Spark, ecrit pour ne pas dependre de celui
+    du socle) : une valeur qui ne rentre pas dans le type du schema devient
+    null au lieu de faire echouer la lecture. C'est un filet, pas la regle :
+    le schema met deja en string une colonne qui contient du texte."""
+    out: dict[str, str | bool] = {
+        "header": options.get("header", "true") == "true",
+        "mode": "PERMISSIVE",
+    }
     out.update({k: v for k, v in options.items() if k != "header"})
     return out
 
@@ -345,12 +353,9 @@ def file_columns(
                 cols,
                 types,
                 "csv",
-                (f"deduit des {n} premiere(s) ligne(s) de {csv_files[0]}"),
+                (f"deduit des {n} ligne(s) de {csv_files[0]}"),
             )
     return [], {}, None, ""
-
-
-CSV_SAMPLE = 5000  # lignes lues pour deviner les types d'un CSV
 
 
 def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str], int]:
@@ -359,6 +364,10 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
     entier, decimal a point. Une date en texte (29/12/2024) ou un decimal a
     virgule restent en string, car Spark ne les lirait pas sans options ; le
     kit lit deja comme une date un texte au DateFormat du script.
+
+    On lit tout le fichier : une seule valeur texte, meme a la millionieme
+    ligne, met la colonne en string. Un echantillon la laissait en bigint, et
+    Spark lisait ensuite ces valeurs en null.
 
     Sans en-tete, la premiere ligne est une ligne de donnees et les
     colonnes s'appellent _c0, _c1... comme Spark les nomme."""
@@ -377,12 +386,10 @@ def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str
         seen: dict[int, set] = {k: set() for k in range(len(cols))}
         n = 0
         for row in rows:
-            if n >= CSV_SAMPLE:
-                break
             n += 1
             for k, v in enumerate(row[: len(cols)]):
                 v = v.strip()
-                if v:
+                if v and "string" not in seen[k]:
                     seen[k].add(
                         "bigint"
                         if re.fullmatch(r"-?\d{1,18}", v)
