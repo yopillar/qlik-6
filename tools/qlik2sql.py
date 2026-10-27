@@ -260,8 +260,19 @@ def tokenize_expr(text: str) -> list[tuple[str, str]]:
             raise Untranslatable("variable $(...) non resolue dans l'expression")
         if kind == "word" and val.upper() in KEYWORDS:
             kind, val = "kw", val.upper()
+        position = re.fullmatch(r"\[?@(\d+)\]?", val)
+        if kind in ("word", "field") and position:
+            kind, val = "word", positional_column(int(position.group(1)))
         out.append((kind or "", val))
     return out
+
+
+def positional_column(n: int) -> str:
+    """Colonne n (a partir de 1) d'un fichier sans en-tete. Qlik la nomme @n ;
+    on prend le nom que Spark lui donne quand il lit un CSV sans en-tete,
+    _c0 pour @1 : il n'a pas besoin de backticks, et c'est aussi ce que le
+    socle obtiendrait s'il lisait le fichier sans schema."""
+    return f"_c{n - 1}"
 
 
 @dataclass

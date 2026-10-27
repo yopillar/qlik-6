@@ -143,9 +143,10 @@ job au debut de `run()`, il n'y a donc pas de `--conf` a passer.
   Elles sont ecrites aussi, sous le nom de la table. Si un autre script a
   deja une sortie de ce nom, chacun prefixe la sienne par son nom de script
   (`<script>_<table>`), pour ne pas s'ecraser.
-- Une sortie porte le nom du fichier du `STORE` (sans extension, casse
-  gardee) : `STORE T INTO [lib://qvd/Clients.qvd]` donne la sortie
-  `Clients`. Le fichier relu par un autre script garde ce meme nom en
+- Une sortie est ecrite sous le nom du fichier du `STORE` (sans extension,
+  casse gardee), et sa cle dans `io.yml` est ce nom en minuscules :
+  `STORE T INTO [lib://qvd/Clients.qvd]` donne la cle `clients`, de location
+  `${sorties}/Clients`. Le fichier relu par un autre script a la meme cle en
   entree.
 - Les noms de fichiers sont rendus lisibles par Spark, partout et des le
   debut : Hadoop prend le # pour un fragment d'URI et `[ ] { } * ?` pour un
@@ -328,9 +329,25 @@ D'ou viennent les informations :
 - Le format d'une entree est celui que Qlik lit : `(txt, ...)` ou un `.csv`
   donne `csv`, avec le nom complet du fichier dans la location (crochets
   rendus lisibles, comme `(anon)-TT_TEST.CSV`) ; un QVD est suppose converti en
-  Parquet sous le meme nom. Les
-  options du CSV (separateur, en-tete, encodage) sont notees en commentaire
-  sous l'entree, a reporter selon la syntaxe du socle.
+  Parquet sous le meme nom.
+- Un CSV recoit une cle `options`, avec les noms des options du lecteur CSV
+  de Spark, d'apres la specification Qlik : `header` (toujours ecrit),
+  `sep`, `encoding`, `quote`. Hypothese a confirmer : le socle les passe
+  telles quelles a `spark.read.options()`.
+
+  ```yaml
+  codes:
+     format: csv
+     schema_file: schemas/codes.yml
+     location: ${entrees}/codes.csv
+     options: {header: false, sep: ";"}
+  ```
+- Un CSV sans en-tete (`no labels` chez Qlik) : Qlik nomme ses colonnes
+  `@1`, `@2`... Le kit les appelle `_c0`, `_c1`..., les noms que Spark leur
+  donne lui-meme, qui s'ecrivent sans backticks : `@1 as Code` devient
+  `_c0 AS Code`. Le schema liste toutes les colonnes, dans l'ordre, puisque
+  Spark les affecte par position : celles du fichier s'il est dans
+  `data/input/`, sinon de `_c0` jusqu'a la derniere que le script lit.
 - Les scripts sont lus quel que soit leur encodage (UTF-16, UTF-8 avec ou
   sans BOM, Windows-1252).
 - Les colonnes sont celles que les scripts lisent. Si le fichier de donnees

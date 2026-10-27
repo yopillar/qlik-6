@@ -45,10 +45,52 @@ def test_hash_becomes_underscore(project):
     assert not any("#" in v["location"] for v in conf["outputs"].values())
 
 
-def test_csv_options_noted(project):
+def test_csv_options_declared(project):
     fill(project)
-    text = (project / "conf/io.yml").read_text(encoding="utf-8")
-    assert '# options Qlik : encodage "UTF-8", en-tete "true", separateur ","' in text
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    # options du lecteur CSV de Spark, d'apres la specification Qlik
+    assert conf["inputs"]["ventes"]["format"] == "csv"
+    sites = conf["inputs"]["ref_sites_2024"]
+    assert sites["options"] == {"header": True, "encoding": "UTF-8", "sep": ","}
+
+
+NO_LABELS = (
+    "Codes:\n"
+    "LOAD @1 as Code, Upper(@3) as Libelle\n"
+    "FROM [lib://data/codes.csv] (txt, no labels, delimiter is ';');\n"
+    "STORE Codes INTO [lib://out/codes_sortie.qvd] (qvd);\n"
+)
+
+
+def test_csv_without_header_file_absent(project):
+    # sans le fichier : colonnes _c0 a _c2, toutes, dans l'ordre (Spark les
+    # affecte par position), meme si le script ne lit pas @2
+    (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
+    project.run("prepare.py", "--collect", "script_qvd/codes.qvs")
+    project.run("fill_conf.py", "script_qvd/codes.qvs")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert conf["inputs"]["codes"]["options"] == {"header": False, "sep": ";"}
+    schema = yaml.safe_load(
+        (project / "conf/schemas/codes.yml").read_text(encoding="utf-8")
+    )
+    assert list(schema["columns"]) == ["_c0", "_c1", "_c2"]
+
+
+def test_csv_without_header_file_present(project):
+    # avec le fichier : toutes ses colonnes, la 1re ligne est une donnee
+    (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
+    (project / "data/input/codes.csv").write_text("1;x;abc;9\n2;y;def;8\n")
+    project.run("prepare.py", "--collect", "script_qvd/codes.qvs")
+    project.run("fill_conf.py", "script_qvd/codes.qvs")
+    schema = yaml.safe_load(
+        (project / "conf/schemas/codes.yml").read_text(encoding="utf-8")
+    )
+    assert schema["columns"] == {
+        "_c0": "BIGINT",
+        "_c1": "STRING",
+        "_c2": "STRING",
+        "_c3": "BIGINT",
+    }
 
 
 def test_model_tables_become_outputs(project):
@@ -56,11 +98,13 @@ def test_model_tables_become_outputs(project):
     # modele de donnees de l'app, il doit etre ecrit
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    # sous le nom de la table dans le script Qlik
-    assert conf["outputs"]["Dates"]["location"] == "${sorties}/Dates"
+    # cle en minuscules, location au nom de la table dans le script Qlik
+    assert conf["outputs"]["dates"]["location"] == "${sorties}/Dates"
     # pas les tables supprimees, ni celles qui ont un STORE
-    assert "Bornes" not in conf["outputs"]
-    assert "Ventes" not in conf["outputs"]
+    assert "bornes" not in conf["outputs"]
+    assert "ventes" not in conf["outputs"]
+    # toutes les cles des sorties sont en minuscules
+    assert all(k == k.lower() for k in conf["outputs"])
 
 
 def test_model_table_name_taken_by_another_script(project):
@@ -72,8 +116,8 @@ def test_model_table_name_taken_by_another_script(project):
     project.run("prepare.py", "--collect", *SCRIPTS, "script_qvd/autre.qvs")
     project.run("fill_conf.py", "script_qvd/")
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    assert {"calendrier_Dates", "autre_Dates"} <= set(conf["outputs"])
-    assert "Dates" not in conf["outputs"]
+    assert {"calendrier_dates", "autre_dates"} <= set(conf["outputs"])
+    assert "dates" not in conf["outputs"]
 
 
 def test_produced_file_waits_for_its_writer(project):
