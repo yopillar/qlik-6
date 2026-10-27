@@ -86,7 +86,13 @@ def read_input(name: str):
     fmt = str(entry.get("format", "parquet")).lower()
     if fmt == "csv":
         schema = _schema(entry)
-        reader = reader.option("header", "true").option("sep", entry.get("sep", ","))
+        # cle options de io.yml, passee telle quelle au lecteur CSV (hypothese
+        # sur le vrai socle) ; en-tete par defaut
+        options = {"header": True, **(entry.get("options") or {})}
+        for key, value in options.items():
+            reader = reader.option(
+                key, str(value).lower() if isinstance(value, bool) else value
+            )
         reader = (
             reader.schema(schema) if schema else reader.option("inferSchema", "false")
         )

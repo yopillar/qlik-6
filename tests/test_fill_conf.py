@@ -45,10 +45,52 @@ def test_hash_becomes_underscore(project):
     assert not any("#" in v["location"] for v in conf["outputs"].values())
 
 
-def test_csv_options_noted(project):
+def test_csv_options_declared(project):
     fill(project)
-    text = (project / "conf/io.yml").read_text(encoding="utf-8")
-    assert '# options Qlik : encodage "UTF-8", en-tete "true", separateur ","' in text
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    # options du lecteur CSV de Spark, d'apres la specification Qlik
+    assert conf["inputs"]["ventes"]["format"] == "csv"
+    sites = conf["inputs"]["ref_sites_2024"]
+    assert sites["options"] == {"header": True, "encoding": "UTF-8", "sep": ","}
+
+
+NO_LABELS = (
+    "Codes:\n"
+    "LOAD @1 as Code, Upper(@3) as Libelle\n"
+    "FROM [lib://data/codes.csv] (txt, no labels, delimiter is ';');\n"
+    "STORE Codes INTO [lib://out/codes_sortie.qvd] (qvd);\n"
+)
+
+
+def test_csv_without_header_file_absent(project):
+    # sans le fichier : colonnes _c0 a _c2, toutes, dans l'ordre (Spark les
+    # affecte par position), meme si le script ne lit pas @2
+    (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
+    project.run("prepare.py", "--collect", "script_qvd/codes.qvs")
+    project.run("fill_conf.py", "script_qvd/codes.qvs")
+    conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
+    assert conf["inputs"]["codes"]["options"] == {"header": False, "sep": ";"}
+    schema = yaml.safe_load(
+        (project / "conf/schemas/codes.yml").read_text(encoding="utf-8")
+    )
+    assert list(schema["columns"]) == ["_c0", "_c1", "_c2"]
+
+
+def test_csv_without_header_file_present(project):
+    # avec le fichier : toutes ses colonnes, la 1re ligne est une donnee
+    (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
+    (project / "data/input/codes.csv").write_text("1;x;abc;9\n2;y;def;8\n")
+    project.run("prepare.py", "--collect", "script_qvd/codes.qvs")
+    project.run("fill_conf.py", "script_qvd/codes.qvs")
+    schema = yaml.safe_load(
+        (project / "conf/schemas/codes.yml").read_text(encoding="utf-8")
+    )
+    assert schema["columns"] == {
+        "_c0": "BIGINT",
+        "_c1": "STRING",
+        "_c2": "STRING",
+        "_c3": "BIGINT",
+    }
 
 
 def test_model_tables_become_outputs(project):

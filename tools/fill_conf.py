@@ -67,7 +67,12 @@ from prepare import (
     source_format,
     strip_comments,
 )
-from qlik2sql import Untranslatable, split_statement, tokenize_expr  # noqa: E402
+from qlik2sql import (  # noqa: E402
+    Untranslatable,
+    positional_column,
+    split_statement,
+    tokenize_expr,
+)
 
 DRAFT = CONF / "draft"  # sortie de --draft
 
@@ -174,24 +179,25 @@ def source_file(path: str, spec: str | None) -> str:
     return file_stem(path)
 
 
-def csv_options_note(options: dict[str, str]) -> str | None:
-    """Options de lecture CSV vues dans le script Qlik, en commentaire : on
-    ne connait pas encore la cle du socle pour les passer (hypothese a
-    confirmer), et une cle inconnue pourrait faire refuser io.yml."""
-    if not options:
-        return None
-    shown = {
-        "sep": "separateur",
-        "header": "en-tete",
-        "encoding": "encodage",
-        "quote": "guillemets",
-    }
+def csv_options(options: dict[str, str]) -> dict[str, str | bool]:
+    """Options de lecture CSV vues dans le script Qlik, sous les noms des
+    options du lecteur CSV de Spark (sep, header, encoding, quote), pour la
+    cle options de l'entree. Hypothese : le socle les passe telles quelles a
+    spark.read.options(). header vaut true par defaut chez Qlik (embedded
+    labels) : on l'ecrit toujours, pour qu'un fichier sans en-tete ne soit
+    jamais lu avec sa premiere ligne en guise de noms de colonnes."""
+    out: dict[str, str | bool] = {"header": options.get("header", "true") == "true"}
+    out.update({k: v for k, v in options.items() if k != "header"})
+    return out
+
+
+def flow_map(values: dict) -> str:
+    """Dictionnaire YAML sur une ligne : {header: false, sep: ";"}."""
     parts = [
-        f"{shown[k]} {json.dumps(v, ensure_ascii=False)}" for k, v in options.items()
+        f"{k}: {str(v).lower() if isinstance(v, bool) else json.dumps(v)}"
+        for k, v in values.items()
     ]
-    return (
-        "options Qlik : " + ", ".join(parts) + " (a passer au socle selon sa syntaxe)"
-    )
+    return "{" + ", ".join(parts) + "}"
 
 
 def columns_read(text: str) -> tuple[list[str], bool]:
@@ -293,10 +299,13 @@ def suggest(col: str, counter: Counter | None) -> tuple[str | None, str]:
     return "string", "type inconnu : string par defaut, a verifier"
 
 
-def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None, str]:
+def file_columns(
+    location: str, header: bool = True
+) -> tuple[list[str], dict[str, str], str | None, str]:
     """Colonnes et types d'un fichier de donnees present sur le disque, son
     format (parquet ou csv, None si on ne l'a pas trouve) et d'ou viennent
-    les types, pour le commentaire du schema."""
+    les types, pour le commentaire du schema. header=False : CSV sans ligne
+    d'en-tete."""
     path = Path(location)
     candidates = [path] + [path.with_name(path.name + s) for s in (".parquet", ".csv")]
     for p in candidates:
@@ -331,7 +340,7 @@ def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None, 
             else []
         )
         if csv_files:
-            cols, types, n = csv_types(csv_files[0])
+            cols, types, n = csv_types(csv_files[0], header)
             return (
                 cols,
                 types,
@@ -344,12 +353,15 @@ def file_columns(location: str) -> tuple[list[str], dict[str, str], str | None, 
 CSV_SAMPLE = 5000  # lignes lues pour deviner les types d'un CSV
 
 
-def csv_types(path: Path) -> tuple[list[str], dict[str, str], int]:
+def csv_types(path: Path, header: bool = True) -> tuple[list[str], dict[str, str], int]:
     """En-tete d'un CSV et types deduits de ses valeurs (sur place : rien
     n'en sort du poste). On ne retient que des types surs a la lecture :
     entier, decimal a point. Une date en texte (29/12/2024) ou un decimal a
     virgule restent en string, car Spark ne les lirait pas sans options ; le
-    kit lit deja comme une date un texte au DateFormat du script."""
+    kit lit deja comme une date un texte au DateFormat du script.
+
+    Sans en-tete, la premiere ligne est une ligne de donnees et les
+    colonnes s'appellent _c0, _c1... comme Spark les nomme."""
     import csv as csv_mod
 
     with path.open(encoding="utf-8-sig", errors="replace", newline="") as f:
@@ -357,7 +369,11 @@ def csv_types(path: Path) -> tuple[list[str], dict[str, str], int]:
         sep = max((";", ",", "\t", "|"), key=head.count) if head else ","
         f.seek(0)
         rows = csv_mod.reader(f, delimiter=sep)
-        cols = [c.strip() for c in next(rows, [])]
+        if header:
+            cols = [c.strip() for c in next(rows, [])]
+        else:
+            first = next(csv_mod.reader([head], delimiter=sep), [])
+            cols = [positional_column(k + 1) for k in range(len(first))]
         seen: dict[int, set] = {k: set() for k in range(len(cols))}
         n = 0
         for row in rows:
@@ -426,15 +442,14 @@ def yaml_value(value: str) -> str:
     )
 
 
-def entry_lines(name: str, props: dict, why: str, comments=()) -> list[tuple[int, str]]:
+def entry_lines(name: str, props: dict, why: str) -> list[tuple[int, str]]:
     """Lignes d'une entree, avec leur niveau (0 : la cle, 1 : ses
-    proprietes et les commentaires)."""
+    proprietes). Une propriete dictionnaire (options) tient sur une ligne."""
     today = dt.date.today().isoformat()
-    return (
-        [(0, f"{yaml_key(name)}:  # ajoute le {today} : {why}")]
-        + [(1, f"{k}: {yaml_value(str(v))}") for k, v in props.items()]
-        + [(1, f"# {c}") for c in comments if c]
-    )
+    return [(0, f"{yaml_key(name)}:  # ajoute le {today} : {why}")] + [
+        (1, f"{k}: {flow_map(v) if isinstance(v, dict) else yaml_value(str(v))}")
+        for k, v in props.items()
+    ]
 
 
 def insert_entries(
@@ -844,13 +859,19 @@ def main(argv=None) -> int:
                 ]
             )
         )
+        # Format : celui que Qlik lit (txt -> csv, qvd -> parquet), et pour un
+        # CSV ses options, dont l'en-tete (no labels : pas d'en-tete).
+        qlik_fmt, options = source_format(r["path"], r["spec"])
+        if is_produced:
+            qlik_fmt, options = "parquet", {}  # ecrit par le job
+        header = options.get("header", "true") == "true"
         cols = []
         types: dict[str, str] = {}
         fmt = None
         origin, how = None, ""
         for loc in found:
             try:
-                cols, types, fmt, how = file_columns(loc)
+                cols, types, fmt, how = file_columns(loc, header)
             except Exception as exc:  # fichier illisible
                 warnings.append(f"{name} : {loc} illisible ({exc})")
                 cols, types, fmt, how = [], {}, None, ""
@@ -874,6 +895,12 @@ def main(argv=None) -> int:
             # partie, et un LOAD * qui suivrait en perdrait.
             written = (writes.get(name) or {}).get("columns", [])
             cols = list(dict.fromkeys(written + r["columns"]))
+        if not header and not from_file:
+            # Sans en-tete, Spark affecte les colonnes par position : le
+            # schema doit les lister toutes, dans l'ordre, jusqu'a la
+            # derniere que le script lit (@4 -> _c0 a _c3).
+            used = [int(m.group(1)) for c in cols if (m := re.fullmatch(r"_c(\d+)", c))]
+            cols = [positional_column(k + 1) for k in range(max(used, default=-1) + 1)]
         if exact and not fmt:
             out_types, sure = exact
             cols = list(dict.fromkeys(list(out_types) + cols))
@@ -898,13 +925,9 @@ def main(argv=None) -> int:
         )
         if r["star"] and not from_file:
             why += " ; LOAD * : colonnes incompletes sans le fichier"
-        # Format : celui du fichier trouve, sinon celui que Qlik lit (txt ->
-        # csv, qvd -> parquet), sinon parquet, a verifier.
-        qlik_fmt, options = source_format(r["path"], r["spec"])
-        if is_produced:
-            qlik_fmt, options = "parquet", {}  # ecrit par le job
+        # format du fichier trouve, sinon celui que Qlik lit, sinon a verifier
         fmt = fmt or qlik_fmt
-        comments = [csv_options_note(options)] if fmt == "csv" else []
+        extra = {"options": csv_options(options)} if fmt == "csv" else {}
         if not lines:
             # Aucune colonne connue (LOAD * sans le fichier) : un schema vide
             # risquerait de faire planter la lecture par le socle. On declare
@@ -918,9 +941,8 @@ def main(argv=None) -> int:
                 new_inputs.append(
                     (
                         entry_name,
-                        {"format": fmt or "parquet", "location": location},
+                        {"format": fmt or "parquet", "location": location, **extra},
                         why + " ; pas de schema, colonnes inconnues",
-                        comments,
                     )
                 )
             continue
@@ -940,14 +962,15 @@ def main(argv=None) -> int:
             "format": fmt or "parquet",
             "schema_file": schema_file,
             "location": location,
+            **extra,
         }
         new_inputs.append(
-            (entry_name, props, why if fmt else why + " ; format a verifier", comments)
+            (entry_name, props, why if fmt else why + " ; format a verifier")
         )
 
     propagate_types(schemas_out, conf)
     blocks = {
-        sections["input"]: [entry_lines(n, pr, w, c) for n, pr, w, c in new_inputs],
+        sections["input"]: [entry_lines(n, pr, w) for n, pr, w in new_inputs],
         sections["output"]: [entry_lines(n, pr, w) for n, pr, w in new_outputs],
     }
     if args.draft:

@@ -64,6 +64,31 @@ def test_migrate_demo_identical_to_qlik(project):
     assert "saveAsTable" in job and "--temp-views" in job
 
 
+def test_csv_without_header(project):
+    # (txt, no labels) : Qlik nomme les colonnes @1, @2... ; on les lit en
+    # _c0, _c1... et le resultat doit etre celui de Qlik
+    (project / "script_qvd/codes.qvs").write_text(
+        "Codes:\n"
+        "LOAD @1 as Code, Upper(@3) as Libelle\n"
+        "FROM [lib://data/codes.csv] (txt, no labels, delimiter is ';');\n"
+        "STORE Codes INTO [lib://out/codes_sortie.qvd] (qvd);\n"
+    )
+    (project / "data/input/codes.csv").write_text("1;x;abc\n2;y;def\n")
+    (project / "data/qlik_outputs/codes_sortie.csv").write_text(
+        "Code,Libelle\n1,ABC\n2,DEF\n"
+    )
+    res = project.run(
+        "migrate.py",
+        "script_qvd/codes.qvs",
+        "--skip-selftest",
+        "--var",
+        "sorties=data/output",
+    )
+    assert "- codes.qvs : assemble dans src/, donnees identiques a Qlik" in (
+        res.stdout
+    ), res.stdout
+
+
 def test_job_writes_each_step_as_a_table(project):
     project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
