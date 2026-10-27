@@ -143,9 +143,10 @@ job au debut de `run()`, il n'y a donc pas de `--conf` a passer.
   Elles sont ecrites aussi, sous le nom de la table. Si un autre script a
   deja une sortie de ce nom, chacun prefixe la sienne par son nom de script
   (`<script>_<table>`), pour ne pas s'ecraser.
-- Une sortie porte le nom du fichier du `STORE` (sans extension, casse
-  gardee) : `STORE T INTO [lib://qvd/Clients.qvd]` donne la sortie
-  `Clients`. Le fichier relu par un autre script garde ce meme nom en
+- Une sortie est ecrite sous le nom du fichier du `STORE` (sans extension,
+  casse gardee), et sa cle dans `io.yml` est ce nom en minuscules :
+  `STORE T INTO [lib://qvd/Clients.qvd]` donne la cle `clients`, de location
+  `${sorties}/Clients`. Le fichier relu par un autre script a la meme cle en
   entree.
 - Les noms de fichiers sont rendus lisibles par Spark, partout et des le
   debut : Hadoop prend le # pour un fragment d'URI et `[ ] { } * ?` pour un

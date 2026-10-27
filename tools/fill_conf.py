@@ -768,7 +768,8 @@ def main(argv=None) -> int:
         # une sortie porte le nom du fichier (ou de la table) du script Qlik
         new_outputs.append(
             (
-                file_stem(w["path"]),
+                # cle en minuscules ; la location garde le nom du fichier
+                file_stem(w["path"]).lower(),
                 {"location": f"{out_prefix}/{file_stem(w['path'])}"},
                 (
                     f"table {w['model']} du modele de donnees de "
@@ -888,7 +889,9 @@ def main(argv=None) -> int:
                 t, note = suggest(c, hints.get(c))
             lines.append((c, t, note))
         # relu apres un STORE : meme nom que la sortie qu'il relit
-        entry_name = file_stem(writes.get(name, r)["path"]) if is_produced else name
+        entry_name = (
+            file_stem(writes.get(name, r)["path"]).lower() if is_produced else name
+        )
         schema_file = f"{schema_dir}/{entry_name}.yml"
         why = f"lu par {', '.join(sorted(r['scripts']))}" + (
             ", produit par un autre script" if is_produced else ""

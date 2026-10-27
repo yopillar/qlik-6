@@ -56,11 +56,13 @@ def test_model_tables_become_outputs(project):
     # modele de donnees de l'app, il doit etre ecrit
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    # sous le nom de la table dans le script Qlik
-    assert conf["outputs"]["Dates"]["location"] == "${sorties}/Dates"
+    # cle en minuscules, location au nom de la table dans le script Qlik
+    assert conf["outputs"]["dates"]["location"] == "${sorties}/Dates"
     # pas les tables supprimees, ni celles qui ont un STORE
-    assert "Bornes" not in conf["outputs"]
-    assert "Ventes" not in conf["outputs"]
+    assert "bornes" not in conf["outputs"]
+    assert "ventes" not in conf["outputs"]
+    # toutes les cles des sorties sont en minuscules
+    assert all(k == k.lower() for k in conf["outputs"])
 
 
 def test_model_table_name_taken_by_another_script(project):
@@ -72,8 +74,8 @@ def test_model_table_name_taken_by_another_script(project):
     project.run("prepare.py", "--collect", *SCRIPTS, "script_qvd/autre.qvs")
     project.run("fill_conf.py", "script_qvd/")
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
-    assert {"calendrier_Dates", "autre_Dates"} <= set(conf["outputs"])
-    assert "Dates" not in conf["outputs"]
+    assert {"calendrier_dates", "autre_dates"} <= set(conf["outputs"])
+    assert "dates" not in conf["outputs"]
 
 
 def test_produced_file_waits_for_its_writer(project):
