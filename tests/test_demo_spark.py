@@ -88,8 +88,13 @@ def test_csv_without_header(project):
         res.stdout
     ), res.stdout
     # Null() donne une colonne void, que Parquet refuse : ecrite en string
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(
+        next((project / "data/output/codes_sortie").glob("*.parquet"))
+    )
+    assert str(schema.field("Vide").type) == "string"
     out = pd.read_parquet(project / "data/output/codes_sortie")
-    assert str(out["Vide"].dtype) in ("object", "string")
     assert out["Vide"].isna().all()
 
 
