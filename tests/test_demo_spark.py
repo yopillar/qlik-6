@@ -1,10 +1,11 @@
-"""Migration complete du projet de demo, avec Spark et le faux socle :
+"""Migration complete du projet de demo, avec Spark, core/ et commons/ :
 deux scripts chaines (synthese lit la sortie de ventes), un calendrier, un
 script en .txt et un sans extension, un io.yml a 3 espaces commente, une
 entree CSV et une sortie avec "#" dans leur nom, une table du modele de
 donnees sans STORE."""
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -114,6 +115,8 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
     assert 'read_input("ventes", table="in_ventes")' in ventes
     assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
+    assert "Lit : ref_sites_2024, ventes." in ventes
+    check_generated_code(project)
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
     project.run_job("--only", "ventes")
@@ -130,3 +133,30 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         text=True,
     )
     assert "ventes__ventes" in res.stdout, res.stderr[-2000:]
+
+
+def check_generated_code(project: Project) -> None:
+    """Le code genere passe les memes controles que le kit : docstrings et
+    annotations de type partout (ruff D1, ANN), types coherents (mypy)."""
+    src = project / "src/demo"
+    config = str(ROOT / "pyproject.toml")
+    ruff = shutil.which("ruff")
+    if ruff:
+        for cmd in (["format", "--check"], ["check", "--no-cache"]):
+            res = subprocess.run(
+                [ruff, *cmd, "--config", config, str(src)],
+                capture_output=True,
+                text=True,
+            )
+            assert res.returncode == 0, res.stdout + res.stderr
+    mypy = shutil.which("mypy")
+    if mypy:
+        res = subprocess.run(
+            [mypy, "--config-file", config, "--cache-dir", os.devnull]
+            + ["--explicit-package-bases", "job.py", "scripts"],
+            cwd=src,
+            env=dict(os.environ, MYPYPATH=str(ROOT)),
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr

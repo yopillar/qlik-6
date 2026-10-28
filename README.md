@@ -64,7 +64,10 @@ tables dans le script.
 
 Toute fonction, classe et module de `core/`, `commons/` et `tools/` a une
 docstring et des annotations de type (`DataFrame` pour un DataFrame) :
-`ruff` (regles `D1` et `ANN`) et `mypy` le verifient.
+`ruff` (regles `D1` et `ANN`) et `mypy` le verifient. Le code genere
+(`job.py`, `scripts/`) aussi : la docstring de chaque script dit ce qu'il
+lit, calcule et ecrit, et le test de bout en bout passe le projet genere a
+`ruff` et `mypy`.
 
 Le texte du job et des modules de scripts est dans
 `tools/job_template.py`. Si on veut changer leur forme, on corrige ce

@@ -18,6 +18,7 @@ from __future__ import annotations
 import keyword
 import os
 import re
+import textwrap
 from pathlib import Path
 
 
@@ -117,14 +118,36 @@ Chaque ligne est une etape du script Qlik, dans l'ordre :
 """
 
 from __future__ import annotations
-
-from core import {functions}
-
+{imports}
 
 def run() -> None:
-    """Rejoue le script {script}."""
+    """Rejoue le script {script}.
+
+{summary}
+    """
 {body}
 '''
+
+
+def _summary_line(label: str, names: list[str]) -> str:
+    """Une ligne de la docstring d'un script : "Lit : a, b.", repliee.
+
+    Args:
+        label: Lit, Calcule ou Ecrit.
+        names: les noms a lister, dans l'ordre, sans doublon.
+
+    Returns:
+        Le texte indente pour la docstring, ou "" s'il n'y a rien.
+    """
+    if not names:
+        return ""
+    return textwrap.fill(
+        f"{label} : {', '.join(dict.fromkeys(names))}.",
+        width=84,
+        initial_indent="    ",
+        subsequent_indent="        ",
+        break_on_hyphens=False,
+    )
 
 
 def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
@@ -168,8 +191,14 @@ def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str
     used = ["read_input"] if inputs else []
     used += ["run_sql"] if steps else []
     used += ["write_output"] if any(st[2] for st in steps) else []
+    summary = [
+        _summary_line("Lit", list(inputs.values())),
+        _summary_line("Calcule", [st[1] for st in steps]),
+        _summary_line("Ecrit", [st[2] for st in steps if st[2]]),
+    ]
     return SCRIPT.format(
         script=script,
-        functions=", ".join(used) or "run_sql",
+        imports=f"\nfrom core import {', '.join(used)}\n" if used else "",
+        summary="\n".join(x for x in summary if x) or "    Rien a faire.",
         body="\n".join(lines) or "    pass",
     )
