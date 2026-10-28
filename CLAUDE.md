@@ -18,8 +18,11 @@ python -m pytest                          # les tests Spark ont le marqueur spar
   `DataFrame`). Ruff (D1, ANN) et mypy le verifient.
 - Le job genere (`job.py`, `scripts/`) reste lisible par un developpeur
   Qlik : pipeline, run_scripts, read_input, run_sql, write_output, rien
-  d'autre. Le code Spark va dans `core/` (le technique dans
-  `core/internal/`) et les transformations dans `commons/`.
+  d'autre. Il importe le socle `spark_foundation` (`runner.py`,
+  `tables.py`) ; le technique est dans `spark_foundation/internal/` et les
+  transformations dans `pyspark_commons`.
+- `core/` et `commons/` ne se modifient pas ici : le socle vit dans son
+  depot. Les tests passent par la doublure `tests/fakelib/spark_foundation`.
 - La cible est Spark 3.5.8 : verifier aussi avec PySpark 3.5.8 quand c'est
   possible, pas seulement 4.x.
 - Branche de travail, puis MR vers develop.

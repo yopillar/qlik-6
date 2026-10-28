@@ -1,4 +1,4 @@
-"""Migration complete du projet de demo, avec Spark, core/ et commons/ :
+"""Migration complete du projet de demo, avec Spark et la doublure du socle :
 deux scripts chaines (synthese lit la sortie de ventes), un calendrier, un
 script en .txt et un sans extension, un io.yml a 3 espaces commente, une
 entree CSV et une sortie avec "#" dans leur nom, une table du modele de
@@ -12,7 +12,7 @@ import sys
 import pandas as pd
 import pytest
 
-from conftest import ROOT, Project
+from conftest import JOB_PATH, ROOT, Project
 
 pytestmark = pytest.mark.spark
 
@@ -98,14 +98,14 @@ def test_csv_without_header(project: Project) -> None:
 
 
 def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> None:
-    """Le job ne contient que des appels a core/, et chaque table Qlik est une
+    """Le job ne contient que des appels au socle, et chaque table Qlik est une
     table du catalogue (pour OpenLineage)."""
     project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
     job = (project / "src/demo/job.py").read_text(encoding="utf-8")
     # rien de technique dans le job : pipeline, run_scripts, les scripts
-    assert "from core import pipeline, run_scripts" in job
+    assert "from spark_foundation import pipeline, run_scripts" in job
     assert "SCRIPTS = " not in job and "def " in job and len(job.splitlines()) < 60
     # l'ordre des scripts est l'ordre des appels
     calls = job[job.index("run_scripts(\n") :]
@@ -113,6 +113,10 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         calls.index("calendrier,") < calls.index("ventes,") < calls.index("synthese,")
     )
     ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
+    assert (
+        "from spark_foundation.tables import read_input, run_sql, write_output"
+        in ventes
+    )
     assert 'read_input("ventes", table="in_ventes")' in ventes
     assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
     assert "Lit : ref_sites_2024, ventes." in ventes
@@ -155,7 +159,7 @@ def check_generated_code(project: Project) -> None:
             [mypy, "--config-file", config, "--cache-dir", os.devnull]
             + ["--explicit-package-bases", "job.py", "scripts"],
             cwd=src,
-            env=dict(os.environ, MYPYPATH=str(ROOT)),
+            env=dict(os.environ, MYPYPATH=JOB_PATH),
             capture_output=True,
             text=True,
         )

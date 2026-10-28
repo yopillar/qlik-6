@@ -3,8 +3,8 @@
 Chaque script Qlik est traduit en requetes Spark SQL, une par table, rangees
 dans `src/<nom-projet>/sql/`. Un job unique, `src/<nom-projet>/job.py`, les
 enchaine pour tout le projet. Le job ne contient aucun code PySpark : il
-appelle des fonctions de `core/` (`spark-foundation-core`), qui s'appuient
-sur `commons/` (`pyspark-commons`). Un developpeur Qlik peut le lire sans
+appelle des fonctions du socle `spark_foundation` (`spark-foundation-core`),
+qui s'appuie sur `pyspark_commons`. Un developpeur Qlik peut le lire sans
 connaitre Spark.
 
 L'essentiel de la traduction est fait en Python, sans modele. On n'appelle
@@ -24,9 +24,6 @@ mon-projet/
 |-- src/<nom-projet>/job.py   job du projet, tous les scripts dans l'ordre (genere)
 |-- src/<nom-projet>/scripts/ un module par script Qlik : ses etapes        (genere)
 |-- src/<nom-projet>/sql/     <script>__01_<table>.sql, ...                  (genere)
-|-- core/                     spark-foundation-core : fonctions du job
-|-- core/internal/            le technique, reserve aux data engineers
-|-- commons/                  pyspark-commons : transformations de DataFrame
 |-- work/                     travail intermediaire, journal.csv           (genere)
 |-- .opencode/agents/translator.md
 |-- .opencode/skills/         4 skills SQL (jointures, mappings, chaines TMP, Peek/Previous)
@@ -45,22 +42,28 @@ tables dans le script.
 
 ## Les deux bibliotheques
 
-- `core/` (`spark-foundation-core`) : ce que le job appelle, et rien
-  d'autre.
-  - `core/pipeline.py` : `@pipeline("<nom-projet>")` ouvre la session et
-    passe les arguments au job.
-  - `core/datasets.py` : `read_input(nom, table=...)` et
-    `write_output(nom, table=...)`, avec les noms de `conf/io.yml`.
-  - `core/steps.py` : `run_sql(fichier, table=...)` pour une table Qlik, et
-    `run_scripts(args, script, ...)` pour enchainer les scripts.
-  - `core/internal/` : session et reglages SQL, lecture de `conf/io.yml`,
-    lecture et ecriture des fichiers, tables du catalogue pour OpenLineage,
-    enchainement et reprise. Reserve aux data engineers : un developpeur
-    Qlik n'a pas a l'ouvrir.
-- `commons/` (`pyspark-commons`) : uniquement des transformations de
-  DataFrame, sans lecture ni ecriture, rangees par theme (`order.py` pour
-  l'ordre de chargement Qlik, `columns.py` pour les colonnes). `core/` s'en
-  sert ; le job ne l'importe jamais directement.
+Le code genere n'importe que le socle, et seulement ces fonctions :
+
+| Import dans le code genere | Fichier du socle | Role |
+|---|---|---|
+| `from spark_foundation import pipeline, run_scripts` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session ; `run_scripts(args, script, ...)` enchaine les scripts et trouve `sql/` a cote de `job.py` |
+| `from spark_foundation.tables import read_input, run_sql, write_output` (`scripts/`) | `spark_foundation/tables.py` | lire une entree de `conf/io.yml`, calculer une table Qlik avec sa requete, l'ecrire |
+
+- `spark_foundation/internal/` : session et reglages SQL (`session.py`),
+  lecture de `conf/io.yml` (`config.py`), etat du job (`context.py`),
+  tables du catalogue pour OpenLineage (`lineage.py`), lecture et ecriture
+  des fichiers (`io/access.py` : `read_config`, `write_config`,
+  `input_location`, `output_location`). Reserve aux data engineers.
+- `pyspark_commons` : uniquement des transformations de DataFrame (ordre de
+  chargement Qlik, colonnes). Le socle s'en sert ; le job ne l'importe
+  jamais directement.
+
+`core/` et `commons/` dans ce depot sont la version d'origine qui a servi
+de base au socle. Les tests s'en servent comme doublure du socle :
+`tests/fakelib/spark_foundation/` reprend son API publique (`runner.py`,
+`tables.py`) au-dessus de `core/`. Si l'API du socle change, c'est
+`tools/job_template.py` (les imports du code genere) et cette doublure
+qu'il faut suivre.
 
 Toute fonction, classe et module de `core/`, `commons/` et `tools/` a une
 docstring et des annotations de type (`DataFrame` pour un DataFrame) :
@@ -135,7 +138,7 @@ En mode client, le driver lit les requetes dans `src/<nom-projet>/sql/`. Le
 mode cluster demanderait d'envoyer aussi ce dossier et `conf/` : pas prevu
 pour l'instant. Les reglages SQL dont dependent les requetes (sensibilite a
 la casse, ANSI desactive, `timeParserPolicy=CORRECTED`) sont poses par
-`core/` a l'ouverture de la session, il n'y a donc pas de `--conf` a passer.
+le socle a l'ouverture de la session, il n'y a donc pas de `--conf` a passer.
 
 Le job tient en quelques lignes :
 
@@ -172,7 +175,7 @@ def run() -> None:
   relancer ne cree donc pas de doublon.
 - Les lectures et ecritures passent par `read_input` et `write_output`,
   avec les noms de `conf/io.yml`. La location, le format et la resolution
-  des chemins relatifs sont l'affaire de `core/`.
+  des chemins relatifs sont l'affaire du socle.
 - Les vues d'un script sont supprimees quand il a fini, pour que deux
   scripts puissent avoir une table du meme nom.
 - Chaque `STORE` du script Qlik devient une ecriture. Un `STORE` qu'on
@@ -207,7 +210,7 @@ def run() -> None:
   `--temp-views`, le job garde les vues temporaires (plus rapide, mais rien
   dans la lignee). Une table dont deux colonnes ne different que par la
   casse reste en vue temporaire : le catalogue ne les distingue pas.
-  En local, sans metastore Hive, `core/` en cree un dans `metastore_db/`
+  En local, sans metastore Hive, le socle en cree un dans `metastore_db/`
   et les fichiers vont dans `spark-warehouse/` (tous deux ignores par git) :
   sans lui, remplacer une table existante echoue d'un lancement a l'autre.
 - Seuls les scripts entierement valides entrent dans le job. Les autres sont
@@ -579,7 +582,7 @@ Qlik attendus. Chaque test le copie dans un dossier temporaire. Le cas de la
 table de 322 colonnes est construit par le test lui-meme.
 
 Les tests marques `spark` lancent `migrate.py` de bout en bout, puis le
-job genere avec `core/` et `commons/`. Ils verifient aussi que le job reste
+job genere avec la doublure du socle (`tests/fakelib/`). Ils verifient aussi que le job reste
 court et que chaque table Qlik arrive dans le catalogue. Sans pyspark, ces
 tests sont sautes.
 
@@ -627,9 +630,9 @@ tests sont sautes.
   base de donnees.
 - Tests pytest passes en local avec PySpark 3.5.8 (la cible) et 4.0.1,
   Java 21. Pas encore teste sur le cluster, ni avec un vrai opencode.
-- `core/` et `commons/` sont ecrits ici ; s'ils doivent rejoindre les
-  depots `spark-foundation-core` et `pyspark-commons`, ce sont ces deux
-  dossiers a reprendre tels quels.
+- Les tests tournent sur la doublure du socle, pas sur le vrai
+  `spark_foundation` : on suppose que son API publique est celle decrite
+  plus haut (noms et signatures de `runner.py` et `tables.py`).
 - Les tables du catalogue sont en Parquet, ecrasees a chaque lancement : on
   n'a que la derniere version. Un overwrite Parquet n'est pas atomique, un
   echec au milieu laisse la table incomplete jusqu'au prochain lancement

@@ -19,6 +19,10 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
 DEMO = Path(__file__).resolve().parent / "demo"
+# doublure du socle spark_foundation, que le code genere importe
+FAKELIB = Path(__file__).resolve().parent / "fakelib"
+# le job genere trouve le socle (doublure) et core/, commons/ qu'elle utilise
+JOB_PATH = os.pathsep.join([str(FAKELIB), str(ROOT)])
 
 sys.path.insert(0, str(TOOLS))
 
@@ -45,11 +49,11 @@ class Project:
     def run(
         self, tool: str, *args: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
-        """Lance tools/<tool> depuis la racine du projet, avec core/ et
-        commons/ du depot dans le PYTHONPATH (le job genere les importe)."""
+        """Lance tools/<tool> depuis la racine du projet, avec la doublure
+        du socle dans le PYTHONPATH (le job genere l'importe)."""
         env = dict(
             os.environ,
-            PYTHONPATH=str(ROOT),
+            PYTHONPATH=JOB_PATH,
             entrees="data/input",
             sorties="data/output",
         )
@@ -78,7 +82,7 @@ class Project:
         """
         env = dict(
             os.environ,
-            PYTHONPATH=str(ROOT),
+            PYTHONPATH=JOB_PATH,
             entrees="data/input",
             sorties="data/output",
         )
