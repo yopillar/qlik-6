@@ -35,15 +35,15 @@ def state() -> JobState:
     return _STATE
 
 
-def start_job(job_name: str, sql_dir: Path) -> None:
-    """Remet l'etat a zero au lancement d'un job.
+def start_job(job_name: str) -> None:
+    """Remet l'etat a zero au lancement d'un job. Le dossier des requetes
+    est pose ensuite par run_scripts.
 
     Args:
         job_name: le nom du job.
-        sql_dir: dossier des requetes du projet.
     """
     global _STATE
-    _STATE = JobState(job_name=job_name, sql_dir=sql_dir)
+    _STATE = JobState(job_name=job_name)
 
 
 @contextmanager

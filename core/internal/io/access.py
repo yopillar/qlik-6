@@ -10,7 +10,7 @@ from commons import LOAD_ORDER, cast_void_to_string, drop_columns
 from core.internal import config
 
 
-def read_dataset(spark: SparkSession, name: str) -> DataFrame:
+def read_config(spark: SparkSession, name: str) -> DataFrame:
     """Lit une entree de io.yml.
 
     Un CSV est lu avec son schema (colonnes dans l'ordre du fichier) et ses
@@ -65,7 +65,7 @@ def input_location(name: str) -> str:
     return config.location(config.entry("input", name))
 
 
-def write_dataset(df: DataFrame, name: str) -> None:
+def write_config(df: DataFrame, name: str) -> None:
     """Ecrit une table dans une sortie de io.yml, en Parquet, en remplacant
     ce qui y etait.
 

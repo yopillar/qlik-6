@@ -1,16 +1,12 @@
 """spark-foundation-core : les fonctions qu'un job migre depuis Qlik appelle.
 
-Un developpeur Qlik n'a besoin que de celles-ci :
-    pipeline      declare la fonction principale du job
-    read_input    LOAD ... FROM un fichier de conf/io.yml
-    run_sql       une table Qlik, calculee par sa requete du dossier sql/
-    write_output  STORE d'une table dans un fichier de conf/io.yml
-    run_scripts   les scripts du projet, dans l'ordre
+Meme organisation que le socle spark_foundation :
+    runner.py   pipeline, Pipeline, run_scripts : le job et ses scripts
+    tables.py   read_input, run_sql, write_output : les tables d'un script
 Tout le reste est dans core/internal/, reserve aux data engineers.
 """
 
-from core.datasets import read_input, write_output
-from core.pipeline import pipeline
-from core.steps import run_scripts, run_sql
+from core.runner import Pipeline, pipeline, run_scripts
+from core.tables import read_input, write_output
 
-__all__ = ["pipeline", "read_input", "run_scripts", "run_sql", "write_output"]
+__all__ = ["Pipeline", "pipeline", "read_input", "run_scripts", "write_output"]

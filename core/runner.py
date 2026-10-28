@@ -1,18 +1,84 @@
-"""Enchainement des scripts d'un projet : options de la ligne de commande,
-reprise, chronometrage et erreurs."""
+"""Le decorateur @pipeline, point d'entree de chaque job, et l'enchainement
+des scripts d'un projet.
+
+    @pipeline("demo")
+    def run(spark: SparkSession, args: list[str]) -> None:
+        run_scripts(args, calendrier, ventes, synthese)
+"""
 
 from __future__ import annotations
 
 import argparse
+import functools
+import inspect
 import logging
+import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from pathlib import Path
 from types import ModuleType
 
-from core.internal import context, lineage
-from core.internal.session import active_session
+from pyspark.sql import SparkSession
+
+from core.internal import context, lineage, session
 
 logger = logging.getLogger("core")
+
+# La fonction principale d'un job : run(spark, args).
+JobFunction = Callable[[SparkSession, list[str]], None]
+
+
+class Pipeline:
+    """Un job : sa fonction principale et son nom."""
+
+    def __init__(self, name: str, func: JobFunction) -> None:
+        """Enregistre la fonction principale.
+
+        Args:
+            name: le nom du job.
+            func: la fonction run(spark, args) du job.
+        """
+        self.name = name
+        self.func = func
+        functools.update_wrapper(self, func)
+
+    def __call__(self, args: list[str] | None = None) -> None:
+        """Lance le job : ouvre la session Spark, puis appelle la fonction
+        principale.
+
+        Args:
+            args: les arguments du job ; par defaut ceux de la ligne de
+                commande.
+        """
+        spark = session.get_session(self.name)
+        context.start_job(self.name)
+        self.func(spark, sys.argv[1:] if args is None else args)
+
+
+def pipeline(name: str) -> Callable[[JobFunction], Pipeline]:
+    """Declare la fonction principale d'un job.
+
+    Exemple :
+
+        @pipeline("ventes")
+        def run(spark: SparkSession, args: list[str]) -> None:
+            ...
+
+        if __name__ == "__main__":
+            raise SystemExit(run())
+
+    Args:
+        name: le nom du job.
+
+    Returns:
+        Le decorateur.
+    """
+
+    def wrap(func: JobFunction) -> Pipeline:
+        """Enveloppe la fonction principale."""
+        return Pipeline(name, func)
+
+    return wrap
 
 
 def script_name(module: ModuleType) -> str:
@@ -81,25 +147,37 @@ def select(
     return list(scripts)
 
 
-def run(args: list[str], scripts: Sequence[ModuleType]) -> None:
-    """Fait tourner les scripts dans l'ordre, et s'arrete au premier echec.
+def _caller_sql_dir() -> Path:
+    """Dossier sql/ a cote du fichier qui a appele run_scripts (job.py)."""
+    frame = inspect.currentframe()
+    # deux crans : _caller_sql_dir, puis run_scripts
+    caller = frame.f_back.f_back if frame and frame.f_back else None
+    if caller is None:
+        raise RuntimeError("run_scripts : impossible de trouver le job appelant")
+    return Path(caller.f_code.co_filename).resolve().parent / "sql"
 
-    Comme un rechargement Qlik qui s'arrete a la premiere erreur : les
-    scripts suivants lisent souvent ce que le script en echec devait ecrire,
-    ils tourneraient sur des donnees absentes ou d'hier. Une fois corrige, on
-    reprend avec --from <script>. Chaque table etant ecrite en mode
-    overwrite, relancer ne cree pas de doublon.
+
+def run_scripts(args: list[str], *scripts: ModuleType) -> None:
+    """Fait tourner les scripts du projet, dans l'ordre donne.
+
+    Les requetes sont lues dans le dossier sql/ a cote du job qui appelle
+    cette fonction. Comme un rechargement Qlik, on s'arrete au premier
+    script en echec : les suivants liraient des donnees absentes ou d'hier.
+    Une fois corrige, on reprend avec --from <script>. Chaque table etant
+    ecrite en mode overwrite, relancer ne cree pas de doublon. --only
+    <script> n'en lance qu'un.
 
     Args:
-        args: les arguments de la ligne de commande.
-        scripts: les modules des scripts, dans l'ordre.
+        args: les arguments recus par le job.
+        scripts: les scripts, dans l'ordre ou ils doivent tourner.
 
     Raises:
         RuntimeError: un script a echoue ; le message dit d'ou reprendre.
     """
     opts = parse_options(args)
     state = context.state()
-    spark = active_session()
+    state.sql_dir = _caller_sql_dir()
+    spark = session.active_session()
     if not opts.temp_views:
         state.database = opts.database or f"{state.job_name}_qlik"
         lineage.ensure_database(spark, state.database)

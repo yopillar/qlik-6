@@ -1,11 +1,12 @@
 """Gabarits du code genere pour un projet : job.py et un fichier par script.
 
 Ce code est lu par des developpeurs Qlik qui ne connaissent pas PySpark. Il
-ne contient donc que des appels aux fonctions de spark-foundation-core
-(core/) : pipeline, read_input, run_sql, write_output, run_scripts. Tout ce
-qui est technique (session, lecture, ecriture, tables pour OpenLineage,
-reprise) est dans core/internal/, et les transformations dans
-pyspark-commons (commons/).
+ne contient donc que des appels aux fonctions du socle spark_foundation :
+    spark_foundation            pipeline, run_scripts (runner.py)
+    spark_foundation.tables     read_input, run_sql, write_output
+Tout ce qui est technique (session, io.yml, lecture, ecriture, tables pour
+OpenLineage, reprise) est dans spark_foundation/internal/, et les
+transformations dans pyspark_commons.
 
     src/<projet>/job.py                le job : les scripts, dans l'ordre
     src/<projet>/scripts/<script>.py   un script Qlik : ses LOAD, ses tables,
@@ -77,7 +78,7 @@ Le job s'arrete au premier script en echec.
 Sur le cluster, depuis la racine du projet :
 
     spark-submit --name {project} --deploy-mode client \\\\
-        --py-files <spark-foundation-core et pyspark-commons, s'ils ne sont
+        --py-files <spark_foundation et pyspark_commons, s'ils ne sont
                     pas installes> \\\\
         src/{project}/job.py [--from <script> | --only <script>]
 """
@@ -86,8 +87,7 @@ from __future__ import annotations
 
 from pyspark.sql import SparkSession
 
-from core import pipeline, run_scripts
-{imports}
+{imports}from spark_foundation import pipeline, run_scripts
 
 
 @pipeline("{project}")
@@ -100,8 +100,7 @@ def run(spark: SparkSession, args: list[str]) -> None:
     """
     run_scripts(
         args,
-{calls}
-    )
+{calls}    )
 
 
 if __name__ == "__main__":
@@ -162,10 +161,11 @@ def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
         Le code du job.
     """
     names = sorted(m for m, _ in scripts)
-    imports = f"from scripts import {', '.join(names)}" if names else ""
-    calls = "\n".join(
+    imports = f"from scripts import {', '.join(names)}\n" if names else ""
+    calls = "".join(
         f"        {m},"
         + (f"  # apres {', '.join(deps)}, dont il lit les sorties" if deps else "")
+        + "\n"
         for m, deps in scripts
     )
     return JOB.format(project=project, imports=imports, calls=calls)
@@ -198,7 +198,9 @@ def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str
     ]
     return SCRIPT.format(
         script=script,
-        imports=f"\nfrom core import {', '.join(used)}\n" if used else "",
+        imports=f"\nfrom spark_foundation.tables import {', '.join(used)}\n"
+        if used
+        else "",
         summary="\n".join(x for x in summary if x) or "    Rien a faire.",
         body="\n".join(lines) or "    pass",
     )
