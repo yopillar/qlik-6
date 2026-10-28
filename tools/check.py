@@ -28,6 +28,10 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pyspark est facultatif pour les controles statiques
+    from pyspark.sql import SparkSession
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
@@ -51,6 +55,7 @@ MAX_UNREFERENCED = 0.3
 
 
 def strip_sql_comments(sql: str) -> str:
+    """Retire les commentaires -- et /* */ d'une requete."""
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
     return re.sub(r"--[^\n]*", " ", sql)
 
@@ -63,7 +68,8 @@ def strip_sql_strings(sql: str, idents: bool = False) -> str:
     deux dans la meme regex, sinon l'apostrophe de `Payment's type` serait
     prise pour le debut d'une chaine."""
 
-    def repl(m):
+    def repl(m: re.Match[str]) -> str:
+        """Chaine videe, ou nom vide si idents."""
         tok = m.group()
         if tok[0] in "'\"":
             return "''"
@@ -95,7 +101,7 @@ SPARK_TYPES = {
 }
 
 
-def spark_type(t) -> str:
+def spark_type(t: object) -> str:
     """Traduit un type de conf/schema en type Spark (STRING si on ne le
     connait pas)."""
     if not t:
@@ -124,7 +130,12 @@ class SparkChecker:
     ce qui suffit a verifier les noms de colonnes et de vues, les fonctions
     et les types de base. Rien n'est execute."""
 
-    def __init__(self, spark):
+    def __init__(self, spark: SparkSession) -> None:
+        """Garde la session et son parseur SQL.
+
+        Args:
+            spark: une session locale, sans donnees.
+        """
         import threading
 
         self.spark = spark
@@ -133,6 +144,7 @@ class SparkChecker:
         self.lock = threading.Lock()
 
     def parse(self, sql: str) -> str | None:
+        """Erreur de syntaxe de la requete, ou None."""
         try:
             self.parser.parsePlan(sql)
             return None
@@ -140,6 +152,11 @@ class SparkChecker:
             return "syntaxe SQL : " + str(exc).splitlines()[0][:300]
 
     def analyze(self, section: dict, sql: str) -> str | None:
+        """Erreur de l'analyse Spark sur des vues vides, ou None.
+
+        Garde au passage dans la section les types de sortie calcules par
+        Spark (output_types).
+        """
         views = section.get("views", {})
         if not views or any(not v.get("columns") for v in views.values()):
             # on ne connait pas toutes les colonnes
@@ -186,7 +203,7 @@ class SparkChecker:
                 return "analyse Spark : " + msg[:300]
 
 
-def get_parser():
+def get_parser() -> SparkChecker | None:
     """Renvoie le verificateur Spark, ou None si pyspark n'est pas installe.
 
     Pas besoin du socle ici : on ne lit ni n'ecrit rien, une session locale
@@ -231,9 +248,21 @@ def is_table_from(code: str, pos: int) -> bool:
 
 
 def check_section(
-    section: dict, query_path: Path, parser=None
+    section: dict, query_path: Path, parser: SparkChecker | None = None
 ) -> tuple[list[str], list[str]]:
-    errors, warnings = [], []
+    """Controle une requete traduite.
+
+    Args:
+        section: la section du manifest.
+        query_path: son query.sql.
+        parser: le verificateur Spark, ou None pour les seuls controles
+            statiques.
+
+    Returns:
+        (erreurs, avertissements).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
     if not query_path.exists() or not query_path.read_text(encoding="utf-8").strip():
         return ["query.sql absent ou vide"], []
     raw = query_path.read_text(encoding="utf-8")
@@ -345,7 +374,15 @@ def check_section(
     return sorted(set(errors), key=errors.index), warnings
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("workdir", type=Path, help="work/<script>")
     p.add_argument("--only", help="id d'une table")

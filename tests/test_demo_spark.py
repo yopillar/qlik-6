@@ -11,12 +11,13 @@ import sys
 import pandas as pd
 import pytest
 
-from conftest import FAKELIB
+from conftest import ROOT, Project
 
 pytestmark = pytest.mark.spark
 
 
-def test_migrate_demo_identical_to_qlik(project):
+def test_migrate_demo_identical_to_qlik(project: Project) -> None:
+    """La migration complete du projet de demo donne les memes donnees que Qlik."""
     res = project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
@@ -59,12 +60,9 @@ def test_migrate_demo_identical_to_qlik(project):
     job = (project / "src/demo/job.py").read_text(encoding="utf-8")
     assert "spark-submit" in job
 
-    # chaque table Qlik est une table du catalogue (pour OpenLineage), pas
-    # seulement une vue temporaire
-    assert "saveAsTable" in job and "--temp-views" in job
 
-
-def test_csv_without_header(project):
+def test_csv_without_header(project: Project) -> None:
+    """Un CSV sans en-tete (no labels) donne le meme resultat que Qlik."""
     # (txt, no labels) : Qlik nomme les colonnes @1, @2... ; on les lit en
     # _c0, _c1... et le resultat doit etre celui de Qlik
     (project / "script_qvd/codes.qvs").write_text(
@@ -98,27 +96,36 @@ def test_csv_without_header(project):
     assert out["Vide"].isna().all()
 
 
-def test_job_writes_each_step_as_a_table(project):
+def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> None:
+    """Le job ne contient que des appels a core/, et chaque table Qlik est une
+    table du catalogue (pour OpenLineage)."""
     project.run(
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
-    # le job et la lecture du catalogue dans le meme processus : le
-    # catalogue du faux socle est en memoire
+    job = (project / "src/demo/job.py").read_text(encoding="utf-8")
+    # rien de technique dans le job : pipeline, run_scripts, les scripts
+    assert "from core import pipeline, run_scripts" in job
+    assert "SCRIPTS = " not in job and "def " in job and len(job.splitlines()) < 60
+    # l'ordre des scripts est l'ordre des appels
+    calls = job[job.index("run_scripts(\n") :]
+    assert (
+        calls.index("calendrier,") < calls.index("ventes,") < calls.index("synthese,")
+    )
+    ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
+    assert 'read_input("ventes", table="in_ventes")' in ventes
+    assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
+    # le metastore local garde les tables d'un lancement a l'autre ; on
+    # relance ventes pour verifier qu'une table existante est bien remplacee
+    project.run_job("--only", "ventes")
     check = (
-        "import runpy, sys\n"
-        "sys.argv = ['job.py', '--only', 'ventes']\n"
-        "try:\n"
-        "    runpy.run_path('src/demo/job.py', run_name='__main__')\n"
-        "except SystemExit:\n"
-        "    pass\n"
-        "from spark_foundation import _session\n"
-        "print(sorted(t.name for t in "
-        "_session().catalog.listTables('demo_qlik')))\n"
+        "from core.internal.session import get_session\n"
+        "spark = get_session('demo')\n"
+        "print(sorted(t.name for t in spark.catalog.listTables('demo_qlik')))\n"
     )
     res = subprocess.run(
         [sys.executable, "-c", check],
         cwd=project.path,
-        env=dict(os.environ, PYTHONPATH=str(FAKELIB)),
+        env=dict(os.environ, PYTHONPATH=str(ROOT)),
         capture_output=True,
         text=True,
     )

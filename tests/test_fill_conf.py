@@ -1,16 +1,24 @@
+"""Completion de conf/io.yml et des schemas par fill_conf.py."""
+
+import subprocess
+
 import pytest
 import yaml
+
+from conftest import Project
 
 SCRIPTS = ("script_qvd/calendrier", "script_qvd/synthese.txt", "script_qvd/ventes.qvs")
 
 
-def fill(project):
+def fill(project: Project) -> subprocess.CompletedProcess[str]:
+    """Recense les scripts de la demo et complete conf/."""
     project.run("normalize.py")
     project.run("prepare.py", "--collect", *SCRIPTS)
     return project.run("fill_conf.py", "script_qvd/")
 
 
-def test_fill_conf_adds_without_touching_existing(project):
+def test_fill_conf_adds_without_touching_existing(project: Project) -> None:
+    """fill_conf ajoute ce qui manque sans modifier l'existant, et relancer n'ajoute rien."""
     before = (project / "conf/io.yml").read_text(encoding="utf-8")
     fill(project)
     after = (project / "conf/io.yml").read_text(encoding="utf-8")
@@ -29,7 +37,8 @@ def test_fill_conf_adds_without_touching_existing(project):
     assert (project / "conf/io.yml").read_text(encoding="utf-8") == after
 
 
-def test_hash_becomes_underscore(project):
+def test_hash_becomes_underscore(project: Project) -> None:
+    """Le # des noms de fichiers devient _ ; aucune sortie ne garde de #."""
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
     # [ref]-sites#2024.csv : renomme (ref)-sites_2024.csv, lu en csv sous ce nom
@@ -45,7 +54,8 @@ def test_hash_becomes_underscore(project):
     assert not any("#" in v["location"] for v in conf["outputs"].values())
 
 
-def test_csv_options_declared(project):
+def test_csv_options_declared(project: Project) -> None:
+    """Les options CSV de la specification Qlik vont dans la cle options."""
     fill(project)
     conf = yaml.safe_load((project / "conf/io.yml").read_text(encoding="utf-8"))
     # options du lecteur CSV de Spark, d'apres la specification Qlik
@@ -67,7 +77,8 @@ NO_LABELS = (
 )
 
 
-def test_csv_without_header_file_absent(project):
+def test_csv_without_header_file_absent(project: Project) -> None:
+    """Sans le fichier, un CSV sans en-tete a toutes ses colonnes _c0... dans l'ordre."""
     # sans le fichier : colonnes _c0 a _c2, toutes, dans l'ordre (Spark les
     # affecte par position), meme si le script ne lit pas @2
     (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
@@ -85,7 +96,8 @@ def test_csv_without_header_file_absent(project):
     assert list(schema["columns"]) == ["_c0", "_c1", "_c2"]
 
 
-def test_csv_without_header_file_present(project):
+def test_csv_without_header_file_present(project: Project) -> None:
+    """Avec le fichier, un CSV sans en-tete prend toutes ses colonnes et leurs types."""
     # avec le fichier : toutes ses colonnes, la 1re ligne est une donnee
     (project / "script_qvd/codes.qvs").write_text(NO_LABELS)
     (project / "data/input/codes.csv").write_text("1;x;abc;9\n2;y;def;8\n")
@@ -102,7 +114,8 @@ def test_csv_without_header_file_present(project):
     }
 
 
-def test_model_tables_become_outputs(project):
+def test_model_tables_become_outputs(project: Project) -> None:
+    """Les tables encore la a la fin du script deviennent des sorties."""
     # Dates reste en memoire a la fin du calendrier, sans STORE : c'est le
     # modele de donnees de l'app, il doit etre ecrit
     fill(project)
@@ -116,7 +129,8 @@ def test_model_tables_become_outputs(project):
     assert all(k == k.lower() for k in conf["outputs"])
 
 
-def test_model_table_name_taken_by_another_script(project):
+def test_model_table_name_taken_by_another_script(project: Project) -> None:
+    """Deux scripts avec une table du meme nom gardent chacun leur sortie."""
     # deux scripts laissent une table Dates : chacune garde sa sortie
     (project / "script_qvd/autre.qvs").write_text(
         "Dates:\nLOAD Jour FROM [lib://src/jours.qvd] (qvd);\n"
@@ -129,7 +143,8 @@ def test_model_table_name_taken_by_another_script(project):
     assert "dates" not in conf["outputs"]
 
 
-def test_produced_file_waits_for_its_writer(project):
+def test_produced_file_waits_for_its_writer(project: Project) -> None:
+    """Un fichier relu n'est declare qu'une fois le script qui l'ecrit traduit."""
     # synthese relit ce que ventes ecrit : tant que ventes n'est pas
     # traduit, on ne fige pas un schema devine
     res = fill(project)
@@ -139,7 +154,8 @@ def test_produced_file_waits_for_its_writer(project):
 
 
 @pytest.mark.spark
-def test_produced_file_gets_exact_spark_types(project):
+def test_produced_file_gets_exact_spark_types(project: Project) -> None:
+    """Un fichier relu prend les types exacts de la requete Spark qui l'ecrit."""
     fill(project)
     project.run("prepare.py", "script_qvd/ventes.qvs")
     project.run("check.py", "work/ventes", "--parse")
@@ -164,7 +180,8 @@ def test_produced_file_gets_exact_spark_types(project):
     }
 
 
-def test_types_from_script_comparisons_and_shared_fields(project):
+def test_types_from_script_comparisons_and_shared_fields(project: Project) -> None:
+    """Les types se devinent des comparaisons du script et des champs du meme nom."""
     (project / "script_qvd/c.qvs").write_text(
         "C:\nLOAD Statut, Qte, DateCde, Site FROM [lib://src/c.qvd] (qvd)\n"
         "WHERE Statut = 'OK' and Qte > 0 and DateCde >= '01/01/2024';\n"
@@ -178,13 +195,15 @@ def test_types_from_script_comparisons_and_shared_fields(project):
     assert "Site: STRING" in text and "meme champ que dans" in text
 
 
-def test_types_from_csv_values(project):
+def test_types_from_csv_values(project: Project) -> None:
+    """Les types d'un CSV se deduisent de ses valeurs."""
     fill(project)
     text = (project / "conf/schemas/ref_sites_2024.yml").read_text(encoding="utf-8")
     assert "Site: STRING" in text and "deduit des 3 ligne(s)" in text
 
 
-def test_types_from_parquet_metadata(project):
+def test_types_from_parquet_metadata(project: Project) -> None:
+    """Les types d'un Parquet se lisent dans ses metadonnees."""
     import pandas as pd
 
     (project / "script_qvd/produits.qvs").write_text(
@@ -221,7 +240,8 @@ def test_types_from_parquet_metadata(project):
     }
 
 
-def test_unknown_location_variable_is_reported(project):
+def test_unknown_location_variable_is_reported(project: Project) -> None:
+    """Une variable de location inconnue est signalee."""
     (project / "conf/io.yml").write_text(
         "inputs:\n  dummy:\n    location: ${lac}/dummy\n", encoding="utf-8"
     )
@@ -233,7 +253,8 @@ def test_unknown_location_variable_is_reported(project):
     assert "${lac} inconnue(s)" in res.stdout
 
 
-def test_no_function_name_taken_for_a_column():
+def test_no_function_name_taken_for_a_column() -> None:
+    """Un nom de fonction n'est jamais pris pour une colonne."""
     from fill_conf import type_hints
 
     hints = type_hints(
@@ -243,7 +264,8 @@ def test_no_function_name_taken_for_a_column():
     assert "x" in hints
 
 
-def test_csv_types_read_the_whole_file(project):
+def test_csv_types_read_the_whole_file(project: Project) -> None:
+    """Une seule valeur texte, meme loin dans le fichier, met la colonne en string."""
     # une seule valeur texte, loin dans le fichier, met la colonne en string
     lines = "".join(f"{k}\n" for k in range(6000)) + "N/A\n"
     (project / "data/input/gros.csv").write_text("Num\n" + lines)

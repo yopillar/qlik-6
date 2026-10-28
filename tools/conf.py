@@ -17,8 +17,10 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 CONF = Path("conf")
 IO_FILE = CONF / "io.yml"
@@ -105,7 +107,8 @@ def resolve_location(location: str, variables: dict | None = None) -> str:
     sinon les variables d'environnement. Une variable inconnue reste telle
     quelle, et le chemin n'existera simplement pas."""
 
-    def repl(m):
+    def repl(m: re.Match[str]) -> str:
+        """Valeur d'une variable ${x}."""
         name = m.group(1)
         if variables and name in variables:
             return variables[name]
@@ -116,6 +119,8 @@ def resolve_location(location: str, variables: dict | None = None) -> str:
 
 @dataclass
 class IoEntry:
+    """Une entree ou une sortie de io.yml."""
+
     name: str
     kind: str  # "input" ou "output"
     location: str
@@ -137,7 +142,8 @@ def io_key(text: str) -> str:
     return re.sub(r"[\W_]+", "_", _stem(text), flags=re.ASCII).strip("_")
 
 
-def _load_yaml(path: Path):
+def _load_yaml(path: Path) -> Any:
+    """Contenu d'un fichier YAML, ou {} s'il est vide."""
     try:
         import yaml
     except ImportError as exc:
@@ -147,7 +153,7 @@ def _load_yaml(path: Path):
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
-def _schema_columns(data) -> tuple[list[str], dict[str, str]]:
+def _schema_columns(data: Any) -> tuple[list[str], dict[str, str]]:
     """Colonnes d'un schema dans l'ordre, avec leur type, quelle que soit la
     forme du schema."""
     if isinstance(data, dict):
@@ -184,7 +190,8 @@ def _schema_columns(data) -> tuple[list[str], dict[str, str]]:
     return [], {}
 
 
-def _entries(section, kind: str):
+def _entries(section: Any, kind: str) -> Iterator[IoEntry]:
+    """Entrees d'une section de io.yml, en dictionnaire ou en liste."""
     if isinstance(section, dict):
         items = [(str(k), v) for k, v in section.items()]
     elif isinstance(section, list):
@@ -210,7 +217,12 @@ class IoConf:
     """Entrees et sorties de io.yml, qu'on retrouve a partir du nom de
     fichier utilise dans le script Qlik."""
 
-    def __init__(self, path: Path = IO_FILE):
+    def __init__(self, path: Path = IO_FILE) -> None:
+        """Lit io.yml et les schemas qu'il cite.
+
+        Args:
+            path: le fichier io.yml.
+        """
         self.path = path
         self.inputs: list[IoEntry] = []
         self.outputs: list[IoEntry] = []
@@ -232,6 +244,7 @@ class IoConf:
 
     @property
     def enabled(self) -> bool:
+        """Vrai si io.yml declare au moins une entree ou une sortie."""
         return bool(self.inputs or self.outputs)
 
     def _load_schema(self, entry: IoEntry) -> None:
@@ -264,6 +277,11 @@ class IoConf:
 
 
 def main() -> int:
+    """Affiche ce qui a ete compris de conf/io.yml.
+
+    Returns:
+        0.
+    """
     conf = IoConf()
     if not conf.path.exists():
         print(f"{conf.path} absent : regle par defaut data/input, data/output.")

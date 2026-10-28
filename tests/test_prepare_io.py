@@ -3,16 +3,19 @@ encodages, formats des sources."""
 
 import json
 
+from conftest import Project
 from prepare import source_format
 
 
-def stores(project, *scripts):
+def stores(project: Project, *scripts: str) -> dict[str, list[str]]:
+    """Fichiers ecrits par chaque script, d'apres prepare.py --collect."""
     project.run("prepare.py", "--collect", *scripts)
     data = json.loads((project / "work/stores.json").read_text(encoding="utf-8"))
     return {k: v["writes"] for k, v in data.items()}
 
 
-def test_store_all_tables_loop(project):
+def test_store_all_tables_loop(project: Project) -> None:
+    """La boucle NoOfTables / TableName qui ecrit toutes les tables est deroulee."""
     # la boucle classique qui ecrit toutes les tables restantes
     (project / "script_qvd/boucle.qvs").write_text("""
 A: LOAD x FROM [lib://s/a.csv] (txt);
@@ -30,7 +33,8 @@ NEXT i
     ]
 
 
-def test_utf16_and_bom_scripts(project):
+def test_utf16_and_bom_scripts(project: Project) -> None:
+    """Les scripts en UTF-16 ou avec BOM sont lus."""
     (project / "script_qvd/u16.qvs").write_text(
         "E: LOAD v FROM [lib://s/e.csv] (txt);\n"
         "STORE E INTO [lib://qvd/E.qvd] (qvd);\n",
@@ -44,7 +48,8 @@ def test_utf16_and_bom_scripts(project):
     assert found == {"u16.qvs": ["lib://qvd/e.qvd"], "bom.qvs": ["lib://qvd/d.qvd"]}
 
 
-def test_source_format_from_qlik_spec():
+def test_source_format_from_qlik_spec() -> None:
+    """Le format et les options d'une source viennent de la specification Qlik."""
     assert source_format(
         "lib://s/Clients#2024.csv",
         "txt, codepage is 28591, embedded labels, delimiter is ';', msq",

@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -56,7 +57,7 @@ def guess_sep(path: Path) -> str:
     return best if counts[best] else ","
 
 
-def read_any(path: Path, sep: str) -> pd.DataFrame:
+def read_any(path: Path, sep: str | None) -> pd.DataFrame:
     """Lit un QVD, un CSV ou un Parquet (fichier seul ou dossier de part-*)."""
     suffix = path.suffix.lower()
     if suffix == ".qvd":
@@ -296,11 +297,11 @@ def _has_tabulate() -> bool:
 def compare_files(
     qlik: Path,
     spark: Path,
-    sep=None,
-    decimals=6,
-    ignore=(),
-    date_formats=(),
-    strict_order=False,
+    sep: str | None = None,
+    decimals: int = 6,
+    ignore: Sequence[str] = (),
+    date_formats: Sequence[str | None] = (),
+    strict_order: bool = False,
 ) -> tuple[bool, str, str]:
     """Compare deux fichiers (ou dossiers) et renvoie (identique, rapport en
     markdown, verdict sur l'ordre). date_formats : formats Qlik
@@ -326,7 +327,15 @@ def compare_files(
     return ok, text, order
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("qlik", type=Path, help="sortie Qlik : .qvd ou .csv")
     p.add_argument("spark", type=Path, help="sortie PySpark : dossier ou fichier")

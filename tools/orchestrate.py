@@ -1,6 +1,7 @@
-"""Genere src/<nom-projet>/job.py, le job unique du projet.
+"""Genere le job du projet : src/<nom-projet>/job.py et un fichier par
+script dans src/<nom-projet>/scripts/.
 
-Ce job enchaine tous les scripts assembles, dans l'ordre de leurs
+Le job enchaine tous les scripts assembles, dans l'ordre de leurs
 dependances. L'ordre est calcule a partir de work/stores.json (rempli par
 prepare.py --collect), sans passer par le modele : si le script A ecrit un
 fichier que B lit, A passe avant B. C'est ce que faisait l'enchainement des
@@ -8,7 +9,7 @@ taches de rechargement cote Qlik. Les entrees et les etapes de chaque script
 sont lues dans work/<script>/assembly.json, ecrit par assemble.py.
 
 Usage :
-    python tools/orchestrate.py          # ecrit src/<nom-projet>/job.py
+    python tools/orchestrate.py          # ecrit src/<nom-projet>/
 """
 
 from __future__ import annotations
@@ -22,7 +23,13 @@ from pathlib import Path
 STORES = Path("work/stores.json")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from job_template import JOB, project_dir, project_name  # noqa: E402
+from job_template import (  # noqa: E402
+    module_name,
+    project_dir,
+    project_name,
+    render_job,
+    render_script,
+)
 
 
 def order_scripts(io: dict) -> tuple[list[tuple[str, list[str]]], list[str]]:
@@ -30,7 +37,8 @@ def order_scripts(io: dict) -> tuple[list[tuple[str, list[str]]], list[str]]:
 
     # Meme rapprochement que dans prepare.py : meme chemin, ou meme nom de
     # fichier sans tenir compte de l'extension ni de la casse.
-    def stem(path):
+    def stem(path: str) -> str:
+        """Nom de fichier sans dossier, extension ni casse."""
         return re.sub(
             r"\.(qvd|txt|csv|parquet|xlsx?)$",
             "",
@@ -70,7 +78,15 @@ def order_scripts(io: dict) -> tuple[list[tuple[str, list[str]]], list[str]]:
     return order, cycles
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args(argv)
     if not STORES.exists():
         print(
@@ -85,31 +101,36 @@ def main(argv=None) -> int:
     ready = [(s, d) for s, d in order if assembled[s].exists()]
     missing = [s for s, _ in order if not assembled[s].exists()]
 
-    blocks = []
-    for s, d in ready:
-        a = json.loads(assembled[s].read_text(encoding="utf-8"))
-        inputs = "\n".join(
-            f"            {v!r}: {io_name!r}," for v, io_name in a["inputs"].items()
-        )
-        steps = "\n".join(f"            {tuple(st)!r}," for st in a["steps"])
-        blocks.append(
-            f"    {stem[s]!r}: {{\n"
-            f'        "depends_on": {[stem[x] for x in d]!r},\n'
-            f'        "inputs": {{\n{inputs}\n        }},\n'
-            f'        "steps": [\n{steps}\n        ],\n    }},'
-        )
     out = project_dir()
-    out.mkdir(parents=True, exist_ok=True)
-    # src/<nom-projet>/ est un package Python, comme dp_test. On ne cree le
-    # __init__.py que s'il manque, pour ne pas ecraser ce qu'on y aurait mis.
-    if not (out / "__init__.py").exists():
-        (out / "__init__.py").write_text(
-            f'"""Projet {project_name()} migre depuis Qlik."""\n', encoding="utf-8"
+    modules = out / "scripts"
+    modules.mkdir(parents=True, exist_ok=True)
+    # src/<nom-projet>/ et scripts/ sont des packages Python, comme dp_test.
+    # On ne cree un __init__.py que s'il manque, pour ne rien ecraser.
+    for package, doc in (
+        (out, f"Projet {project_name()} migre depuis Qlik."),
+        (modules, "Scripts Qlik du projet, un module par script."),
+    ):
+        if not (package / "__init__.py").exists():
+            (package / "__init__.py").write_text(f'"""{doc}"""\n', encoding="utf-8")
+    module = {s: module_name(stem[s]) for s in io}
+    code: dict[Path, str] = {}
+    for s, _ in ready:
+        a = json.loads(assembled[s].read_text(encoding="utf-8"))
+        code[modules / f"{module[s]}.py"] = render_script(
+            Path(s).name, a["inputs"], a["steps"]
         )
-    code = JOB.format(project=project_name(), scripts="\n".join(blocks))
-    # on s'assure que le job compile avant de l'ecrire
-    compile(code, str(out / "job.py"), "exec")
-    (out / "job.py").write_text(code, encoding="utf-8")
+    code[out / "job.py"] = render_job(
+        project_name(), [(module[s], [module[x] for x in d]) for s, d in ready]
+    )
+    # on s'assure que tout compile avant d'ecrire quoi que ce soit
+    for path, text in code.items():
+        compile(text, str(path), "exec")
+    # un script qui n'est plus assemble ne doit pas rester dans scripts/
+    for old in modules.glob("*.py"):
+        if old.name != "__init__.py" and old not in code:
+            old.unlink()
+    for path, text in code.items():
+        path.write_text(text, encoding="utf-8")
 
     print(f"{out}/job.py : {len(ready)} script(s) dans l'ordre :")
     for s, d in ready:

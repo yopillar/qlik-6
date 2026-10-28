@@ -1,9 +1,12 @@
+"""Comparaison des sorties Spark avec les exports Qlik."""
+
 import pandas as pd
 
 from compare import compare, strptime_format
 
 
-def test_strptime_format():
+def test_strptime_format() -> None:
+    """Un format de date Qlik se traduit pour strptime, sauf noms de mois et millisecondes."""
     assert strptime_format("DD/MM/YYYY") == "%d/%m/%Y"
     assert strptime_format("YYYY-MM-DD hh:mm:ss") == "%Y-%m-%d %H:%M:%S"
     # noms de mois, millisecondes : on ne devine pas
@@ -11,32 +14,37 @@ def test_strptime_format():
     assert strptime_format("DD/MM/YYYY hh:mm:ss[.fff]") is None
 
 
-def test_text_dates_of_qlik_export_match_spark_dates():
+def test_text_dates_of_qlik_export_match_spark_dates() -> None:
+    """Les dates texte d'un export Qlik se comparent aux dates Spark avec le DateFormat."""
     qlik = pd.DataFrame({"Jour": ["29/12/2024", "30/12/2024"]})
     spark = pd.DataFrame({"Jour": pd.to_datetime(["2024-12-29", "2024-12-30"])})
     assert not compare(qlik, spark, 6, [])[0]
     assert compare(qlik, spark, 6, [], ["%d/%m/%Y"])[0]
 
 
-def test_column_partly_like_dates_stays_text():
+def test_column_partly_like_dates_stays_text() -> None:
+    """Une colonne dont seules certaines valeurs ressemblent a des dates reste du texte."""
     qlik = pd.DataFrame({"Code": ["01/02/2024", "ABC"]})
     spark = pd.DataFrame({"Code": ["01/02/2024", "ABC"]})
     assert compare(qlik, spark, 6, [], ["%d/%m/%Y"])[0]
 
 
-def test_duplicates_are_counted():
+def test_duplicates_are_counted() -> None:
+    """Deux lignes identiques cote Qlik contre une seule cote Spark font un ecart."""
     qlik = pd.DataFrame({"a": ["x", "x"]})
     spark = pd.DataFrame({"a": ["x"]})
     assert not compare(qlik, spark, 6, [])[0]
 
 
-def spark_side(rows, order):
+def spark_side(rows: list[str], order: list[int]) -> pd.DataFrame:
+    """Sortie Spark d'une colonne a, avec son ordre de chargement."""
     df = pd.DataFrame({"a": rows})
     df["_qlik_order"] = [[o] for o in order]
     return df
 
 
-def test_order_checked_on_qlik_order():
+def test_order_checked_on_qlik_order() -> None:
+    """L'ordre est verifie sur _qlik_order, quel que soit l'ordre du fichier."""
     qlik = pd.DataFrame({"a": ["x", "y", "z"]})
     # fichier ecrit dans le desordre, mais _qlik_order donne le bon ordre
     ok, report, order = compare(
@@ -45,7 +53,8 @@ def test_order_checked_on_qlik_order():
     assert ok and order == "identique"
 
 
-def test_order_gap_reported_and_strict():
+def test_order_gap_reported_and_strict() -> None:
+    """Un ecart d'ordre est signale, et ne compte qu'avec strict_order."""
     qlik = pd.DataFrame({"a": ["x", "y"]})
     spark = spark_side(["x", "y"], [2, 1])
     ok, report, order = compare(qlik, spark, 6, ["_qlik_order"])
@@ -55,13 +64,15 @@ def test_order_gap_reported_and_strict():
     assert not ok and order == "different"
 
 
-def test_order_array_compared_element_by_element():
+def test_order_array_compared_element_by_element() -> None:
+    """_qlik_order se trie nombre par nombre, pas comme du texte."""
     # [1, 10] passe apres [1, 2] : tri numerique, pas sur le texte
     qlik = pd.DataFrame({"a": ["x", "y"]})
     spark = pd.DataFrame({"a": ["y", "x"], "_qlik_order": [[1, 10], [1, 2]]})
     assert compare(qlik, spark, 6, ["_qlik_order"])[2] == "identique"
 
 
-def test_order_not_checked_without_column():
+def test_order_not_checked_without_column() -> None:
+    """Sans _qlik_order, l'ordre n'est pas verifie."""
     qlik = pd.DataFrame({"a": ["x"]})
     assert compare(qlik, pd.DataFrame({"a": ["x"]}), 6, [])[2] == "non verifie"

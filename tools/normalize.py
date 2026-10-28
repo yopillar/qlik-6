@@ -60,6 +60,7 @@ def check_collisions(moves: list[tuple[Path, Path]]) -> list[str]:
 
 
 def rename(old: Path, new: Path) -> None:
+    """Renomme un fichier, meme sur un disque insensible a la casse."""
     # Passage par un nom temporaire : sur un disque insensible a la casse,
     # renommer Ventes.qvs en ventes.qvs directement ne fait rien.
     tmp = old.with_name(old.name + ".renommage")
@@ -67,7 +68,15 @@ def rename(old: Path, new: Path) -> None:
     tmp.rename(new)
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument(
         "--dry-run", action="store_true", help="afficher les renommages sans les faire"

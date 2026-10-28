@@ -1,13 +1,20 @@
+"""Traduction et prompts produits par prepare.py."""
+
 import json
+from typing import Any
+
+from conftest import Project
 
 
-def manifest(project, script):
+def manifest(project: Project, script: str) -> dict[str, Any]:
+    """Le manifest d'un script de la demo."""
     return json.loads(
         (project / f"work/{script}/manifest.json").read_text(encoding="utf-8")
     )
 
 
-def test_demo_translated_without_model(project):
+def test_demo_translated_without_model(project: Project) -> None:
+    """Le projet de demo se traduit entierement sans modele."""
     for script in ("calendrier", "synthese.txt", "ventes.qvs"):
         project.run("prepare.py", f"script_qvd/{script}")
     for script in ("calendrier", "synthese", "ventes"):
@@ -15,18 +22,21 @@ def test_demo_translated_without_model(project):
         assert statuses <= {"deterministic", "skip"}, (script, statuses)
 
 
-def test_exit_script_ignores_the_rest(project):
+def test_exit_script_ignores_the_rest(project: Project) -> None:
+    """Tout ce qui suit EXIT SCRIPT est ignore."""
     project.run("prepare.py", "script_qvd/synthese.txt")
     tables = [s.get("table") for s in manifest(project, "synthese")["sections"]]
     assert "Ignore" not in " ".join(map(str, tables))
 
 
-def test_date_format_kept_for_comparison(project):
+def test_date_format_kept_for_comparison(project: Project) -> None:
+    """Le DateFormat du script est garde dans le manifest."""
     project.run("prepare.py", "script_qvd/calendrier")
     assert manifest(project, "calendrier")["date_format"] == "DD/MM/YYYY"
 
 
-def test_wide_table_prompt_lists_only_used_columns(project):
+def test_wide_table_prompt_lists_only_used_columns(project: Project) -> None:
+    """Sur une table de 322 colonnes, le prompt ne cite que celles utilisees."""
     cols = [f"Col{i:03d}" for i in range(322)]
     (project / "conf/schemas/large.yml").write_text(
         "columns:\n" + "".join(f"  {c}: STRING\n" for c in cols)
@@ -59,7 +69,8 @@ def test_wide_table_prompt_lists_only_used_columns(project):
         assert len(text) < 6000, (name, len(text))
 
 
-def test_prompt_without_store_drop_and_one_context_line(project):
+def test_prompt_without_store_drop_and_one_context_line(project: Project) -> None:
+    """Le prompt ne montre ni STORE ni DROP, et une seule ligne de contexte."""
     (project / "script_qvd/boucle.qvs").write_text("""
 SUB Charge(vT)
   [$(vT)]:

@@ -42,10 +42,19 @@ from orchestrate import STORES, order_scripts  # noqa: E402
 
 
 def run(script: str, *args: str) -> int:
+    """Lance un outil du kit et renvoie son code retour."""
     return subprocess.run([sys.executable, str(TOOLS / script), *args]).returncode
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
     p.add_argument("--pilot", type=int, help="nombre de tables, puis arret")

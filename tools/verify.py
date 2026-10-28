@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from compare import compare_files  # noqa: E402
 from conf import resolve_location, work_dir  # noqa: E402
-from job_template import project_dir  # noqa: E402
+from job_template import module_name, project_dir  # noqa: E402
 
 QLIK_DIR = Path("data") / "qlik_outputs"
 EXTENSIONS = (".qvd", ".csv", ".txt", ".parquet")
@@ -55,7 +55,15 @@ def find_reference(name: str) -> Path | None:
     return None
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("workdir", type=Path, help="work/<script>")
     p.add_argument(
@@ -103,10 +111,10 @@ def main(argv=None) -> int:
             )
             return 2
         print(f"Execution de {job} ...")
-        res = subprocess.run([sys.executable, str(job), "--only", stem])
+        res = subprocess.run([sys.executable, str(job), "--only", module_name(stem)])
         if res.returncode:
-            # Le job isole ses etapes, donc il a pu ecrire une partie des
-            # sorties : on compare quand meme ce qui existe.
+            # Le script s'est arrete a l'etape en echec, mais il a pu ecrire
+            # les sorties d'avant : on compare quand meme ce qui existe.
             print(
                 "[!] Une ou plusieurs etapes du job ont echoue (voir la trace "
                 "ci-dessus) : comparaison de ce qui a ete produit."

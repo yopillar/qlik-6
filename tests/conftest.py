@@ -19,12 +19,14 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
 DEMO = Path(__file__).resolve().parent / "demo"
-FAKELIB = Path(__file__).resolve().parent / "fakelib"
 
 sys.path.insert(0, str(TOOLS))
 
 
-def pytest_collection_modifyitems(config, items):
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Saute les tests Spark quand pyspark n'est pas installe."""
     # sans pyspark, les tests Spark sont sautes plutot qu'en echec
     if importlib.util.find_spec("pyspark") is None:
         skip = pytest.mark.skip(reason="pyspark absent")
@@ -36,15 +38,18 @@ def pytest_collection_modifyitems(config, items):
 class Project:
     """Un projet de demo dans un dossier temporaire."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path) -> None:
+        """Projet copie dans path."""
         self.path = path
 
-    def run(self, tool: str, *args: str, check: bool = True):
-        """Lance tools/<tool> depuis la racine du projet, avec le faux
-        spark_foundation dans le PYTHONPATH."""
+    def run(
+        self, tool: str, *args: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """Lance tools/<tool> depuis la racine du projet, avec core/ et
+        commons/ du depot dans le PYTHONPATH (le job genere les importe)."""
         env = dict(
             os.environ,
-            PYTHONPATH=str(FAKELIB),
+            PYTHONPATH=str(ROOT),
             entrees="data/input",
             sorties="data/output",
         )
@@ -62,12 +67,40 @@ class Project:
             )
         return res
 
-    def __truediv__(self, other):
+    def run_job(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Lance le job genere src/demo/job.py.
+
+        Args:
+            args: ses arguments (--only ventes...).
+
+        Returns:
+            Le resultat du processus ; une erreur s'il a echoue.
+        """
+        env = dict(
+            os.environ,
+            PYTHONPATH=str(ROOT),
+            entrees="data/input",
+            sorties="data/output",
+        )
+        res = subprocess.run(
+            [sys.executable, "src/demo/job.py", *args],
+            cwd=self.path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode:
+            raise AssertionError(f"job.py {' '.join(args)}\n{res.stderr[-3000:]}")
+        return res
+
+    def __truediv__(self, other: str) -> Path:
+        """Chemin d'un fichier du projet : project / "conf/io.yml"."""
         return self.path / other
 
 
 @pytest.fixture
-def project(tmp_path) -> Project:
+def project(tmp_path: Path) -> Project:
+    """Le projet de demo, copie dans un dossier temporaire."""
     path = tmp_path / "demo"
     shutil.copytree(DEMO, path)
     return Project(path)

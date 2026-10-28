@@ -24,6 +24,12 @@ FIELDS = [
 
 
 def update(path: Path, row: dict) -> None:
+    """Ajoute ou met a jour la ligne (script, section) du journal.
+
+    Args:
+        path: work/journal.csv.
+        row: les colonnes a ecrire ; les autres gardent leur valeur.
+    """
     rows = []
     if path.exists():
         with path.open(encoding="utf-8", newline="") as f:

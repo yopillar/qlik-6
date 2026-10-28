@@ -44,7 +44,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
-from check import check_section, get_parser  # noqa: E402
+from check import SparkChecker, check_section, get_parser  # noqa: E402
 from conf import work_dir  # noqa: E402
 from prepare import fill_holes, hole_key, load_cache  # noqa: E402
 
@@ -127,7 +127,8 @@ def parse_events(stdout: str) -> dict:
         "output_tokens": None,
     }
 
-    def walk(obj):
+    def walk(obj: Any) -> None:
+        """Parcourt un evenement JSON et note ce qu'il contient."""
         if isinstance(obj, dict):
             kind = str(obj.get("type", "")).lower()
             if kind == "text" and isinstance(obj.get("text"), str):
@@ -230,6 +231,7 @@ def ctes_of(sql: str) -> list[tuple[str, int, int]]:
 
 
 def todo_ctes(draft: str) -> list[str]:
+    """Noms des CTE du brouillon qui contiennent un TODO(model)."""
     return [name for name, a, b in ctes_of(draft) if "TODO(model)" in draft[a:b]]
 
 
@@ -273,7 +275,7 @@ def splice(draft: str, answer: str) -> tuple[str, list[str]]:
     return sql, missing
 
 
-def answer_sql(ok: bool, log: str, events: dict):
+def answer_sql(ok: bool, log: str, events: dict) -> tuple[str | None, str | None, bool]:
     """Renvoie le texte de la reponse, la requete extraite, et un booleen
     qui dit si la requete vient d'une tentative d'ecriture de fichier (outil
     refuse) plutot que du texte."""
@@ -294,7 +296,7 @@ def answer_sql(ok: bool, log: str, events: dict):
     return answer, None, False
 
 
-def run_opencode(message: str, args) -> tuple[bool, str, dict]:
+def run_opencode(message: str, args: argparse.Namespace) -> tuple[bool, str, dict]:
     """Fait un appel au modele. Renvoie (succes, sortie brute, evenements)."""
     cmd = [args.opencode_bin, "run", "--agent", args.agent]
     if args.model:
@@ -339,11 +341,14 @@ def run_opencode(message: str, args) -> tuple[bool, str, dict]:
 class Calls:
     """Les appels au modele pour une table, avec un log numerote par appel."""
 
-    def __init__(self, d: Path, sec: dict, args):
+    def __init__(self, d: Path, sec: dict, args: argparse.Namespace) -> None:
+        """Appels au modele pour la table sec, journalises dans d."""
         self.d, self.sec, self.args, self.n = d, sec, args, 0
         self.failures, self.last_note = 0, ""
 
-    def call(self, msg: str, holes: bool = False):
+    def call(
+        self, msg: str, holes: bool = False
+    ) -> tuple[bool, str, str | None, bool, str]:
         """Renvoie (ok, texte, sql extrait, reponse coupee, note).
 
         Avec holes=True on attend des lignes "hN: expression", pas une
@@ -453,7 +458,7 @@ def parse_holes(text: str) -> dict[str, str]:
     return {k: v.strip().rstrip(";,").strip() for k, v in out.items() if v.strip()}
 
 
-def translator_errors(sec: dict, path: Path, parser) -> list[str]:
+def translator_errors(sec: dict, path: Path, parser: SparkChecker | None) -> list[str]:
     """Erreurs deja presentes dans le brouillon, avant que le modele n'y
     touche. Elles viennent du traducteur : si on les lui renvoyait, il
     essaierait de les corriger et partirait dans tous les sens."""
@@ -462,7 +467,12 @@ def translator_errors(sec: dict, path: Path, parser) -> list[str]:
 
 
 def holes_phase(
-    calls: Calls, d: Path, sec: dict, args, parser, statement_left: bool
+    calls: Calls,
+    d: Path,
+    sec: dict,
+    args: argparse.Namespace,
+    parser: SparkChecker | None,
+    statement_left: bool,
 ) -> tuple[dict, list[str]]:
     """Le modele traduit les expressions que le traducteur a laissees.
     Renvoie (reponses acceptees {id: sql}, problemes restants)."""
@@ -540,7 +550,13 @@ def holes_phase(
     return answers, left
 
 
-def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
+def statement_phase(
+    calls: Calls,
+    d: Path,
+    sec: dict,
+    args: argparse.Namespace,
+    parser: SparkChecker | None,
+) -> list[str]:
     """Le modele complete les CTE TODO(model), c'est-a-dire des
     instructions entieres."""
     out, prompt_path = d / "query.sql", d / "prompt.md"
@@ -616,7 +632,12 @@ def statement_phase(calls: Calls, d: Path, sec: dict, args, parser):
     return errors
 
 
-def translate_section(workdir: Path, sec: dict, args, parser=None):
+def translate_section(
+    workdir: Path,
+    sec: dict,
+    args: argparse.Namespace,
+    parser: SparkChecker | None = None,
+) -> tuple[str, int, str, dict]:
     """Complete une table : les expressions isolees d'abord
     (holes_prompt.md), puis les instructions entieres (prompt.md) s'il y en
     a. Renvoie (statut, nombre d'appels, probleme, reponses aux
@@ -655,7 +676,7 @@ def translate_section(workdir: Path, sec: dict, args, parser=None):
     return "escalade", calls.n, " | ".join(problems or final)[:500], answers
 
 
-def selftest(args, quiet: bool = False) -> int:
+def selftest(args: argparse.Namespace, quiet: bool = False) -> int:
     """Pose une question bete a l'agent et affiche ce qui revient.
     Avec quiet=True, n'affiche rien si tout va bien (c'est le test lance
     avant chaque traduction)."""
@@ -687,7 +708,15 @@ def selftest(args, quiet: bool = False) -> int:
     return 0 if sql else 1
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument(
         "workdir", type=Path, nargs="?", default=Path("work"), help="work/<script>"
@@ -771,7 +800,8 @@ def main(argv=None) -> int:
     cache_path = args.workdir.parent / "expressions.json"
     cache = load_cache(args.workdir.parent)
 
-    def work(sec):
+    def work(sec: dict) -> tuple[dict, tuple[str, int, str, dict], int]:
+        """Traduit une table et mesure le temps pris."""
         t0 = time.perf_counter()
         result = translate_section(args.workdir, sec, args, parser)
         return sec, result, round(time.perf_counter() - t0)
