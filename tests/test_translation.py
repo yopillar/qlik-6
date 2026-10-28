@@ -5,10 +5,12 @@ import json
 
 import pytest
 
+from conftest import Project
 from qlik2sql import ExprCtx, Untranslatable, expr
 
 
-def test_addmonths_modes():
+def test_addmonths_modes() -> None:
+    """AddMonths et ses deux modes se traduisent ; un horodatage reste au modele."""
     ctx = ExprCtx()
     assert expr("AddMonths(d, 1)", ctx) == "add_months(d, 1)"
     assert expr("AddYears(d, 2)", ctx) == "add_months(d, 12 * (2))"
@@ -18,7 +20,8 @@ def test_addmonths_modes():
 
 
 @pytest.mark.spark
-def test_addmonths_values_like_qlik():
+def test_addmonths_values_like_qlik() -> None:
+    """AddMonths donne sous Spark les valeurs de la documentation Qlik."""
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.master("local[1]").getOrCreate()
@@ -36,7 +39,8 @@ def test_addmonths_values_like_qlik():
         assert row is not None and str(row["d"]) == expected, qlik
 
 
-def test_check_refuses_invented_date_functions(project):
+def test_check_refuses_invented_date_functions(project: Project) -> None:
+    """check.py refuse add_month, month_add et autres fonctions inventees."""
     project.run("prepare.py", "script_qvd/ventes.qvs")
     manifest = json.loads(
         (project / "work/ventes/manifest.json").read_text(encoding="utf-8")
@@ -54,10 +58,11 @@ def test_check_refuses_invented_date_functions(project):
     assert "add_month() inconnue de Spark" in res.stdout
 
 
-def test_job_template_has_spark_submit():
-    from job_template import JOB
+def test_job_template_has_spark_submit() -> None:
+    """Le job genere compile et rappelle la commande spark-submit."""
+    from job_template import render_job
 
-    code = JOB.format(project="demo", scripts="")
+    code = render_job("demo", [("ventes", []), ("synthese", ["ventes"])])
     compile(code, "job.py", "exec")
     head = code.split('"""')[1]
     assert "spark-submit" in head and "src/demo/job.py" in head

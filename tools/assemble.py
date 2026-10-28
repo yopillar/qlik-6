@@ -33,7 +33,15 @@ from conf import work_dir  # noqa: E402
 from job_template import project_dir  # noqa: E402
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("workdir", type=Path, help="work/<script>")
     p.add_argument(

@@ -38,10 +38,17 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conf import WORK, IoConf, find_scripts, resolve_location, safe_name  # noqa: E402
+from conf import (  # noqa: E402
+    WORK,
+    IoConf,
+    IoEntry,
+    find_scripts,
+    resolve_location,
+    safe_name,
+)
 from qlik2sql import (
     FEW_COLUMNS,
     SectionContext,  # noqa: E402
@@ -114,6 +121,8 @@ NAME = r"(\[[^\]]+\]|\"[^\"]+\"|[^\s,;()\[\]\"'=]+)"
 
 @dataclass
 class Stmt:
+    """Une instruction du script Qlik, telle qu'ecrite."""
+
     raw: str
     line: int  # ligne du premier caractere de raw
     first_line: int  # ligne du premier caractere qui n'est pas un blanc
@@ -121,19 +130,23 @@ class Stmt:
 
     @property
     def clean(self) -> str:
+        """Le texte sans commentaires, blancs ramenes a une espace."""
         return normalize(strip_comments(self.raw))
 
     @property
     def word(self) -> str:
+        """Le premier mot, en majuscules (LOAD, SET, IF...)."""
         return first_word(self.clean)
 
 
 def first_word(text: str) -> str:
+    """Premier mot d'un texte, en majuscules."""
     m = re.match(r"\s*([A-Za-z]+)", text)
     return m.group(1).upper() if m else ""
 
 
 def normalize(text: str) -> str:
+    """Ramene tous les blancs a une seule espace."""
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -173,7 +186,8 @@ def tokenize(text: str) -> list[Stmt]:
     quote: str | None = None
     useful: list[str] = []
 
-    def flush(end):
+    def flush(end: int) -> None:
+        """Termine l'instruction en cours a la position end."""
         nonlocal start, start_line, first_line, useful
         if "".join(useful).strip():
             stmts.append(Stmt(text[start:end], start_line, first_line or line, line))
@@ -269,18 +283,33 @@ def merge_preceding_loads(stmts: list[Stmt]) -> list[Stmt]:
 
 @dataclass
 class Node:
+    """Un noeud de l'arbre du script : instruction ou bloc de controle."""
+
     kind: str  # stmt | for | if | sub | do | switch
     stmt: Stmt | None = None  # l'instruction, ou l'en-tete du bloc
     branches: list = field(default_factory=list)  # [(en-tete, [Node])]
     closer: Stmt | None = None
 
 
+# SUB du script : nom en minuscules -> (nom, parametres, corps).
+Subs = dict[str, tuple[str, list[str], list[Node]]]
+
+
 def parse_blocks(stmts: list[Stmt]) -> tuple[list[Node], list[str]]:
+    """Range les instructions en arbre de blocs (IF, FOR, SUB, DO...).
+
+    Args:
+        stmts: les instructions du script, dans l'ordre.
+
+    Returns:
+        (noeuds racine, avertissements sur les blocs mal fermes).
+    """
     root: list[Node] = []
     stack: list[tuple[Node, list[Node]]] = []
     warnings = []
 
-    def current():
+    def current() -> list[Node]:
+        """Liste ou ajouter le prochain noeud."""
         return stack[-1][1] if stack else root
 
     for st in stmts:
@@ -352,12 +381,16 @@ class Inst:
     join_keys: list[str] | None = None
     directory: str = ""
     warnings: list[str] = field(default_factory=list)
+    # texte sans commentaires, rempli juste avant la traduction
+    clean_text: str = ""
 
 
 LET_TOKEN = re.compile(r"'[^']*'|\[[^\]]*\]|\"[^\"]*\"|([^\W\d][\w.#]*)\s*(\()?")
 
 
 class Env:
+    """Variables du script (SET, LET) et DIRECTORY courant."""
+
     def let_expression(self, name: str, text: str, pos: int) -> str | None:
         """Pour $(v) quand v est un LET calcule (LET v = Peek(...), Today(),
         NoOfRows(...)...) : on met l'expression a la place, elle sera traduite
@@ -384,31 +417,38 @@ class Env:
             return text
         clause = m.group(1)
 
-        def repl(w):
+        def repl(w: re.Match[str]) -> str:
+            """Valeur ou expression d'une variable nue."""
             name = w.group(0)
-            if self.vars.get(name) is not None:
-                return self.vars[name]
+            value = self.vars.get(name)
+            if value is not None:
+                return value
             return self.let_expression(name, "", 0) or name
 
         new = re.sub(r"(?<![\w$.'\[\"])[A-Za-z_][\w.]*(?![\w(])", repl, clause)
         return text[: m.start(1)] + new + text[m.end(1) :]
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Aucune variable au depart."""
         self.directory = ""  # dernier DIRECTORY rencontre
         self.vars: dict[str, str | None] = {}
         self.lets: dict[str, str] = {}
 
     def expand(self, text: str) -> str:
+        """Remplace les $(variable) du texte par leur valeur."""
+
         # '$(v)' tout seul entre apostrophes, avec v un LET calcule (date,
         # Peek...) : Qlik interprete la valeur, donc on met directement
         # l'expression.
-        def quoted(m):
+        def quoted(m: re.Match[str]) -> str:
+            """'$(v)' remplace par l'expression du LET v."""
             sub = self.let_expression(m.group(1), "", 0)
             return sub if sub else m.group(0)
 
         text = re.sub(r"'\$\(#?([A-Za-z_][\w.]*)\)'", quoted, text)
 
-        def repl(m):
+        def repl(m: re.Match[str]) -> str:
+            """$(v) ou $(v(args)) remplace par sa valeur."""
             name, args = m.group(2), m.group(4)
             if name in SYSTEM_VARS:
                 return m.group(0)
@@ -443,6 +483,7 @@ def _in_quotes(text: str, pos: int) -> bool:
 
 
 def unquote(v: str) -> str:
+    """Retire les apostrophes ou guillemets autour d'une valeur."""
     v = v.strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
         return v[1:-1]
@@ -482,7 +523,8 @@ def table_functions(text: str, out: list[Inst]) -> str:
     names = live_tables(out)
     text = re.sub(r"\bNoOfTables\s*\(\s*\)", str(len(names)), text, flags=re.I)
 
-    def name(m):
+    def name(m: re.Match[str]) -> str:
+        """TableName(n) remplace par le nom de la table."""
         n = int_value(m.group(1))
         return f"'{names[n]}'" if n is not None and 0 <= n < len(names) else m.group(0)
 
@@ -523,8 +565,29 @@ def eval_condition(cond: str) -> bool | None:
     return bool(compare(float(a), float(b)))
 
 
-def execute(nodes, env: Env, ctx, subs, out: list[Inst], notes: list[str], depth=0):
+def execute(
+    nodes: list[Node],
+    env: Env,
+    ctx: list[str],
+    subs: Subs,
+    out: list[Inst],
+    notes: list[str],
+    depth: int = 0,
+) -> None:
+    """Execute a blanc une liste de noeuds : variables, boucles, IF, SUB.
+
+    Args:
+        nodes: les noeuds a executer.
+        env: les variables.
+        ctx: le contexte (boucle, SUB, IF) des instructions produites.
+        subs: les SUB connues.
+        out: les instructions executees, completees au fil de l'eau.
+        notes: les remarques pour le rapport.
+        depth: profondeur d'appel des SUB.
+    """
     for node in nodes:
+        # seule la racine n'a pas d'instruction, et elle n'est jamais ici
+        assert node.stmt is not None
         if node.kind == "stmt":
             run_stmt(node.stmt, env, ctx, subs, out, notes, depth)
         elif node.kind == "sub":
@@ -545,7 +608,8 @@ def execute(nodes, env: Env, ctx, subs, out: list[Inst], notes: list[str], depth
                 out.append(control_inst(node.closer, env, ctx))
 
 
-def control_inst(st, env, ctx):
+def control_inst(st: Stmt, env: Env, ctx: list[str]) -> Inst:
+    """Instruction de controle (IF, FOR...) gardee dans la sortie."""
     inst = Inst(st, env.expand(st.raw), list(ctx))
     inst.kind = "control"
     return inst
@@ -554,12 +618,22 @@ def control_inst(st, env, ctx):
 class StopScript(Exception):
     """Levee sur un EXIT SCRIPT : Qlik s'arrete la."""
 
-    def __init__(self, line: int):
+    def __init__(self, line: int) -> None:
+        """EXIT SCRIPT a la ligne line."""
         super().__init__(line)
         self.line = line
 
 
-def run_stmt(st, env, ctx, subs, out, notes, depth):
+def run_stmt(
+    st: Stmt,
+    env: Env,
+    ctx: list[str],
+    subs: Subs,
+    out: list[Inst],
+    notes: list[str],
+    depth: int,
+) -> None:
+    """Execute une instruction : SET, LET, CALL, EXIT SCRIPT, ou la garde."""
     c = st.clean
     w = st.word
     if w == "EXIT" and re.match(r"\s*EXIT\s+SCRIPT\s*;?\s*$", c, re.I):
@@ -621,7 +695,18 @@ def run_stmt(st, env, ctx, subs, out, notes, depth):
     out.append(inst)
 
 
-def run_for(node, env, ctx, subs, out, notes, depth):
+def run_for(
+    node: Node,
+    env: Env,
+    ctx: list[str],
+    subs: Subs,
+    out: list[Inst],
+    notes: list[str],
+    depth: int,
+) -> None:
+    """Deroule une boucle FOR si ses valeurs sont connues, sinon la garde
+    une fois, signalee."""
+    assert node.stmt is not None
     head = table_functions(env.expand(node.stmt.clean), out)
     body = node.branches[0][1]
     values, var = None, None
@@ -645,6 +730,7 @@ def run_for(node, env, ctx, subs, out, notes, depth):
         a, b, s = (int(x) for x in bounds if x is not None)
         values = [str(v) for v in range(a, b + (1 if s > 0 else -1), s)] if s else None
     if values is not None and len(values) <= MAX_UNROLL:
+        assert var is not None
         for v in values:
             env.vars[var] = v
             execute(
@@ -667,7 +753,16 @@ def run_for(node, env, ctx, subs, out, notes, depth):
         out.append(control_inst(node.closer, env, ctx))
 
 
-def run_if(node, env, ctx, subs, out, notes, depth):
+def run_if(
+    node: Node,
+    env: Env,
+    ctx: list[str],
+    subs: Subs,
+    out: list[Inst],
+    notes: list[str],
+    depth: int,
+) -> None:
+    """Garde la branche d'un IF qu'on sait evaluer, sinon toutes."""
     undecided = False
     for header, body in node.branches:
         hc = env.expand(header.clean)
@@ -722,6 +817,7 @@ def run_if(node, env, ctx, subs, out, notes, depth):
 
 
 def strip_name(n: str) -> str:
+    """Nom sans crochets ni guillemets autour."""
     return n.strip().strip('[]"').strip()
 
 
@@ -761,6 +857,8 @@ def read_path(text: str, pos: int) -> tuple[str, int]:
 
 
 def split_top(s: str) -> list[str]:
+    """Decoupe sur les virgules qui ne sont ni entre parentheses ni entre
+    apostrophes, guillemets ou crochets."""
     parts: list[str] = []
     cur: list[str] = []
     depth, quote = 0, None
@@ -792,6 +890,8 @@ def mask_strings(s: str) -> str:
 
 
 def analyze(inst: Inst) -> None:
+    """Remplit la description d'une instruction : genre, table, sources,
+    jointures, ApplyMap, fonctions utilisees..."""
     c = normalize(strip_comments(inst.text))
     w = first_word(c)
     if inst.kind in ("variable", "control"):
@@ -1073,7 +1173,9 @@ def resolve_path(path: str, directory: str) -> str:
 # ==========================================================================
 
 
-def build_graph(insts: list[Inst]):
+def build_graph(
+    insts: list[Inst],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
     """Construit les tables du script.
 
     Une table supprimee (DROP) puis rechargee sous le meme nom est une
@@ -1086,10 +1188,17 @@ def build_graph(insts: list[Inst]):
     last = None
     anon = 0
 
-    def ref(name):
+    @overload
+    def ref(name: str) -> str: ...
+    @overload
+    def ref(name: None) -> None: ...
+    def ref(name: str | None) -> str | None:
+        """Cle de la version en cours d'une table."""
         return live.get(name, name) if name else name
 
-    def create(name):
+    def create(name: str) -> str:
+        """Cle d'une table chargee : la version en cours, ou une nouvelle
+        si elle a ete supprimee."""
         if name in live and not tables[live[name]]["dropped"]:
             return live[name]
         versions[name] = versions.get(name, 0) + 1
@@ -1225,9 +1334,9 @@ def build_graph(insts: list[Inst]):
             if inst.resident and inst.resident != key:
                 t["deps"].add(inst.resident)
             t["deps"].update(a["map"] for a in inst.applymaps)
-            other = getattr(inst, "keep_other", None)
-            if other and other != key:
-                t["deps"].add(other)
+            kept = inst.keep_other
+            if kept and kept != key:
+                t["deps"].add(kept)
             for keys in inst.exists_tables.values():
                 t["deps"].update(k_ for k_ in keys if k_ != key)
             t["deps"].update(k_ for k_ in inst.table_refs.values() if k_ != key)
@@ -1283,7 +1392,25 @@ def build_graph(insts: list[Inst]):
     return tables, schemas
 
 
-def build_sections(insts, tables, schemas):
+def build_sections(
+    insts: list[Inst],
+    tables: dict[str, dict[str, Any]],
+    schemas: dict[str, list[str]],
+) -> tuple[
+    list[str], dict[str, list[str]], dict[str, set[str]], dict[int, str], list[str]
+]:
+    """Regroupe les tables en sections, une par table livree (STORE ou
+    encore la a la fin), dans l'ordre ou elles peuvent etre calculees.
+
+    Args:
+        insts: les instructions executees.
+        tables: les tables du graphe.
+        schemas: les colonnes connues de chaque table.
+
+    Returns:
+        (ordre des sections, tables de chaque section, dependances entre
+        sections, section de chaque instruction, tables livrees).
+    """
     finals = [
         n
         for n, t in tables.items()
@@ -1294,7 +1421,8 @@ def build_sections(insts, tables, schemas):
         for d in t["deps"]:
             consumers.setdefault(d, set()).add(n)
 
-    def downstream(name, seen=None):
+    def downstream(name: str, seen: set[str] | None = None) -> set[str]:
+        """Tables livrees qui dependent, directement ou non, de name."""
         seen = seen if seen is not None else set()
         res: set[str] = set()
         for c in consumers.get(name, ()):
@@ -1392,6 +1520,7 @@ def build_sections(insts, tables, schemas):
 
 
 def slug(s: str) -> str:
+    """Nom court en minuscules, pour les identifiants de section."""
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")[:40] or "table"
 
 
@@ -1400,6 +1529,7 @@ OUTPUT_DIR = "data/output"
 
 
 def norm_path(path: str) -> str:
+    """Chemin compare sans tenir compte des separateurs ni de la casse."""
     return path.replace("\\", "/").strip().lower()
 
 
@@ -1516,7 +1646,9 @@ def is_output(path: str, stored: dict) -> bool:
     ).lower() in stored.get("names", ())
 
 
-def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
+def resolve_io(
+    path: str, stored: dict, conf: IoConf | None, store: bool = False
+) -> tuple[str, str, IoEntry | None]:
     """Associe un fichier Qlik a (location, format, entree io.yml ou None).
 
     On prend d'abord l'entree de conf/io.yml qui a le meme nom (dans les
@@ -1548,7 +1680,10 @@ def resolve_io(path: str, stored: dict, conf: IoConf | None, store=False):
     return f"{INPUT_DIR}/{file_stem(path)}", fmt or "parquet", None
 
 
-def map_path(path: str, stored: dict, conf: IoConf | None = None, store=False) -> str:
+def map_path(
+    path: str, stored: dict, conf: IoConf | None = None, store: bool = False
+) -> str:
+    """Location d'un fichier Qlik (voir resolve_io)."""
     return resolve_io(path, stored, conf, store)[0]
 
 
@@ -1558,12 +1693,12 @@ def map_path(path: str, stored: dict, conf: IoConf | None = None, store=False) -
 NOT_IN_PROMPT = {"store", "drop", "variable", "control", "connect", "include"}
 
 
-def prompt_insts(insts):
+def prompt_insts(insts: list[Inst]) -> list[Inst]:
     """Les instructions a montrer au modele."""
     return [i for i in insts if i.kind not in NOT_IN_PROMPT] or insts
 
 
-def numbered(insts_of_section) -> str:
+def numbered(insts_of_section: list[Inst]) -> str:
     """Code de la section sans commentaires ni lignes vides, avec les
     numeros de ligne du script d'origine."""
     lines = []
@@ -1577,6 +1712,7 @@ def numbered(insts_of_section) -> str:
 
 
 def load_skill(skills_dir: Path, name: str) -> str:
+    """Texte d'un skill, sans son en-tete."""
     f = skills_dir / name / "SKILL.md"
     if not f.exists():
         return ""
@@ -1667,6 +1803,7 @@ If information is missing to translate an expression safely, answer
 
 
 def hole_block(h: dict) -> str:
+    """Description d'une expression a traduire, pour holes_prompt.md."""
     types = h.get("types") or {}
     if h.get("columns"):
         # Sur une table large, seulement les colonnes que l'expression cite :
@@ -1722,7 +1859,16 @@ def fill_holes(sql: str, answers: dict[str, str]) -> str:
     return sql
 
 
-def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
+def facts_block(
+    sec: dict,
+    insts: list[Inst],
+    schemas: dict[str, list[str]],
+    env: Env,
+    views: dict[str, dict],
+    global_settings: list[str],
+) -> str:
+    """Section Facts d'un prompt : ce que le traducteur sait de la table
+    (vues, types, jointures, contexte, colonnes attendues, variables)."""
     out = []
     for g_ in global_settings:
         out.append(
@@ -1823,7 +1969,8 @@ def facts_block(sec, insts, schemas, env, views, global_settings) -> str:
     return "\n".join(dict.fromkeys(out))
 
 
-def mapping_code(insts) -> str:
+def mapping_code(insts: list[Inst]) -> str:
+    """Code Qlik d'un Mapping LOAD, pour le prompt."""
     return "\n".join(
         line.rstrip()
         for i in insts
@@ -1847,7 +1994,16 @@ def read_script(script: Path) -> str:
         return raw.decode("cp1252", errors="replace")
 
 
-def analyze_script(script: Path):
+def analyze_script(
+    script: Path,
+) -> tuple[
+    str,
+    Env,
+    list[Inst],
+    list[str],
+    dict[str, dict[str, Any]],
+    dict[str, list[str]],
+]:
     """Decoupe, execute a blanc et construit le graphe d'un script."""
     text = read_script(script).replace("\r\n", "\n")
     stmts = merge_preceding_loads(drop_rem(tokenize(text)))
@@ -1886,7 +2042,7 @@ def collect_io(script: Path) -> dict:
     for i in insts:
         if i.kind == "store" and i.stored:
             writes.add(norm_path(i.stored[1]))
-            cols = schemas.get(i.target) or []
+            cols = (schemas.get(i.target) if i.target else None) or []
             if cols and "*" not in cols and "?" not in cols:
                 columns[file_stem(i.stored[1]).lower()] = cols
     reads = sorted({norm_path(src) for i in insts for src in i.sources})
@@ -1931,6 +2087,19 @@ def prepare(
     project_stores: dict | None = None,
     conf: IoConf | None = None,
 ) -> dict:
+    """Prepare un script : decoupe, traduction sans modele, prompts,
+    manifest et rapport dans out_root/<script>/.
+
+    Args:
+        script: le script Qlik.
+        out_root: le dossier work/.
+        skills_dir: les skills de .opencode/skills.
+        project_stores: ce que les autres scripts ecrivent (stores.json).
+        conf: conf/io.yml lu.
+
+    Returns:
+        Le manifest du script.
+    """
     cache = load_cache(out_root)
     text, env, insts, notes, tables, schemas = analyze_script(script)
     order, groups, gdeps, sec_of, finals = build_sections(insts, tables, schemas)
@@ -2009,7 +2178,7 @@ def prepare(
             conf_types.update(e.types or {})
     inputs: dict[str, dict] = {}  # vue d'entree -> location, format
     # colonnes produites par chaque section
-    final_columns: dict[str, list] = {}
+    final_columns: dict[str, list[str] | None] = {}
     # fichiers qu'on n'a pas trouves dans io.yml
     missing_conf: set[str] = set()
 
@@ -2038,7 +2207,8 @@ def prepare(
             inputs[view]["types"] = entry.types
         return view
 
-    def file_schema(path: str):
+    def file_schema(path: str) -> list[str] | None:
+        """Colonnes connues d'un fichier lu."""
         # Par ordre de preference : conf/schema, puis un Parquet deja present,
         # puis le STORE d'un autre script.
         entry = resolve_io(path, stored, conf)[2]
@@ -2141,7 +2311,12 @@ def prepare(
         produced_now = list(produced)
         extra_views: dict[str, str] = {}  # vues lues par FieldValue()
 
-        def fieldvalue_views(field_name, produced_tables, extra=extra_views):
+        def fieldvalue_views(
+            field_name: str,
+            produced_tables: list[str],
+            extra: dict[str, str] = extra_views,
+        ) -> list[str]:
+            """Vues des tables deja calculees qui ont le champ field_name."""
             found = [t for t in produced_tables if field_name in (schemas.get(t) or [])]
             for t in found:
                 extra[table_views[t]] = t
@@ -2365,11 +2540,12 @@ def prepare(
     return manifest
 
 
-def _known(cols):
+def _known(cols: list[str] | None) -> list[str] | None:
+    """Les colonnes si on les connait toutes, sinon None."""
     return cols if cols and "*" not in cols and "?" not in cols else None
 
 
-def parquet_columns(path: str):
+def parquet_columns(path: str) -> list[str] | None:
     """Colonnes d'un Parquet deja present dans data/, ou None. Ca permet de
     traduire les "LOAD * FROM fichier" et de calculer leurs cles."""
     try:
@@ -2392,7 +2568,8 @@ def parquet_columns(path: str):
     return None
 
 
-def owner_of(table, groups):
+def owner_of(table: str, groups: dict[str, list[str]]) -> str | None:
+    """Section qui contient une table."""
     for g, names in groups.items():
         if table in names:
             return g
@@ -2400,6 +2577,7 @@ def owner_of(table, groups):
 
 
 def write_report(base: Path, m: dict, n_lines: int) -> None:
+    """Ecrit rapport.md : table par table, ce qui est traduit et ce qui reste."""
     secs = m["sections"]
     count: dict[str, int] = {}
     for s_ in secs:
@@ -2433,7 +2611,15 @@ def write_report(base: Path, m: dict, n_lines: int) -> None:
     (base / "rapport.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("scripts", nargs="+", type=Path)
     p.add_argument("--out", type=Path, help="dossier de travail (defaut : work)")

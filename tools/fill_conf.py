@@ -604,6 +604,16 @@ def type_text(t: str, style: dict) -> str:
 
 
 def schema_text(why: str, lines: list, style: dict) -> str:
+    """Texte d'un schema a creer, dans la forme des schemas existants.
+
+    Args:
+        why: pourquoi il est cree (commentaire d'en-tete).
+        lines: (colonne, type, d'ou vient le type) dans l'ordre.
+        style: forme des schemas existants (voir schema_style).
+
+    Returns:
+        Le contenu du fichier.
+    """
     today = dt.date.today().isoformat()
     body = [
         f"# Cree par tools/fill_conf.py le {today} ({why}).",
@@ -666,7 +676,15 @@ def writer_types(path: str, writer: str) -> tuple[dict[str, str], bool] | None:
     return None
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Point d'entree en ligne de commande.
+
+    Args:
+        argv: les arguments ; par defaut ceux de la ligne de commande.
+
+    Returns:
+        Le code retour du programme.
+    """
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("path", type=Path, help="un script Qlik ou le dossier script_qvd/")
     p.add_argument(
@@ -736,7 +754,7 @@ def main(argv=None) -> int:
                     {"path": i.stored[1], "columns": [], "scripts": set()},
                 )
                 w["scripts"].add(script.name)
-                stored_cols = schemas.get(i.target) or []
+                stored_cols = (schemas.get(i.target) if i.target else None) or []
                 if "*" not in stored_cols and "?" not in stored_cols:
                     w["columns"] = list(dict.fromkeys(w["columns"] + stored_cols))
             elif i.kind == "load" and i.sources:
@@ -917,11 +935,12 @@ def main(argv=None) -> int:
             how = f"type de la requete Spark qui l'ecrit ({written_by[0]})"
         lines = []
         for c in cols:
+            col_type: str | None
             if c in types:
-                t, note = types[c], how
+                col_type, note = types[c], how
             else:
-                t, note = suggest(c, hints.get(c))
-            lines.append((c, t, note))
+                col_type, note = suggest(c, hints.get(c))
+            lines.append((c, col_type, note))
         # relu apres un STORE : meme nom que la sortie qu'il relit
         entry_name = (
             file_stem(writes.get(name, r)["path"]).lower() if is_produced else name
