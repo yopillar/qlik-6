@@ -58,12 +58,25 @@ Le code genere n'importe que le socle, et seulement ces fonctions :
   chargement Qlik, colonnes). Le socle s'en sert ; le job ne l'importe
   jamais directement.
 
-`core/` et `commons/` dans ce depot sont la version d'origine qui a servi
-de base au socle. Les tests s'en servent comme doublure du socle :
-`tests/fakelib/spark_foundation/` reprend son API publique (`runner.py`,
-`tables.py`) au-dessus de `core/`. Si l'API du socle change, c'est
-`tools/job_template.py` (les imports du code genere) et cette doublure
-qu'il faut suivre.
+`core/` et `commons/` dans ce depot suivent l'organisation et les noms du
+socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
+
+| Ici | Dans le socle | Contenu |
+|---|---|---|
+| `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `run_scripts`, `script_name`, `parse_options`, `select` |
+| `core/tables.py` | `spark_foundation/tables.py` | `read_input`, `write_output`, `run_sql` |
+| `core/internal/session.py` | `internal/session.py` | `get_session`, `active_session` |
+| `core/internal/config.py` | `internal/config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
+| `core/internal/context.py` | `internal/context.py` | `JobState`, `state`, `start_job`, `script_scope` |
+| `core/internal/lineage.py` | `internal/lineage.py` | `ensure_database`, `table_name`, `materialize` |
+| `core/internal/io/access.py` | `internal/io/access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
+| `commons/` | `pyspark_commons` | `add_load_order`, `cast_void_to_string`, `drop_columns` |
+
+Seul le nom des packages differe (`core`, `commons`). Les tests passent par
+`tests/fakelib/spark_foundation/`, qui expose `core/` sous le nom du socle
+pour que le code genere tourne tel quel. Si l'API du socle change, on suit
+ici : `core/`, la doublure et `tools/job_template.py` (les imports du code
+genere).
 
 Toute fonction, classe et module de `core/`, `commons/` et `tools/` a une
 docstring et des annotations de type (`DataFrame` pour un DataFrame) :

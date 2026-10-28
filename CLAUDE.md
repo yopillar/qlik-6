@@ -21,8 +21,9 @@ python -m pytest                          # les tests Spark ont le marqueur spar
   d'autre. Il importe le socle `spark_foundation` (`runner.py`,
   `tables.py`) ; le technique est dans `spark_foundation/internal/` et les
   transformations dans `pyspark_commons`.
-- `core/` et `commons/` ne se modifient pas ici : le socle vit dans son
-  depot. Les tests passent par la doublure `tests/fakelib/spark_foundation`.
+- `core/` et `commons/` suivent les fichiers et les noms du socle
+  (correspondance dans le README) : un changement du socle se reporte ici.
+  Les tests passent par la doublure `tests/fakelib/spark_foundation`.
 - La cible est Spark 3.5.8 : verifier aussi avec PySpark 3.5.8 quand c'est
   possible, pas seulement 4.x.
 - Branche de travail, puis MR vers develop.
