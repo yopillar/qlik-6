@@ -126,7 +126,7 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     # relance ventes pour verifier qu'une table existante est bien remplacee
     project.run_job("--only", "ventes")
     check = (
-        "from core.internal.session import get_session\n"
+        "from core.session import get_session\n"
         "spark = get_session('demo')\n"
         "print(sorted(t.name for t in spark.catalog.listTables('demo_qlik')))\n"
     )
@@ -172,8 +172,8 @@ def test_read_input_gives_a_dataframe_and_optionally_a_table(
 ) -> None:
     """read_input renvoie le DataFrame ; avec table, il cree aussi la vue."""
     code = (
-        "from core.internal.session import get_session\n"
-        "from core.internal import context\n"
+        "from core.session import get_session\n"
+        "from core import context\n"
         "from spark_foundation.datasets import read_input\n"
         "spark = get_session('demo')\n"
         "context.start_job('demo')\n"

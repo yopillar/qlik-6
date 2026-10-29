@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core.internal.session import active_session
+from core.session import active_session
 
 
 @dataclass

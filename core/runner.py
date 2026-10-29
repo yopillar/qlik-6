@@ -20,7 +20,7 @@ from types import ModuleType
 
 from pyspark.sql import SparkSession
 
-from core.internal import context, lineage, session
+from core import context, lineage, session
 
 logger = logging.getLogger("core")
 

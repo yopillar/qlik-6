@@ -1,10 +1,15 @@
 """spark-foundation-core : les fonctions qu'un job migre depuis Qlik appelle.
 
-Meme organisation que le socle spark_foundation :
+Que des fichiers, aucun sous-dossier. Ce qu'un job appelle :
     runner.py   pipeline, Pipeline, run_scripts : le job et ses scripts
     datasets.py read_input : une entree, en DataFrame et/ou en table SQL
     tables.py   run_sql, write_output (et read_input) : les tables d'un script
-Tout le reste est dans core/internal/, reserve aux data engineers.
+Le technique, reserve aux data engineers (les jobs ne l'importent pas) :
+    session.py  creation et reglages de la session Spark
+    config.py   lecture de conf/io.yml et des schemas
+    access.py   lecture et ecriture des fichiers
+    lineage.py  tables intermediaires, pour OpenLineage
+    context.py  etat du job en cours (script, tables, base)
 """
 
 from core.datasets import read_input

@@ -15,9 +15,8 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from commons import add_load_order
-from core.internal import context
-from core.internal.io import access
-from core.internal.session import active_session
+from core import access, context
+from core.session import active_session
 
 
 def read_input(name: str, table: str | None = None) -> DataFrame:

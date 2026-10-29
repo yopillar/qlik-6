@@ -49,10 +49,10 @@ Le code genere n'importe que le socle, et seulement ces fonctions :
 | `from spark_foundation import pipeline, run_scripts` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session ; `run_scripts(args, script, ...)` enchaine les scripts et trouve `sql/` a cote de `job.py` |
 | `from spark_foundation.tables import read_input, run_sql, write_output` (`scripts/`) | `spark_foundation/tables.py` | lire une entree de `conf/io.yml`, calculer une table Qlik avec sa requete, l'ecrire |
 
-- `spark_foundation/internal/` : session et reglages SQL (`session.py`),
+- les autres fichiers du socle, a plat (aucun sous-dossier) : session et reglages SQL (`session.py`),
   lecture de `conf/io.yml` (`config.py`), etat du job (`context.py`),
   tables du catalogue pour OpenLineage (`lineage.py`), lecture et ecriture
-  des fichiers (`io/access.py` : `read_config`, `write_config`,
+  des fichiers (`access.py` : `read_config`, `write_config`,
   `input_location`, `output_location`). Reserve aux data engineers.
 - `pyspark_commons` : uniquement des transformations de DataFrame (ordre de
   chargement Qlik, colonnes). Le socle s'en sert ; le job ne l'importe
@@ -66,11 +66,11 @@ socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
 | `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `run_scripts`, `script_name`, `parse_options`, `select` |
 | `core/datasets.py` | `spark_foundation/datasets.py` | `read_input` : la seule definition |
 | `core/tables.py` | `spark_foundation/tables.py` | `write_output`, `run_sql`, et `read_input` repris de `datasets.py` |
-| `core/internal/session.py` | `internal/session.py` | `get_session`, `active_session` |
-| `core/internal/config.py` | `internal/config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
-| `core/internal/context.py` | `internal/context.py` | `JobState`, `state`, `start_job`, `script_scope` |
-| `core/internal/lineage.py` | `internal/lineage.py` | `ensure_database`, `table_name`, `materialize` |
-| `core/internal/io/access.py` | `internal/io/access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
+| `core/session.py` | `session.py` | `get_session`, `active_session` |
+| `core/config.py` | `config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
+| `core/context.py` | `context.py` | `JobState`, `state`, `start_job`, `script_scope` |
+| `core/lineage.py` | `lineage.py` | `ensure_database`, `table_name`, `materialize` |
+| `core/access.py` | `access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
 | `commons/` | `pyspark_commons` | `add_load_order`, `cast_void_to_string`, `drop_columns` |
 
 `read_input(nom)` renvoie l'entree en DataFrame (usage PySpark classique) ;

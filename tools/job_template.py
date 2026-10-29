@@ -5,7 +5,7 @@ ne contient donc que des appels aux fonctions du socle spark_foundation :
     spark_foundation            pipeline, run_scripts (runner.py)
     spark_foundation.tables     read_input, run_sql, write_output
 Tout ce qui est technique (session, io.yml, lecture, ecriture, tables pour
-OpenLineage, reprise) est dans spark_foundation/internal/, et les
+OpenLineage, reprise) est dans les autres fichiers du socle, et les
 transformations dans pyspark_commons.
 
     src/<projet>/job.py                le job : les scripts, dans l'ordre

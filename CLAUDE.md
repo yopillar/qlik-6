@@ -19,7 +19,8 @@ python -m pytest                          # les tests Spark ont le marqueur spar
 - Le job genere (`job.py`, `scripts/`) reste lisible par un developpeur
   Qlik : pipeline, run_scripts, read_input, run_sql, write_output, rien
   d'autre. Il importe le socle `spark_foundation` (`runner.py`,
-  `tables.py`) ; le technique est dans `spark_foundation/internal/` et les
+  `tables.py`, `datasets.py`) ; le technique est dans les autres fichiers du
+  socle (aucun sous-dossier) et les
   transformations dans `pyspark_commons`.
 - `core/` et `commons/` suivent les fichiers et les noms du socle
   (correspondance dans le README) : un changement du socle se reporte ici.

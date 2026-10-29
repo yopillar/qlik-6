@@ -7,10 +7,9 @@ write_output("ventes_v2", table="Ventes")          STORE Ventes INTO ventes_v2
 
 from __future__ import annotations
 
+from core import access, context, lineage
 from core.datasets import read_input
-from core.internal import context, lineage
-from core.internal.io import access
-from core.internal.session import active_session
+from core.session import active_session
 
 # read_input est defini une seule fois, dans datasets.py
 __all__ = ["read_input", "run_sql", "write_output"]
