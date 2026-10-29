@@ -1111,9 +1111,9 @@ def _translate_function(
             return ctx.recno
         if ctx.in_where:
             raise Untranslatable(f"{name}() dans un WHERE")
-        # ordre du LOAD ... ORDER BY s'il y en a un, sinon ordre de lecture du
-        # fichier
-        order = ctx.order_by or "monotonically_increasing_id()"
+        # ordre du LOAD ... ORDER BY s'il y en a un, sinon ordre de
+        # chargement de la source
+        order = ctx.order_by or ORD
         return f"row_number() OVER (ORDER BY {order})"
     if n == "fieldvalue":
         need(2)
@@ -1353,14 +1353,15 @@ def values_sql(header: list[str], data: list[list[str]]) -> str:
             + ", ".join(f"CAST(NULL AS STRING) AS {ident(h)}" for h in header)
             + f", CAST(NULL AS ARRAY<BIGINT>) AS {ORD} WHERE false"
         )
-    rows = ",\n    ".join("(" + ", ".join(sql_string(v) for v in r) + ")" for r in data)
-    cols = ", ".join(ident(h) for h in header)
-    # VALUES tient sur une seule partition, donc l'identifiant suit l'ordre des
-    # lignes tel qu'il est ecrit.
-    return (
-        f"SELECT *, array(monotonically_increasing_id()) AS {ORD} FROM VALUES\n  "
-        f"{rows.replace(chr(10) + '    ', chr(10) + '  ')}\nAS t({cols})"
+    # L'ordre de chargement est ecrit en dur sur chaque ligne : on le connait
+    # deja. monotonically_increasing_id() ne convient pas : Spark le refuse
+    # dans un agregat ou une jointure, et peut le recalculer autrement.
+    rows = ",\n  ".join(
+        "(" + ", ".join([sql_string(v) for v in r] + [f"array({k}L)"]) + ")"
+        for k, r in enumerate(data)
     )
+    cols = ", ".join([ident(h) for h in header] + [ORD])
+    return f"SELECT * FROM VALUES\n  {rows}\nAS t({cols})"
 
 
 # ==========================================================================

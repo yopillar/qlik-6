@@ -321,6 +321,12 @@ technique `_qlik_order` (`array<bigint>`) :
 - a la lecture, on la reprend si elle est deja dans le fichier (fichier
   ecrit par un job migre). Sinon on numerote les lignes dans l'ordre de
   lecture, avant toute autre operation.
+- un `INLINE` porte son numero en dur sur chaque ligne :
+  `VALUES ('1', 'Un', array(0L)), ('2', 'Deux', array(1L))`. Les requetes
+  n'utilisent jamais `monotonically_increasing_id()` : Spark le refuse dans
+  un agregat (`min`, `GROUP BY`) ou une condition de jointure, et il
+  renumerote les lignes s'il est recalcule. Le controle refuse une requete
+  du modele qui l'utilise.
 - elle suit ensuite les regles de Qlik : `ORDER BY` (et a egalite l'ordre
   d'avant), `CONCATENATE` (les lignes ajoutees passent apres), `JOIN`
   (l'ordre de la table de gauche, puis les lignes sans correspondance),

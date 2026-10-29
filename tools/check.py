@@ -448,6 +448,13 @@ def check_section(
             " + les CTE de la requete)"
         )
 
+    if re.search(r"\bmonotonically_increasing_id\s*\(", code_no_idents, re.I):
+        errors.append(
+            "monotonically_increasing_id() interdit : Spark le refuse dans un "
+            "agregat ou une jointure, et il renumerote les lignes. Reprendre "
+            "_qlik_order de la source ; pour un INLINE, ecrire array(0L), "
+            "array(1L)... sur chaque ligne du VALUES"
+        )
     bad = unknown_prefixes(code, allowed)
     if bad:
         errors.append(
