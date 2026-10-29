@@ -1,0 +1,4 @@
+columns:
+  Site: STRING
+  Produit: STRING
+  Montant: DOUBLE

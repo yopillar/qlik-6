@@ -1,0 +1,14 @@
+# conf de demo, indentee a 3 espaces
+# referentiel des sites : ajoute par fill_conf.py (nom avec #)
+inputs:
+   ventes:
+       format: csv
+       schema_file: schemas/ventes.yml
+       location: ${entrees}/ventes.csv
+   ventes_dates:
+       format: csv
+       schema_file: schemas/ventes_dates.yml
+       location: ${entrees}/ventes_dates.csv
+outputs:
+   synthese:
+       location: ${sorties}/synthese

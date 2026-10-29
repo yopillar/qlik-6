@@ -6,7 +6,7 @@ description: Translate a chain of temporary Qlik tables (RESIDENT, NoConcatenate
 # Temporary tables -> CTEs of one query
 
 TMP1 -> TMP2 -> FINAL becomes one `WITH` clause: one CTE per Qlik LOAD,
-named `step_1`, `step_2`… with a `-- l.<n>` comment, then the final SELECT.
+named `step_1`, `step_2`... with a `-- l.<n>` comment, then the final SELECT.
 
 | Qlik | Spark SQL |
 |---|---|
@@ -29,7 +29,7 @@ WITH
 step_1 AS (SELECT id_commande, quantite, prix_unitaire FROM commandes),
 -- l.47 : montant = quantite * prix_unitaire
 step_2 AS (SELECT *, quantite * prix_unitaire AS montant FROM step_1)
--- l.58 : agrégation par commande
+-- l.58 : agregation par commande
 SELECT id_commande, SUM(montant) AS montant_total
 FROM step_2
 GROUP BY id_commande

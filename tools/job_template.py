@@ -1,63 +1,206 @@
-"""Gabarit du job généré pour chaque script (src/<script>/job.py).
+"""Gabarits du code genere pour un projet : job.py et un fichier par script.
 
-C'est le SEUL endroit où le code généré appelle pyspark-commons : si une
-signature change dans la bibliothèque, on corrige ici puis on relance
-python tools/assemble.py work/<script> (ou migrate.py).
+Ce code est lu par des developpeurs Qlik qui ne connaissent pas PySpark. Il
+ne contient donc que des appels aux fonctions du socle spark_foundation :
+    spark_foundation            pipeline, run_scripts (runner.py)
+    spark_foundation.tables     read_input, run_sql, write_output
+Tout ce qui est technique (session, io.yml, lecture, ecriture, tables pour
+OpenLineage, reprise) est dans spark_foundation/internal/, et les
+transformations dans pyspark_commons.
 
-Fonctions pyspark-commons utilisées (API connue, à vérifier) :
-    pyspark_commons.io.read(spark, path, fmt) -> DataFrame
-    pyspark_commons.io.write(df, path, fmt, mode)
-    pyspark_commons.monitoring.timer(label)      (context manager)
-    pyspark_commons.logger.setup_logging()
+    src/<projet>/job.py                le job : les scripts, dans l'ordre
+    src/<projet>/scripts/<script>.py   un script Qlik : ses LOAD, ses tables,
+                                       ses STORE
+    src/<projet>/sql/                  une requete par table Qlik
 """
 
-JOB = '''"""Job {stem} — traduit de script_qvd/{script} (généré, ne pas éditer).
+from __future__ import annotations
 
-Chaque fichier .sql de ce dossier calcule une table du script Qlik.
-Ce job :
-  1. expose chaque fichier lu comme une vue SQL (in_<nom>) ;
-  2. exécute les requêtes dans l'ordre du script : chaque résultat devient
-     une vue au nom de la table Qlik, utilisable par les requêtes suivantes ;
-  3. écrit les tables qui avaient un STORE dans Qlik.
-"""
-
+import keyword
+import os
+import re
+import textwrap
 from pathlib import Path
+
+
+def project_name() -> str:
+    """Nom du projet : la variable QLIK_PROJECT si elle existe, sinon le nom
+    du dossier courant, ramene a un identifiant Python (mon-projet devient
+    mon_projet).
+
+    Returns:
+        Le nom, qui sert de nom de package (src/<nom>/) et de nom de job.
+    """
+    name = os.environ.get("QLIK_PROJECT") or Path.cwd().name
+    name = re.sub(r"\W", "_", name.strip().lower(), flags=re.ASCII)
+    # un identifiant ne peut pas commencer par un chiffre
+    return name if name and not name[0].isdigit() else f"p_{name}"
+
+
+def project_dir() -> Path:
+    """Dossier du projet genere.
+
+    Returns:
+        src/<nom-projet>/, qui contient job.py, scripts/ et sql/.
+    """
+    return Path("src") / project_name()
+
+
+def module_name(script_stem: str) -> str:
+    """Nom du module Python d'un script Qlik, celui qu'on passe a --from et
+    --only.
+
+    Args:
+        script_stem: le nom du script sans extension (ventes).
+
+    Returns:
+        Un identifiant Python : ventes, mon_script, s_2024...
+    """
+    name = re.sub(r"\W", "_", script_stem.lower(), flags=re.ASCII)
+    if not name or name[0].isdigit():
+        name = f"s_{name}"
+    return f"{name}_" if keyword.iskeyword(name) else name
+
+
+JOB = '''"""Job du projet {project}.
+
+Fichier genere par tools/orchestrate.py : ne pas le modifier a la main.
+
+Il fait tourner les scripts Qlik du projet, dans l'ordre ou Qlik les
+rechargeait : un script qui lit un fichier ecrit par un autre passe apres
+lui. Le detail de chaque script est dans scripts/, ses requetes dans sql/.
+Le job s'arrete au premier script en echec.
+
+    python src/{project}/job.py                  # tout
+    python src/{project}/job.py --from ventes    # reprendre a un script
+    python src/{project}/job.py --only ventes    # un seul script
+
+Sur le cluster, depuis la racine du projet :
+
+    spark-submit --name {project} --deploy-mode client \\\\
+        --py-files <spark_foundation et pyspark_commons, s'ils ne sont
+                    pas installes> \\\\
+        src/{project}/job.py [--from <script> | --only <script>]
+"""
+
+from __future__ import annotations
 
 from pyspark.sql import SparkSession
 
-from pyspark_commons.io import read, write
-from pyspark_commons.logger import setup_logging
-from pyspark_commons.monitoring import timer
-
-HERE = Path(__file__).resolve().parent
-
-# Fichiers lus : vue SQL -> fichier Parquet
-INPUTS = {{
-{inputs}
-}}
-
-# Requêtes, dans l'ordre : (fichier SQL, vue produite, fichier écrit ou None)
-STEPS = [
-{steps}
-]
+{imports}from spark_foundation import pipeline, run_scripts
 
 
-def main(spark: SparkSession) -> None:
-    """Exécute le script {stem}."""
-    for view, path in INPUTS.items():
-        read(spark, path, "parquet").createOrReplaceTempView(view)
-    for sql_file, view, output in STEPS:
-        with timer(f"{stem} / {{view}}"):
-            df = spark.sql((HERE / sql_file).read_text(encoding="utf-8"))
-            if output in INPUTS.values():
-                # le fichier écrit est aussi lu : on coupe la lignée
-                df = df.localCheckpoint()
-            df.createOrReplaceTempView(view)
-            if output:
-                write(df, output, "parquet", "overwrite")
+@pipeline("{project}")
+def run(spark: SparkSession, args: list[str]) -> None:
+    """Fait tourner les scripts du projet, dans l'ordre.
+
+    Args:
+        spark: la session Spark, ouverte par @pipeline.
+        args: les arguments de la ligne de commande (--from, --only).
+    """
+    run_scripts(
+        args,
+{calls}    )
 
 
 if __name__ == "__main__":
-    setup_logging()
-    main(SparkSession.builder.appName("{stem}").getOrCreate())
+    raise SystemExit(run())
 '''
+
+SCRIPT = '''"""Script Qlik {script}, traduit en Spark SQL.
+
+Fichier genere par tools/orchestrate.py : ne pas le modifier a la main.
+Chaque ligne est une etape du script Qlik, dans l'ordre :
+    read_input    LOAD ... FROM un fichier de conf/io.yml
+    run_sql       une table Qlik, calculee par sa requete du dossier sql/
+    write_output  STORE de la table dans un fichier de conf/io.yml
+"""
+
+from __future__ import annotations
+{imports}
+
+def run() -> None:
+    """Rejoue le script {script}.
+
+{summary}
+    """
+{body}
+'''
+
+
+def _summary_line(label: str, names: list[str]) -> str:
+    """Une ligne de la docstring d'un script : "Lit : a, b.", repliee.
+
+    Args:
+        label: Lit, Calcule ou Ecrit.
+        names: les noms a lister, dans l'ordre, sans doublon.
+
+    Returns:
+        Le texte indente pour la docstring, ou "" s'il n'y a rien.
+    """
+    if not names:
+        return ""
+    return textwrap.fill(
+        f"{label} : {', '.join(dict.fromkeys(names))}.",
+        width=84,
+        initial_indent="    ",
+        subsequent_indent="        ",
+        break_on_hyphens=False,
+    )
+
+
+def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
+    """Code de job.py.
+
+    Args:
+        project: le nom du projet.
+        scripts: (module, modules dont il depend) pour chaque script, dans
+            l'ordre ou ils tournent.
+
+    Returns:
+        Le code du job.
+    """
+    names = sorted(m for m, _ in scripts)
+    imports = f"from scripts import {', '.join(names)}\n" if names else ""
+    calls = "".join(
+        f"        {m},"
+        + (f"  # apres {', '.join(deps)}, dont il lit les sorties" if deps else "")
+        + "\n"
+        for m, deps in scripts
+    )
+    return JOB.format(project=project, imports=imports, calls=calls)
+
+
+def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str:
+    """Code de scripts/<script>.py.
+
+    Args:
+        script: le nom du fichier du script Qlik (ventes.qvs).
+        inputs: table (vue SQL) -> nom de l'entree dans conf/io.yml.
+        steps: [fichier sql, table, nom de la sortie ou None, ...] dans
+            l'ordre du script.
+
+    Returns:
+        Le code du module.
+    """
+    lines = [f'    read_input("{io}", table="{view}")' for view, io in inputs.items()]
+    for sql_file, table, output, *_ in steps:
+        lines.append(f'    run_sql("{sql_file}", table="{table}")')
+        if output:
+            lines.append(f'    write_output("{output}", table="{table}")')
+    used = ["read_input"] if inputs else []
+    used += ["run_sql"] if steps else []
+    used += ["write_output"] if any(st[2] for st in steps) else []
+    summary = [
+        _summary_line("Lit", list(inputs.values())),
+        _summary_line("Calcule", [st[1] for st in steps]),
+        _summary_line("Ecrit", [st[2] for st in steps if st[2]]),
+    ]
+    return SCRIPT.format(
+        script=script,
+        imports=f"\nfrom spark_foundation.tables import {', '.join(used)}\n"
+        if used
+        else "",
+        summary="\n".join(x for x in summary if x) or "    Rien a faire.",
+        body="\n".join(lines) or "    pass",
+    )

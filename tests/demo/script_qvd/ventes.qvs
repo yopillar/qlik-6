@@ -1,0 +1,16 @@
+// Ventes par site
+SET DateFormat='DD/MM/YYYY';
+MapRegion:
+Mapping LOAD Site, Region FROM [lib://data/[ref]-sites#2024.csv] (txt, utf8, embedded labels, delimiter is ',');
+
+Ventes:
+LOAD
+    Site,
+    Produit,
+    Montant * 1.2 as MontantTTC,
+    ApplyMap('MapRegion', Site, 'Inconnue') as Region,
+    If(Montant > 100, 'gros', 'petit') as Taille
+FROM [lib://data/ventes.csv] (txt, utf8, embedded labels, delimiter is ',')
+WHERE Montant > 0;
+
+STORE Ventes INTO [lib://out/ventes_enrichies#v2.qvd] (qvd);

@@ -1,0 +1,34 @@
+# Outils de qualite du kit. A lancer avant chaque commit :
+#   ruff format . && ruff check . && mypy
+#   python -m pytest
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+extend-exclude = ["tests/demo"]
+
+[tool.ruff.lint]
+# D1 : toute fonction, classe et module a une docstring.
+# ANN : tout argument et tout retour a une annotation de type.
+select = ["E", "F", "W", "I", "B", "UP", "D1", "ANN"]
+ignore = [
+    "E501",    # longueur des lignes : ruff format s'en charge, sauf chaines longues
+    "ANN401",  # Any reste permis pour les donnees JSON et YAML
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["conf", "prepare", "qlik2sql", "fill_conf", "compare",
+                     "journal", "job_template", "orchestrate", "translate",
+                     "check", "verify", "assemble", "migrate", "normalize",
+                     "conftest", "core", "commons", "scripts",
+                     "spark_foundation", "pyspark_commons"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["core", "commons", "tools", "tests"]
+exclude = ["tests/demo/"]
+mypy_path = ["tools", "."]
+ignore_missing_imports = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_unused_ignores = true

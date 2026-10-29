@@ -1,7 +1,8 @@
-"""Journal des tables traduites : work/journal.csv (séparateur ';').
+"""Journal des tables traduites, dans work/journal.csv (separateur ;).
 
-Une ligne par (script, section). Les mises à jour fusionnent les colonnes :
-la colonne « resolution », remplie à la main, n'est jamais écrasée.
+Une ligne par couple (script, section). Une mise a jour ne touche qu'aux
+colonnes qu'on lui passe : la colonne "resolution", qu'on remplit a la
+main, n'est donc jamais ecrasee.
 """
 
 from __future__ import annotations
@@ -9,11 +10,26 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-FIELDS = ["date", "script", "section", "status", "attempts", "seconds",
-          "compare", "problem", "resolution"]
+FIELDS = [
+    "date",
+    "script",
+    "section",
+    "status",
+    "attempts",
+    "seconds",
+    "compare",
+    "problem",
+    "resolution",
+]
 
 
 def update(path: Path, row: dict) -> None:
+    """Ajoute ou met a jour la ligne (script, section) du journal.
+
+    Args:
+        path: work/journal.csv.
+        row: les colonnes a ecrire ; les autres gardent leur valeur.
+    """
     rows = []
     if path.exists():
         with path.open(encoding="utf-8", newline="") as f:
@@ -26,7 +42,8 @@ def update(path: Path, row: dict) -> None:
         rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS, delimiter=";", restval="",
-                           extrasaction="ignore")
+        w = csv.DictWriter(
+            f, fieldnames=FIELDS, delimiter=";", restval="", extrasaction="ignore"
+        )
         w.writeheader()
         w.writerows(rows)
