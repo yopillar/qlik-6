@@ -1,5 +1,5 @@
 """Genere le job du projet : src/<nom-projet>/job.py et un fichier par
-script dans src/<nom-projet>/scripts/.
+script a cote de lui, src/<nom-projet>/<script>.py.
 
 Le job enchaine tous les scripts assembles, dans l'ordre de leurs
 dependances. L'ordre est calcule a partir de work/stores.json (rempli par
@@ -21,6 +21,13 @@ import sys
 from pathlib import Path
 
 STORES = Path("work/stores.json")
+# Marque des fichiers ecrits par ce programme : seuls eux peuvent etre
+# supprimes quand un script disparait.
+GENERATED = "Fichier genere par tools/orchestrate.py"
+# __init__.py que le kit ecrivait avant dans src/<nom-projet>/.
+PROJECT_INIT = '"""Projet {project} migre depuis Qlik."""\n'
+# __init__.py de l'ancien dossier scripts/, tel que le kit l'ecrivait.
+SCRIPTS_INIT = '"""Scripts Qlik du projet, un module par script."""\n'
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from job_template import (  # noqa: E402
@@ -102,21 +109,20 @@ def main(argv: list[str] | None = None) -> int:
     missing = [s for s, _ in order if not assembled[s].exists()]
 
     out = project_dir()
-    modules = out / "scripts"
-    modules.mkdir(parents=True, exist_ok=True)
-    # src/<nom-projet>/ et scripts/ sont des packages Python, comme dp_test.
-    # On ne cree un __init__.py que s'il manque, pour ne rien ecraser.
-    for package, doc in (
-        (out, f"Projet {project_name()} migre depuis Qlik."),
-        (modules, "Scripts Qlik du projet, un module par script."),
+    out.mkdir(parents=True, exist_ok=True)
+    # job.py importe ses scripts directement (import ventes) : le dossier
+    # n'est pas un package. On retire le __init__.py que le kit y mettait.
+    init = out / "__init__.py"
+    if init.exists() and init.read_text(encoding="utf-8") == PROJECT_INIT.format(
+        project=project_name()
     ):
-        if not (package / "__init__.py").exists():
-            (package / "__init__.py").write_text(f'"""{doc}"""\n', encoding="utf-8")
+        init.unlink()
     module = {s: module_name(stem[s]) for s in io}
     code: dict[Path, str] = {}
     for s, _ in ready:
         a = json.loads(assembled[s].read_text(encoding="utf-8"))
-        code[modules / f"{module[s]}.py"] = render_script(
+        # un fichier par script, a cote de job.py : pas de sous-dossier
+        code[out / f"{module[s]}.py"] = render_script(
             Path(s).name, a["inputs"], a["steps"]
         )
     code[out / "job.py"] = render_job(
@@ -125,10 +131,25 @@ def main(argv: list[str] | None = None) -> int:
     # on s'assure que tout compile avant d'ecrire quoi que ce soit
     for path, text in code.items():
         compile(text, str(path), "exec")
-    # un script qui n'est plus assemble ne doit pas rester dans scripts/
-    for old in modules.glob("*.py"):
-        if old.name != "__init__.py" and old not in code:
+    # Un script qui n'est plus assemble ne doit pas rester. On ne supprime
+    # que des fichiers generes par le kit, jamais un fichier ecrit a la main.
+    # L'ancien dossier scripts/ disparait s'il ne contient plus rien d'autre.
+    old_dir = out / "scripts"
+    for old in [*out.glob("*.py"), *old_dir.glob("*.py")]:
+        if old in code or old.name == "__init__.py":
+            continue
+        if GENERATED in old.read_text(encoding="utf-8"):
             old.unlink()
+    if old_dir.is_dir():
+        init = old_dir / "__init__.py"
+        if init.exists() and init.read_text(encoding="utf-8") == SCRIPTS_INIT:
+            init.unlink()
+        for cache in old_dir.glob("__pycache__"):
+            for f in cache.iterdir():
+                f.unlink()
+            cache.rmdir()
+        if not any(old_dir.iterdir()):
+            old_dir.rmdir()
     for path, text in code.items():
         path.write_text(text, encoding="utf-8")
 

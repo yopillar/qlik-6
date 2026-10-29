@@ -47,6 +47,9 @@ def run_sql(sql_file: str, table: str) -> None:
     state = context.state()
     df = spark.sql((state.sql_dir / sql_file).read_text(encoding="utf-8"))
     if state.database:
+        if not state.database_ready:
+            lineage.ensure_database(spark, state.database)
+            state.database_ready = True
         name = lineage.table_name(state.database, state.script, table)
         df = lineage.materialize(spark, df, name)
     df.createOrReplaceTempView(table)

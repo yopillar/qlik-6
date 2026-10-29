@@ -1,20 +1,6 @@
-"""Doublure de spark_foundation/runner.py : le decorateur du job et
-l'enchainement des scripts."""
+"""Doublure de spark_foundation/runner.py : le decorateur du job et celui
+de chaque script."""
 
-from core.runner import (
-    Pipeline,
-    parse_options,
-    pipeline,
-    run_scripts,
-    script_name,
-    select,
-)
+from core.runner import Pipeline, parse_options, pipeline, script
 
-__all__ = [
-    "Pipeline",
-    "parse_options",
-    "pipeline",
-    "run_scripts",
-    "script_name",
-    "select",
-]
+__all__ = ["Pipeline", "parse_options", "pipeline", "script"]

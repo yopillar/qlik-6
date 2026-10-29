@@ -1,9 +1,11 @@
-"""Le decorateur @pipeline, point d'entree de chaque job, et l'enchainement
-des scripts d'un projet.
+"""Le decorateur @pipeline, point d'entree de chaque job, et le decorateur
+@script, pose sur chaque script Qlik du projet.
 
     @pipeline("demo")
     def run(spark: SparkSession, args: list[str]) -> None:
-        run_scripts(args, calendrier, ventes, synthese)
+        calendrier.run()
+        ventes.run()
+        synthese.run()
 """
 
 from __future__ import annotations
@@ -14,18 +16,19 @@ import inspect
 import logging
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
 
 from pyspark.sql import SparkSession
 
-from core import context, lineage, session
+from core import context, session
 
 logger = logging.getLogger("core")
 
 # La fonction principale d'un job : run(spark, args).
 JobFunction = Callable[[SparkSession, list[str]], None]
+# La fonction run() d'un script Qlik.
+ScriptFunction = Callable[[], None]
 
 
 class Pipeline:
@@ -43,16 +46,30 @@ class Pipeline:
         functools.update_wrapper(self, func)
 
     def __call__(self, args: list[str] | None = None) -> None:
-        """Lance le job : ouvre la session Spark, puis appelle la fonction
-        principale.
+        """Lance le job : ouvre la session Spark, lit les options (--from,
+        --only, --database, --temp-views), puis appelle la fonction
+        principale. Les arguments qu'il ne connait pas sont laisses au job.
 
         Args:
             args: les arguments du job ; par defaut ceux de la ligne de
                 commande.
         """
         spark = session.get_session(self.name)
-        context.start_job(self.name)
-        self.func(spark, sys.argv[1:] if args is None else args)
+        argv = sys.argv[1:] if args is None else args
+        opts = parse_options(argv)
+        context.start_job(
+            self.name,
+            # les requetes sont dans sql/, a cote du job
+            sql_dir=Path(inspect.getfile(self.func)).resolve().parent / "sql",
+            database=None if opts.temp_views else opts.database or f"{self.name}_qlik",
+            start=opts.start,
+            only=opts.only,
+        )
+        self.func(spark, argv)
+        state = context.state()
+        wanted = opts.only or opts.start
+        if wanted and wanted not in state.seen:
+            raise ValueError(f"Script inconnu : {wanted} (connus : {state.seen})")
 
 
 def pipeline(name: str) -> Callable[[JobFunction], Pipeline]:
@@ -81,29 +98,18 @@ def pipeline(name: str) -> Callable[[JobFunction], Pipeline]:
     return wrap
 
 
-def script_name(module: ModuleType) -> str:
-    """Nom d'un script : celui de son module (scripts/ventes.py -> ventes).
-
-    Args:
-        module: le module du script.
-
-    Returns:
-        Le nom, tel qu'on le passe a --from et --only.
-    """
-    return module.__name__.rsplit(".", 1)[-1]
-
-
 def parse_options(args: list[str]) -> argparse.Namespace:
-    """Options de la ligne de commande d'un job.
+    """Options de la ligne de commande d'un job migre depuis Qlik.
 
     Args:
-        args: les arguments recus par le job.
+        args: les arguments recus par le job ; ceux qu'on ne connait pas
+            sont ignores ici.
 
     Returns:
         start (--from), only (--only), database (--database) et
         temp_views (--temp-views).
     """
-    p = argparse.ArgumentParser(prog="job.py")
+    p = argparse.ArgumentParser(prog="job.py", add_help=False)
     p.add_argument("--from", dest="start", help="reprendre a ce script")
     p.add_argument("--only", help="ne lancer que ce script")
     p.add_argument(
@@ -117,79 +123,48 @@ def parse_options(args: list[str]) -> argparse.Namespace:
         help="garder les tables en vues temporaires (plus rapide, mais rien "
         "dans OpenLineage)",
     )
-    return p.parse_args(args)
+    return p.parse_known_args(args)[0]
 
 
-def select(
-    scripts: Sequence[ModuleType], start: str | None, only: str | None
-) -> list[ModuleType]:
-    """Les scripts a lancer, d'apres --from et --only.
+def _should_run(name: str) -> bool:
+    """Dit si le script doit tourner, d'apres --from et --only."""
+    state = context.state()
+    if state.only:
+        return name == state.only
+    if state.start and name == state.start:
+        state.started = True
+    return state.started or not state.start
+
+
+def script(func: ScriptFunction) -> ScriptFunction:
+    """Declare la fonction run() d'un script Qlik.
+
+    Le job appelle les scripts dans l'ordre. Chacun tourne avec ses propres
+    vues, supprimees a la fin, et un script en echec arrete le job, comme
+    un rechargement Qlik : les suivants liraient des donnees absentes ou
+    d'hier. Le message dit comment reprendre (--from <script>) ; chaque
+    table etant ecrite en overwrite, relancer ne cree pas de doublon.
 
     Args:
-        scripts: tous les scripts du job, dans l'ordre.
-        start: reprendre a ce script, ou None.
-        only: ne lancer que ce script, ou None.
+        func: la fonction run() du script.
 
     Returns:
-        Les scripts a lancer, dans l'ordre.
-
-    Raises:
-        ValueError: --from ou --only nomme un script inconnu.
+        La meme fonction, qui respecte --from et --only.
     """
-    names = [script_name(m) for m in scripts]
-    for wanted in (start, only):
-        if wanted and wanted not in names:
-            raise ValueError(f"Script inconnu : {wanted} (connus : {names})")
-    if only:
-        return [scripts[names.index(only)]]
-    if start:
-        return list(scripts[names.index(start) :])
-    return list(scripts)
+    name = func.__module__.rsplit(".", 1)[-1]
 
-
-def _caller_sql_dir() -> Path:
-    """Dossier sql/ a cote du fichier qui a appele run_scripts (job.py)."""
-    frame = inspect.currentframe()
-    # deux crans : _caller_sql_dir, puis run_scripts
-    caller = frame.f_back.f_back if frame and frame.f_back else None
-    if caller is None:
-        raise RuntimeError("run_scripts : impossible de trouver le job appelant")
-    return Path(caller.f_code.co_filename).resolve().parent / "sql"
-
-
-def run_scripts(args: list[str], *scripts: ModuleType) -> None:
-    """Fait tourner les scripts du projet, dans l'ordre donne.
-
-    Les requetes sont lues dans le dossier sql/ a cote du job qui appelle
-    cette fonction. Comme un rechargement Qlik, on s'arrete au premier
-    script en echec : les suivants liraient des donnees absentes ou d'hier.
-    Une fois corrige, on reprend avec --from <script>. Chaque table etant
-    ecrite en mode overwrite, relancer ne cree pas de doublon. --only
-    <script> n'en lance qu'un.
-
-    Args:
-        args: les arguments recus par le job.
-        scripts: les scripts, dans l'ordre ou ils doivent tourner.
-
-    Raises:
-        RuntimeError: un script a echoue ; le message dit d'ou reprendre.
-    """
-    opts = parse_options(args)
-    state = context.state()
-    state.sql_dir = _caller_sql_dir()
-    spark = session.active_session()
-    if not opts.temp_views:
-        state.database = opts.database or f"{state.job_name}_qlik"
-        lineage.ensure_database(spark, state.database)
-    chosen = select(scripts, opts.start, opts.only)
-    t_all = time.perf_counter()
-    for module in chosen:
-        name = script_name(module)
+    @functools.wraps(func)
+    def run() -> None:
+        """Fait tourner le script, sauf si --from ou --only l'excluent."""
+        context.state().seen.append(name)
+        if not _should_run(name):
+            logger.info("%s saute (--from / --only)", name)
+            return
         logger.info("=== %s", name)
         t0 = time.perf_counter()
         try:
             with context.script_scope(name):
-                module.run()
+                func()
         except Exception as exc:
             logger.error("%s en echec : %s", name, str(exc).splitlines()[0])
             raise RuntimeError(
@@ -197,6 +172,5 @@ def run_scripts(args: list[str], *scripts: ModuleType) -> None:
                 f"--from {name}."
             ) from exc
         logger.info("%s termine en %.0fs", name, time.perf_counter() - t0)
-    logger.info(
-        "Termine : %d script(s) en %.0fs", len(chosen), time.perf_counter() - t_all
-    )
+
+    return run

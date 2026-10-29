@@ -104,15 +104,23 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
     job = (project / "src/demo/job.py").read_text(encoding="utf-8")
-    # rien de technique dans le job : pipeline, run_scripts, les scripts
-    assert "from spark_foundation import pipeline, run_scripts" in job
-    assert "SCRIPTS = " not in job and "def " in job and len(job.splitlines()) < 60
+    # rien de technique dans le job : pipeline et un appel par script
+    assert "from spark_foundation import pipeline" in job
+    assert "run_scripts" not in job and len(job.splitlines()) < 60
     # l'ordre des scripts est l'ordre des appels
-    calls = job[job.index("run_scripts(\n") :]
     assert (
-        calls.index("calendrier,") < calls.index("ventes,") < calls.index("synthese,")
+        job.index("calendrier.run()")
+        < job.index("ventes.run()")
+        < job.index("synthese.run()")
     )
-    ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
+    # les scripts sont des fichiers a cote de job.py, sans dossier (hors le
+    # cache que Python cree en lancant le job)
+    src = project / "src/demo"
+    folders = sorted(p.name for p in src.iterdir() if p.is_dir())
+    assert [f for f in folders if f != "__pycache__"] == ["sql"]
+    ventes = (src / "ventes.py").read_text(encoding="utf-8")
+    assert "from spark_foundation.runner import script" in ventes
+    assert "@script\ndef run() -> None:" in ventes
     assert (
         "from spark_foundation.tables import read_input, run_sql, write_output"
         in ventes
@@ -125,6 +133,10 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
     project.run_job("--only", "ventes")
+    # reprise a un script, et nom de script inconnu
+    project.run_job("--from", "synthese")
+    with pytest.raises(AssertionError, match="Script inconnu : ventess"):
+        project.run_job("--only", "ventess")
     check = (
         "from core.session import get_session\n"
         "spark = get_session('demo')\n"
@@ -148,8 +160,10 @@ def check_generated_code(project: Project) -> None:
     ruff = shutil.which("ruff")
     if ruff:
         for cmd in (["format", "--check"], ["check", "--no-cache"]):
+            # depuis la racine du projet, comme on lance ruff en vrai
             res = subprocess.run(
-                [ruff, *cmd, "--config", config, str(src)],
+                [ruff, *cmd, "--config", config, "src/demo"],
+                cwd=project.path,
                 capture_output=True,
                 text=True,
             )
@@ -158,7 +172,9 @@ def check_generated_code(project: Project) -> None:
     if mypy:
         res = subprocess.run(
             [mypy, "--config-file", config, "--cache-dir", os.devnull]
-            + ["--explicit-package-bases", "job.py", "scripts"],
+            + [
+                str(p.name) for p in sorted(src.glob("*.py")) if p.name != "__init__.py"
+            ],
             cwd=src,
             env=dict(os.environ, MYPYPATH=JOB_PATH),
             capture_output=True,
