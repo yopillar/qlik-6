@@ -36,6 +36,7 @@ if TYPE_CHECKING:  # pyspark est facultatif pour les controles statiques
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from conf import work_dir  # noqa: E402
+from qlik2sql import FILE_VIEW_SUFFIX  # noqa: E402
 
 FORBIDDEN = (
     "CREATE",
@@ -176,6 +177,10 @@ class SparkChecker:
                     self.spark.sql(
                         f"SELECT {', '.join(cols)} WHERE false"
                     ).createOrReplaceTempView(name)
+                    # vue de FileTime(), creee par read_input a cote de l'entree
+                    self.spark.sql(
+                        "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
+                    ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
                 schema = self.spark.sql(sql).schema  # rien n'est execute
                 # Types des colonnes produites, tels que Spark les ecrira :
                 # fill_conf.py s'en sert pour le schema d'un fichier relu par
@@ -413,7 +418,8 @@ def check_section(
 
     # vues et CTE lues par la requete
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents, re.I)}
-    allowed = ctes | {v.lower() for v in section.get("views", {})}
+    views = {v.lower() for v in section.get("views", {})}
+    allowed = ctes | views | {v + FILE_VIEW_SUFFIX for v in views}
     unknown = []
     # Hors mode ANSI, "FROM t WHERE (x)" est lu comme l'alias WHERE avec une
     # colonne renommee en x : le filtre disparait sans erreur.
@@ -452,8 +458,8 @@ def check_section(
         errors.append(
             "monotonically_increasing_id() interdit : Spark le refuse dans un "
             "agregat ou une jointure, et il renumerote les lignes. Reprendre "
-            "_qlik_order de la source ; pour un INLINE, ecrire array(0L), "
-            "array(1L)... sur chaque ligne du VALUES"
+            "_qlik_order de la source ; pour un INLINE, numeroter les lignes du "
+            "VALUES (0, 1...) et faire array(CAST(__n AS BIGINT))"
         )
     bad = unknown_prefixes(code, allowed)
     if bad:

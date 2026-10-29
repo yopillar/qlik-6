@@ -183,6 +183,8 @@ def test_read_input_gives_a_dataframe_and_optionally_a_table(
         "df = read_input('ventes', table='in_ventes')\n"
         "print('cols', df.columns)\n"
         "print('vue', spark.table('in_ventes').columns[-1])\n"
+        "t = spark.sql('SELECT file_time FROM in_ventes__file').first()[0]\n"
+        "print('fichier', type(t).__name__)\n"
     )
     res = subprocess.run(
         [sys.executable, "-c", code],
@@ -196,3 +198,5 @@ def test_read_input_gives_a_dataframe_and_optionally_a_table(
     # meme DataFrame dans les deux cas ; la vue a en plus l'ordre Qlik
     assert out[0] == out[2] and "_qlik_order" not in out[0]
     assert out[3] == "vue _qlik_order"
+    # FileTime() : date du fichier, dans la vue in_ventes__file
+    assert out[4] == "fichier datetime"

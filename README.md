@@ -75,7 +75,12 @@ socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
 
 `read_input(nom)` renvoie l'entree en DataFrame (usage PySpark classique) ;
 `read_input(nom, table="in_x")` la range en plus dans la table `in_x` pour
-les requetes SQL, avec l'ordre de lecture Qlik. Une seule fonction, dans
+les requetes SQL, avec l'ordre de lecture Qlik, et cree `in_x__file` : une
+ligne, `file_time`, la date de modification du fichier. C'est ce que lit
+`FileTime()` de Qlik, traduit en `(SELECT file_time FROM in_x__file)`. Spark
+ne la calcule que si une requete la lit. Elle vient de la colonne cachee
+`_metadata` de Spark, qui disparait des que la table passe par une vue :
+d'ou une vue a part, a reporter dans le socle. Une seule fonction, dans
 `datasets.py`, que `tables.py` reprend.
 
 Seul le nom des packages differe (`core`, `commons`). Les tests passent par
@@ -270,6 +275,10 @@ def run() -> None:
   valeur chargee comme Qlik.
 - `Exists(champ[, expr])` et `NOT Exists(...)`, y compris le dedoublonnage
   quand le LOAD charge lui-meme le champ.
+- `FileTime()` dans un `LOAD ... FROM fichier`, et `FileTime('fichier')`
+  quand c'est le fichier du LOAD : date de modification du fichier lu (voir
+  `read_input`). Pour un autre fichier, c'est laisse au modele : il n'est
+  peut-etre pas declare dans `conf/io.yml`.
 - Les variables `LET` calculees (`Peek`, `NoOfRows`, `Today()`...), remplacees
   par leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
 - Les dates a la Qlik : `date - date` donne un nombre de jours, `Floor` et
@@ -321,8 +330,9 @@ technique `_qlik_order` (`array<bigint>`) :
 - a la lecture, on la reprend si elle est deja dans le fichier (fichier
   ecrit par un job migre). Sinon on numerote les lignes dans l'ordre de
   lecture, avant toute autre operation.
-- un `INLINE` porte son numero en dur sur chaque ligne :
-  `VALUES ('1', 'Un', array(0L)), ('2', 'Deux', array(1L))`. Les requetes
+- un `INLINE` porte son numero de ligne en dur, sans fonction dans le
+  `VALUES` : `SELECT Code, Lib, array(CAST(__n AS BIGINT)) AS _qlik_order
+  FROM VALUES ('1', 'Un', 0), ('2', 'Deux', 1) AS t(Code, Lib, __n)`. Les requetes
   n'utilisent jamais `monotonically_increasing_id()` : Spark le refuse dans
   un agregat (`min`, `GROUP BY`) ou une condition de jointure, et il
   renumerote les lignes s'il est recalcule. Le controle refuse une requete

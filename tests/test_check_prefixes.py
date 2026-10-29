@@ -17,8 +17,8 @@ def test_invented_prefix_on_inline() -> None:
     sql = """WITH t_1 AS (
       SELECT v.Code, row_number() OVER (ORDER BY pos._qlik_order) AS Pos,
              pos._qlik_order
-      FROM (SELECT * FROM VALUES ('1', 'a', array(0L)), ('2', 'b', array(1L))
-            AS v(Code, Lib, _qlik_order)) v
+      FROM (SELECT Code, Lib, array(CAST(__n AS BIGINT)) AS _qlik_order
+            FROM VALUES ('1', 'a', 0), ('2', 'b', 1) AS v(Code, Lib, __n)) v
     ) SELECT * FROM t_1"""
     assert prefixes(sql) == ["pos._qlik_order"]
     assert prefixes(sql.replace("pos.", "v.")) == []

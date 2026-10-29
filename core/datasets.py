@@ -2,6 +2,8 @@
 
     df = read_input("ventes")                      un DataFrame, pour du PySpark
     read_input("ventes", table="in_ventes")        en plus, une table pour le SQL
+                                                   (et in_ventes__file pour
+                                                   FileTime())
 
 Une seule fonction pour les deux usages : avant, datasets.py renvoyait le
 DataFrame et tables.py le rangeait dans une vue sans rien renvoyer.
@@ -10,6 +12,7 @@ DataFrame et tables.py le rangeait dans une vue sans rien renvoyer.
 from __future__ import annotations
 
 from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from commons import add_load_order
 from core.internal import context
@@ -39,4 +42,28 @@ def read_input(name: str, table: str | None = None) -> DataFrame:
         add_load_order(df).createOrReplaceTempView(table)
         state.tables.append(table)
         state.read_locations.add(access.input_location(name))
+        times = file_times(df)
+        if times is not None:
+            times.createOrReplaceTempView(table + "__file")
+            state.tables.append(table + "__file")
     return df
+
+
+def file_times(df: DataFrame) -> DataFrame | None:
+    """Date de modification du fichier lu, pour FileTime() de Qlik.
+
+    Une ligne, une colonne file_time (la plus recente si l'entree est un
+    dossier de fichiers). Spark ne la calcule que si une requete la lit. La
+    colonne cachee _metadata n'existe que tant que la table sort tout droit
+    du fichier : il faut la prendre ici, pas dans la vue.
+
+    Args:
+        df: l'entree, telle que lue dans le fichier.
+
+    Returns:
+        La table d'une ligne, ou None si l'entree n'est pas un fichier.
+    """
+    try:
+        return df.select(F.max("_metadata.file_modification_time").alias("file_time"))
+    except Exception:  # pas un fichier (table, base) : pas de _metadata
+        return None
