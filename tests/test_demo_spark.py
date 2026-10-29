@@ -104,28 +104,41 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         "migrate.py", "script_qvd/", "--skip-selftest", "--var", "sorties=data/output"
     )
     job = (project / "src/demo/job.py").read_text(encoding="utf-8")
-    # rien de technique dans le job : pipeline, run_scripts, les scripts
-    assert "from spark_foundation import pipeline, run_scripts" in job
-    assert "SCRIPTS = " not in job and "def " in job and len(job.splitlines()) < 60
+    # rien de technique dans le job : pipeline et un appel par script
+    assert "from spark_foundation import pipeline" in job
+    assert "run_scripts" not in job and len(job.splitlines()) < 60
     # l'ordre des scripts est l'ordre des appels
-    calls = job[job.index("run_scripts(\n") :]
     assert (
-        calls.index("calendrier,") < calls.index("ventes,") < calls.index("synthese,")
+        job.index("calendrier.run()")
+        < job.index("ventes.run()")
+        < job.index("synthese.run()")
     )
-    ventes = (project / "src/demo/scripts/ventes.py").read_text(encoding="utf-8")
+    # les scripts sont des fichiers a cote de job.py, sans dossier (hors le
+    # cache que Python cree en lancant le job)
+    src = project / "src/demo"
+    folders = sorted(p.name for p in src.iterdir() if p.is_dir())
+    assert [f for f in folders if f != "__pycache__"] == ["sql"]
+    ventes = (src / "ventes.py").read_text(encoding="utf-8")
+    assert "from spark_foundation.runner import script" in ventes
+    assert "@script\ndef run() -> None:" in ventes
     assert (
         "from spark_foundation.tables import read_input, run_sql, write_output"
         in ventes
     )
-    assert 'read_input("ventes", table="in_ventes")' in ventes
-    assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
-    assert "Lit : ref_sites_2024, ventes." in ventes
+    # une liste des entrees, une liste des tables, et deux boucles
+    assert '"ventes": "in_ventes",' in ventes
+    assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in ventes
+    assert ventes.count("read_input(") == 1 and ventes.count("run_sql(") == 1
     check_generated_code(project)
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
     project.run_job("--only", "ventes")
+    # reprise a un script, et nom de script inconnu
+    project.run_job("--from", "synthese")
+    with pytest.raises(AssertionError, match="Script inconnu : ventess"):
+        project.run_job("--only", "ventess")
     check = (
-        "from core.internal.session import get_session\n"
+        "from core.session import get_session\n"
         "spark = get_session('demo')\n"
         "print(sorted(t.name for t in spark.catalog.listTables('demo_qlik')))\n"
     )
@@ -147,8 +160,10 @@ def check_generated_code(project: Project) -> None:
     ruff = shutil.which("ruff")
     if ruff:
         for cmd in (["format", "--check"], ["check", "--no-cache"]):
+            # depuis la racine du projet, comme on lance ruff en vrai
             res = subprocess.run(
-                [ruff, *cmd, "--config", config, str(src)],
+                [ruff, *cmd, "--config", config, "src/demo"],
+                cwd=project.path,
                 capture_output=True,
                 text=True,
             )
@@ -157,10 +172,47 @@ def check_generated_code(project: Project) -> None:
     if mypy:
         res = subprocess.run(
             [mypy, "--config-file", config, "--cache-dir", os.devnull]
-            + ["--explicit-package-bases", "job.py", "scripts"],
+            + [
+                str(p.name) for p in sorted(src.glob("*.py")) if p.name != "__init__.py"
+            ],
             cwd=src,
             env=dict(os.environ, MYPYPATH=JOB_PATH),
             capture_output=True,
             text=True,
         )
         assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_read_input_gives_a_dataframe_and_optionally_a_table(
+    project: Project,
+) -> None:
+    """read_input renvoie le DataFrame ; avec table, il cree aussi la vue."""
+    code = (
+        "from core.session import get_session\n"
+        "from core import context\n"
+        "from spark_foundation.datasets import read_input\n"
+        "spark = get_session('demo')\n"
+        "context.start_job('demo')\n"
+        "df = read_input('ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.catalog.tableExists('in_ventes'))\n"
+        "df = read_input('ventes', table='in_ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.table('in_ventes').columns[-1])\n"
+        "t = spark.sql('SELECT file_time FROM in_ventes__file').first()[0]\n"
+        "print('fichier', type(t).__name__)\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project.path,
+        env=dict(os.environ, PYTHONPATH=JOB_PATH, entrees="data/input"),
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout.splitlines()
+    assert out[1] == "vue False", res.stderr[-2000:]
+    # meme DataFrame dans les deux cas ; la vue a en plus l'ordre Qlik
+    assert out[0] == out[2] and "_qlik_order" not in out[0]
+    assert out[3] == "vue _qlik_order"
+    # FileTime() : date du fichier, dans la vue in_ventes__file
+    assert out[4] == "fichier datetime"

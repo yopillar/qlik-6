@@ -19,7 +19,7 @@ ignore = [
 known-first-party = ["conf", "prepare", "qlik2sql", "fill_conf", "compare",
                      "journal", "job_template", "orchestrate", "translate",
                      "check", "verify", "assemble", "migrate", "normalize",
-                     "conftest", "core", "commons", "scripts",
+                     "conftest", "core", "commons",
                      "spark_foundation", "pyspark_commons"]
 
 [tool.mypy]

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core.internal.session import active_session
+from core.session import active_session
 
 
 @dataclass
@@ -21,6 +21,11 @@ class JobState:
     script: str = ""  # script Qlik en cours
     tables: list[str] = field(default_factory=list)  # vues du script en cours
     read_locations: set[str] = field(default_factory=set)  # fichiers lus
+    database_ready: bool = False  # base deja creee
+    start: str | None = None  # --from
+    only: str | None = None  # --only
+    started: bool = False  # --from : le script de depart est passe
+    seen: list[str] = field(default_factory=list)  # scripts appeles
 
 
 _STATE = JobState()
@@ -35,15 +40,27 @@ def state() -> JobState:
     return _STATE
 
 
-def start_job(job_name: str) -> None:
-    """Remet l'etat a zero au lancement d'un job. Le dossier des requetes
-    est pose ensuite par run_scripts.
+def start_job(
+    job_name: str,
+    sql_dir: Path = Path("sql"),
+    database: str | None = None,
+    start: str | None = None,
+    only: str | None = None,
+) -> None:
+    """Remet l'etat a zero au lancement d'un job.
 
     Args:
         job_name: le nom du job.
+        sql_dir: le dossier des requetes du projet.
+        database: la base des tables intermediaires, ou None (vues
+            temporaires seulement).
+        start: --from, le script ou reprendre.
+        only: --only, le seul script a lancer.
     """
     global _STATE
-    _STATE = JobState(job_name=job_name)
+    _STATE = JobState(
+        job_name=job_name, sql_dir=sql_dir, database=database, start=start, only=only
+    )
 
 
 @contextmanager

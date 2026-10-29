@@ -7,7 +7,7 @@ from typing import Any
 from pyspark.sql import DataFrame, SparkSession
 
 from commons import LOAD_ORDER, cast_void_to_string, drop_columns
-from core.internal import config
+from core import config
 
 
 def read_config(spark: SparkSession, name: str) -> DataFrame:

@@ -22,7 +22,7 @@ mon-projet/
 |-- data/qlik_outputs/        sorties Qlik pour comparer, facultatif       (a fournir)
 |-- data/output/              donnees ecrites par le job                   (genere)
 |-- src/<nom-projet>/job.py   job du projet, tous les scripts dans l'ordre (genere)
-|-- src/<nom-projet>/scripts/ un module par script Qlik : ses etapes        (genere)
+|-- src/<nom-projet>/<script>.py un fichier par script Qlik, a cote de job.py (genere)
 |-- src/<nom-projet>/sql/     <script>__01_<table>.sql, ...                  (genere)
 |-- work/                     travail intermediaire, journal.csv           (genere)
 |-- .opencode/agents/translator.md
@@ -46,13 +46,14 @@ Le code genere n'importe que le socle, et seulement ces fonctions :
 
 | Import dans le code genere | Fichier du socle | Role |
 |---|---|---|
-| `from spark_foundation import pipeline, run_scripts` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session ; `run_scripts(args, script, ...)` enchaine les scripts et trouve `sql/` a cote de `job.py` |
-| `from spark_foundation.tables import read_input, run_sql, write_output` (`scripts/`) | `spark_foundation/tables.py` | lire une entree de `conf/io.yml`, calculer une table Qlik avec sa requete, l'ecrire |
+| `from spark_foundation import pipeline` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session, lit `--from`, `--only`, `--database`, `--temp-views` et trouve `sql/` a cote de `job.py` |
+| `from spark_foundation.runner import script` (`<script>.py`) | `spark_foundation/runner.py` | `@script` sur le `run()` d'un script : `--from` / `--only`, vues du script, arret au premier echec |
+| `from spark_foundation.tables import read_input, run_sql, write_output` (`<script>.py`) | `spark_foundation/tables.py` | lire une entree de `conf/io.yml`, calculer une table Qlik avec sa requete, l'ecrire |
 
-- `spark_foundation/internal/` : session et reglages SQL (`session.py`),
+- les autres fichiers du socle, a plat (aucun sous-dossier) : session et reglages SQL (`session.py`),
   lecture de `conf/io.yml` (`config.py`), etat du job (`context.py`),
   tables du catalogue pour OpenLineage (`lineage.py`), lecture et ecriture
-  des fichiers (`io/access.py` : `read_config`, `write_config`,
+  des fichiers (`access.py` : `read_config`, `write_config`,
   `input_location`, `output_location`). Reserve aux data engineers.
 - `pyspark_commons` : uniquement des transformations de DataFrame (ordre de
   chargement Qlik, colonnes). Le socle s'en sert ; le job ne l'importe
@@ -63,14 +64,25 @@ socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
 
 | Ici | Dans le socle | Contenu |
 |---|---|---|
-| `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `run_scripts`, `script_name`, `parse_options`, `select` |
-| `core/tables.py` | `spark_foundation/tables.py` | `read_input`, `write_output`, `run_sql` |
-| `core/internal/session.py` | `internal/session.py` | `get_session`, `active_session` |
-| `core/internal/config.py` | `internal/config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
-| `core/internal/context.py` | `internal/context.py` | `JobState`, `state`, `start_job`, `script_scope` |
-| `core/internal/lineage.py` | `internal/lineage.py` | `ensure_database`, `table_name`, `materialize` |
-| `core/internal/io/access.py` | `internal/io/access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
+| `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `script`, `parse_options` (plus de `run_scripts`) |
+| `core/datasets.py` | `spark_foundation/datasets.py` | `read_input` : la seule definition |
+| `core/tables.py` | `spark_foundation/tables.py` | `write_output`, `run_sql`, et `read_input` repris de `datasets.py` |
+| `core/session.py` | `session.py` | `get_session`, `active_session` |
+| `core/config.py` | `config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
+| `core/context.py` | `context.py` | `JobState`, `state`, `start_job`, `script_scope` |
+| `core/lineage.py` | `lineage.py` | `ensure_database`, `table_name`, `materialize` |
+| `core/access.py` | `access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
 | `commons/` | `pyspark_commons` | `add_load_order`, `cast_void_to_string`, `drop_columns` |
+
+`read_input(nom)` renvoie l'entree en DataFrame (usage PySpark classique) ;
+`read_input(nom, table="in_x")` la range en plus dans la table `in_x` pour
+les requetes SQL, avec l'ordre de lecture Qlik, et cree `in_x__file` : une
+ligne, `file_time`, la date de modification du fichier. C'est ce que lit
+`FileTime()` de Qlik, traduit en `(SELECT file_time FROM in_x__file)`. Spark
+ne la calcule que si une requete la lit. Elle vient de la colonne cachee
+`_metadata` de Spark, qui disparait des que la table passe par une vue :
+d'ou une vue a part, a reporter dans le socle. Une seule fonction, dans
+`datasets.py`, que `tables.py` reprend.
 
 Seul le nom des packages differe (`core`, `commons`). Les tests passent par
 `tests/fakelib/spark_foundation/`, qui expose `core/` sous le nom du socle
@@ -81,8 +93,7 @@ genere).
 Toute fonction, classe et module de `core/`, `commons/` et `tools/` a une
 docstring et des annotations de type (`DataFrame` pour un DataFrame) :
 `ruff` (regles `D1` et `ANN`) et `mypy` le verifient. Le code genere
-(`job.py`, `scripts/`) aussi : la docstring de chaque script dit ce qu'il
-lit, calcule et ecrit, et le test de bout en bout passe le projet genere a
+(`job.py`, `<script>.py`) aussi, et le test de bout en bout passe le projet genere a
 `ruff` et `mypy`.
 
 Le texte du job et des modules de scripts est dans
@@ -156,35 +167,58 @@ le socle a l'ouverture de la session, il n'y a donc pas de `--conf` a passer.
 Le job tient en quelques lignes :
 
 ```python
+import calendrier
+import synthese
+import ventes
+
+
 @pipeline("demo")
 def run(spark: SparkSession, args: list[str]) -> None:
-    run_scripts(
-        args,
-        calendrier,
-        ventes,
-        synthese,  # apres ventes, dont il lit les sorties
-    )
+    calendrier.run()
+    ventes.run()
+    synthese.run()  # apres ventes, dont il lit les sorties
 ```
 
-et chaque script Qlik devient un module de `scripts/`, une ligne par etape :
+et chaque script Qlik devient un fichier a cote de `job.py`
+(`src/<nom-projet>/ventes.py`, pas de sous-dossier, seul `sql/` en est un)
+avec la liste de ses
+entrees, la liste de ses tables dans l'ordre, et deux boucles. Avec 50
+tables, on ajoute 50 lignes aux listes, pas 140 appels de fonction :
 
 ```python
+INPUTS: dict[str, str] = {
+    "ventes": "in_ventes",
+}
+
+TABLES: list[tuple[str, str, str | None]] = [
+    ("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),
+    ("ventes__02_clients.sql", "Clients", None),  # None : pas de STORE
+]
+
+
+@script
 def run() -> None:
     """Rejoue le script ventes.qvs."""
-    read_input("ventes", table="in_ventes")
-    run_sql("ventes__01_ventes.sql", table="Ventes")
-    write_output("ventes_enrichies_v2", table="Ventes")
+    for name, table in INPUTS.items():
+        read_input(name, table=table)
+    for sql_file, table, output in TABLES:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 ```
 
-- L'ordre des scripts est l'ordre des appels dans `run_scripts`, il n'y a
-  pas de liste a part. Il compte encore : un script qui lit un fichier
+- L'ordre des scripts est l'ordre des appels dans `job.py`, il n'y a pas
+  de liste a part. Il compte encore : un script qui lit un fichier
   ecrit par un autre doit passer apres lui, comme avec l'enchainement des
   taches de rechargement dans Qlik. `orchestrate.py` le calcule a partir de
   `work/stores.json` (ce que chaque script lit et ecrit) et le note en
   commentaire. Dans un script, l'ordre des etapes est celui du script Qlik.
 - Le job s'arrete au premier script en echec, comme un rechargement Qlik :
   les suivants liraient des donnees absentes ou d'hier. L'erreur dit d'ou
-  reprendre (`--from <script>`). Toutes les ecritures sont en overwrite,
+  reprendre (`--from <script>`) : `@script` fait sauter les scripts d'avant.
+  Un nom inconnu a `--from` ou `--only` est signale a la fin du job. Un
+  script dont le nom est deja pris par Python ou le socle (`calendar`,
+  `json`, `job`...) prend le suffixe `_qlik`, pour ne pas les cacher. Toutes les ecritures sont en overwrite,
   relancer ne cree donc pas de doublon.
 - Les lectures et ecritures passent par `read_input` et `write_output`,
   avec les noms de `conf/io.yml`. La location, le format et la resolution
@@ -249,6 +283,10 @@ def run() -> None:
   valeur chargee comme Qlik.
 - `Exists(champ[, expr])` et `NOT Exists(...)`, y compris le dedoublonnage
   quand le LOAD charge lui-meme le champ.
+- `FileTime()` dans un `LOAD ... FROM fichier`, et `FileTime('fichier')`
+  quand c'est le fichier du LOAD : date de modification du fichier lu (voir
+  `read_input`). Pour un autre fichier, c'est laisse au modele : il n'est
+  peut-etre pas declare dans `conf/io.yml`.
 - Les variables `LET` calculees (`Peek`, `NoOfRows`, `Today()`...), remplacees
   par leur expression, y compris dans `AUTOGENERATE vMax - vMin + 1`.
 - Les dates a la Qlik : `date - date` donne un nombre de jours, `Floor` et
@@ -300,6 +338,13 @@ technique `_qlik_order` (`array<bigint>`) :
 - a la lecture, on la reprend si elle est deja dans le fichier (fichier
   ecrit par un job migre). Sinon on numerote les lignes dans l'ordre de
   lecture, avant toute autre operation.
+- un `INLINE` porte son numero de ligne en dur, sans fonction dans le
+  `VALUES` : `SELECT Code, Lib, array(CAST(__n AS BIGINT)) AS _qlik_order
+  FROM VALUES ('1', 'Un', 0), ('2', 'Deux', 1) AS t(Code, Lib, __n)`. Les requetes
+  n'utilisent jamais `monotonically_increasing_id()` : Spark le refuse dans
+  un agregat (`min`, `GROUP BY`) ou une condition de jointure, et il
+  renumerote les lignes s'il est recalcule. Le controle refuse une requete
+  du modele qui l'utilise.
 - elle suit ensuite les regles de Qlik : `ORDER BY` (et a egalite l'ordre
   d'avant), `CONCATENATE` (les lignes ajoutees passent apres), `JOIN`
   (l'ordre de la table de gauche, puis les lignes sans correspondance),
@@ -506,6 +551,11 @@ ambigue...) bloque la table avant qu'elle n'arrive dans le job. Une colonne
 introuvable est seulement signalee quand les colonnes de la table amont ont
 ete deduites du script, faute de schema, parce qu'on n'en est pas sur.
 
+Le controle refuse aussi un prefixe `x.colonne` qui ne designe ni une CTE,
+ni une vue, ni un alias de la requete (le modele a deja ecrit
+`pos._qlik_order` pour un INLINE aliase `v(...)`). Une requete qui ne lit
+aucune vue (INLINE, AUTOGENERATE) est quand meme analysee par Spark.
+
 Les erreurs deja presentes dans le brouillon avant que le modele n'y touche
 viennent du traducteur. On ne les lui renvoie jamais, sinon il cherche a
 corriger ce qui n'est pas de son fait.
@@ -611,10 +661,10 @@ tests sont sautes.
 | `conf.py` | lecture de `conf/io.yml` et des schemas |
 | `fill_conf.py` | complete `conf/io.yml` et les schemas (lance par `migrate.py`) |
 | `assemble.py` | copie des requetes d'un script dans `src/<nom-projet>/sql/` |
-| `job_template.py` | texte du job et des modules de `scripts/` |
+| `job_template.py` | texte du job et des fichiers de scripts |
 | `verify.py` | lance le job et compare avec `data/qlik_outputs/` |
 | `compare.py` | comparaison de deux tables |
-| `orchestrate.py` | genere `job.py` et `scripts/`, ordonne les scripts |
+| `orchestrate.py` | genere `job.py` et un fichier par script, ordonne les scripts |
 | `journal.py` | tenue de `work/journal.csv` |
 
 ## Limites connues

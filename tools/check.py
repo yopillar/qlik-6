@@ -36,6 +36,7 @@ if TYPE_CHECKING:  # pyspark est facultatif pour les controles statiques
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal  # noqa: E402
 from conf import work_dir  # noqa: E402
+from qlik2sql import FILE_VIEW_SUFFIX  # noqa: E402
 
 FORBIDDEN = (
     "CREATE",
@@ -158,8 +159,9 @@ class SparkChecker:
         Spark (output_types).
         """
         views = section.get("views", {})
-        if not views or any(not v.get("columns") for v in views.values()):
-            # on ne connait pas toutes les colonnes
+        if any(not v.get("columns") for v in views.values()):
+            # on ne connait pas toutes les colonnes ; sans aucune vue (INLINE,
+            # AUTOGENERATE), il n'y a rien a declarer et on analyse quand meme
             return None
         with self.lock:
             try:
@@ -175,6 +177,10 @@ class SparkChecker:
                     self.spark.sql(
                         f"SELECT {', '.join(cols)} WHERE false"
                     ).createOrReplaceTempView(name)
+                    # vue de FileTime(), creee par read_input a cote de l'entree
+                    self.spark.sql(
+                        "SELECT CAST(NULL AS TIMESTAMP) AS file_time"
+                    ).createOrReplaceTempView(name + FILE_VIEW_SUFFIX)
                 schema = self.spark.sql(sql).schema  # rien n'est execute
                 # Types des colonnes produites, tels que Spark les ecrira :
                 # fill_conf.py s'en sert pour le schema d'un fichier relu par
@@ -247,6 +253,112 @@ def is_table_from(code: str, pos: int) -> bool:
     return True
 
 
+# Mots qui peuvent suivre une table sans etre son alias.
+NOT_ALIASES = {
+    "where",
+    "group",
+    "order",
+    "having",
+    "limit",
+    "union",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "full",
+    "cross",
+    "outer",
+    "semi",
+    "anti",
+    "on",
+    "using",
+    "lateral",
+    "window",
+    "except",
+    "intersect",
+    "minus",
+    "natural",
+    "select",
+}
+
+
+def closes_a_source(code: str, close: int) -> bool:
+    """Dit si la parenthese fermante a close termine une source de donnees :
+    sous-requete (SELECT, WITH), lignes de VALUES ou fonction-table apres
+    FROM / JOIN (range(...)). Sinon c'est une expression, et le nom qui suit
+    est celui d'une colonne.
+
+    Args:
+        code: la requete.
+        close: position de la parenthese fermante.
+
+    Returns:
+        Vrai pour une source de donnees.
+    """
+    depth = 0
+    for k in range(close - 1, -1, -1):
+        if code[k] == ")":
+            depth += 1
+        elif code[k] == "(":
+            if depth:
+                depth -= 1
+                continue
+            inner = code[k + 1 : close]
+            before = code[:k].rstrip()
+            return bool(
+                re.match(r"\s*(SELECT|WITH|VALUES)\b", inner, re.I)
+                or re.search(r"(\bVALUES|,)$", before, re.I)
+                and re.search(r"\bVALUES\b", code[:k], re.I)
+                or re.search(r"\b(FROM|JOIN)\s+[A-Za-z_]\w*$", before, re.I)
+            )
+    return False
+
+
+def unknown_prefixes(code: str, known: set[str]) -> list[str]:
+    """Prefixes x de x.colonne qui ne designent rien dans la requete.
+
+    Un prefixe doit etre une CTE, une vue, ou un alias pose dans la
+    requete : FROM t a, JOIN t AS a, (sous-requete) a, VALUES ... AS v(...).
+    Le modele invente parfois un prefixe (pos._qlik_order) : sans vue en
+    entree, Spark ne le voit pas, et avec il n'en fait qu'un avertissement.
+
+    Args:
+        code: la requete, sans commentaires ni chaines.
+        known: les CTE et les vues, en minuscules.
+
+    Returns:
+        Les references fautives (pos._qlik_order...), dans l'ordre.
+    """
+    words = r"[A-Za-z_]\w*|`(?:``|[^`])*`"
+    defined = set(known)
+    # alias apres une table, une sous-requete ou une fonction-table
+    for m in re.finditer(
+        rf"(?:\b(?:FROM|JOIN)\s+(?:{words})(?:\.(?:{words}))*|\))\s+"
+        rf"(?:AS\s+)?({words})",
+        code,
+        re.I,
+    ):
+        name = m.group(1).strip("`").lower()
+        if name in NOT_ALIASES:
+            continue
+        if m.group(0).startswith(")") and not closes_a_source(code, m.start()):
+            continue  # ") AS x" d'une expression : un nom de colonne
+        defined.add(name)
+    # alias de LATERAL VIEW explode(...) t AS c
+    for m in re.finditer(rf"\bLATERAL\s+VIEW\s+[^)]*\)\s+({words})", code, re.I):
+        defined.add(m.group(1).strip("`").lower())
+    bad: list[str] = []
+    for m in re.finditer(rf"(?<![\w.`])({words})\.({words}|\*)", code):
+        before = code[: m.start()].rstrip()
+        if re.search(r"\b(?:FROM|JOIN)$", before, re.I):
+            continue  # base.table : nom qualifie d'une table
+        prefix = m.group(1).strip("`").lower()
+        ref = m.group(0)
+        if prefix not in defined and ref not in bad:
+            bad.append(ref)
+    return bad
+
+
 def check_section(
     section: dict, query_path: Path, parser: SparkChecker | None = None
 ) -> tuple[list[str], list[str]]:
@@ -306,7 +418,8 @@ def check_section(
 
     # vues et CTE lues par la requete
     ctes = {m.lower() for m in re.findall(r"(\w+)\s+AS\s*\(", code_no_idents, re.I)}
-    allowed = ctes | {v.lower() for v in section.get("views", {})}
+    views = {v.lower() for v in section.get("views", {})}
+    allowed = ctes | views | {v + FILE_VIEW_SUFFIX for v in views}
     unknown = []
     # Hors mode ANSI, "FROM t WHERE (x)" est lu comme l'alias WHERE avec une
     # colonne renommee en x : le filtre disparait sans erreur.
@@ -339,6 +452,20 @@ def check_section(
             f"table ou vue inconnue : {', '.join(unknown)} (vues "
             f"autorisees : {', '.join(sorted(section.get('views', {}))) or 'aucune'}"
             " + les CTE de la requete)"
+        )
+
+    if re.search(r"\bmonotonically_increasing_id\s*\(", code_no_idents, re.I):
+        errors.append(
+            "monotonically_increasing_id() interdit : Spark le refuse dans un "
+            "agregat ou une jointure, et il renumerote les lignes. Reprendre "
+            "_qlik_order de la source ; pour un INLINE, numeroter les lignes du "
+            "VALUES (0, 1...) et faire array(CAST(__n AS BIGINT))"
+        )
+    bad = unknown_prefixes(code, allowed)
+    if bad:
+        errors.append(
+            f"prefixe inconnu : {', '.join(bad)} (ni CTE, ni vue, ni alias "
+            "defini dans la requete)"
         )
 
     # colonnes de sortie

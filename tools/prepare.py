@@ -1757,6 +1757,14 @@ helper CTEs before them if needed (new names). Be concise.
    `ORDER BY _qlik_order` for Peek, Previous, FirstValue, LastValue.
 10. Wide tables: only the columns the Qlik code uses are listed. The others
    exist: keep them with `*` (or `alias.*`), never list or invent them.
+11. A prefix `x.col` must be a CTE, a view or an alias defined in the same
+   SELECT: never invent one such as `pos._qlik_order`. For an INLINE, number
+   the rows and build the array in the SELECT:
+   `SELECT c1, c2, array(CAST(__n AS BIGINT)) AS _qlik_order
+    FROM VALUES ('1', 'a', 0), ('2', 'b', 1) AS v(c1, c2, __n)`.
+12. Never use `monotonically_increasing_id()`: Spark refuses it in an
+   aggregate or a join, and it renumbers rows. Take `_qlik_order` from the
+   source instead.
 
 # Draft query (to complete)
 Already translated CTEs are summarised by their columns (`...`): you can
