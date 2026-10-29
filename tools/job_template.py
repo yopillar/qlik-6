@@ -16,10 +16,10 @@ transformations dans pyspark_commons.
 
 from __future__ import annotations
 
+import json
 import keyword
 import os
 import re
-import textwrap
 from pathlib import Path
 
 
@@ -110,43 +110,32 @@ if __name__ == "__main__":
 SCRIPT = '''"""Script Qlik {script}, traduit en Spark SQL.
 
 Fichier genere par tools/orchestrate.py : ne pas le modifier a la main.
-Chaque ligne est une etape du script Qlik, dans l'ordre :
-    read_input    LOAD ... FROM un fichier de conf/io.yml
-    run_sql       une table Qlik, calculee par sa requete du dossier sql/
-    write_output  STORE de la table dans un fichier de conf/io.yml
+Le script lit ses fichiers d'entree, puis calcule ses tables une par une,
+dans l'ordre du script Qlik, et ecrit celles qui avaient un STORE.
 """
 
 from __future__ import annotations
-{imports}
+
+from spark_foundation.tables import read_input, run_sql, write_output
+
+# Fichiers lus par le script (LOAD ... FROM) :
+# nom dans conf/io.yml -> nom de la table dans les requetes SQL
+INPUTS: dict[str, str] = {inputs}
+
+# Tables du script, dans l'ordre :
+# (requete du dossier sql/, nom de la table, sortie dans conf/io.yml ou None)
+TABLES: list[tuple[str, str, str | None]] = [{tables}]
+
 
 def run() -> None:
-    """Rejoue le script {script}.
-
-{summary}
-    """
-{body}
+    """Rejoue le script {script}."""
+    for name, table in INPUTS.items():
+        read_input(name, table=table)
+    for sql_file, table, output in TABLES:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 '''
-
-
-def _summary_line(label: str, names: list[str]) -> str:
-    """Une ligne de la docstring d'un script : "Lit : a, b.", repliee.
-
-    Args:
-        label: Lit, Calcule ou Ecrit.
-        names: les noms a lister, dans l'ordre, sans doublon.
-
-    Returns:
-        Le texte indente pour la docstring, ou "" s'il n'y a rien.
-    """
-    if not names:
-        return ""
-    return textwrap.fill(
-        f"{label} : {', '.join(dict.fromkeys(names))}.",
-        width=84,
-        initial_indent="    ",
-        subsequent_indent="        ",
-        break_on_hyphens=False,
-    )
 
 
 def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
@@ -171,8 +160,33 @@ def render_job(project: str, scripts: list[tuple[str, list[str]]]) -> str:
     return JOB.format(project=project, imports=imports, calls=calls)
 
 
+def _literal(value: str | None) -> str:
+    """Valeur Python ecrite dans le code genere : "texte" ou None."""
+    return "None" if value is None else json.dumps(value)
+
+
+def _table_line(sql_file: str, table: str, output: str | None) -> str:
+    """Une ligne de TABLES, mise en forme comme le ferait ruff format.
+
+    Args:
+        sql_file: la requete.
+        table: le nom de la table.
+        output: la sortie, ou None.
+
+    Returns:
+        La ligne, ou le tuple sur plusieurs lignes s'il depasse 88 caracteres.
+    """
+    values = [_literal(sql_file), _literal(table), _literal(output)]
+    line = f"    ({', '.join(values)}),"
+    if len(line) <= 88:
+        return line
+    inner = "".join(f"        {v},\n" for v in values)
+    return f"    (\n{inner}    ),"
+
+
 def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str:
-    """Code de scripts/<script>.py.
+    """Code de scripts/<script>.py : deux listes et deux boucles, quel que
+    soit le nombre de tables.
 
     Args:
         script: le nom du fichier du script Qlik (ventes.qvs).
@@ -183,24 +197,15 @@ def render_script(script: str, inputs: dict[str, str], steps: list[list]) -> str
     Returns:
         Le code du module.
     """
-    lines = [f'    read_input("{io}", table="{view}")' for view, io in inputs.items()]
-    for sql_file, table, output, *_ in steps:
-        lines.append(f'    run_sql("{sql_file}", table="{table}")')
-        if output:
-            lines.append(f'    write_output("{output}", table="{table}")')
-    used = ["read_input"] if inputs else []
-    used += ["run_sql"] if steps else []
-    used += ["write_output"] if any(st[2] for st in steps) else []
-    summary = [
-        _summary_line("Lit", list(inputs.values())),
-        _summary_line("Calcule", [st[1] for st in steps]),
-        _summary_line("Ecrit", [st[2] for st in steps if st[2]]),
-    ]
+    entries = "".join(
+        f"    {_literal(io)}: {_literal(view)},\n" for view, io in inputs.items()
+    )
+    tables = "".join(
+        _table_line(sql_file, table, output or None) + "\n"
+        for sql_file, table, output, *_ in steps
+    )
     return SCRIPT.format(
         script=script,
-        imports=f"\nfrom spark_foundation.tables import {', '.join(used)}\n"
-        if used
-        else "",
-        summary="\n".join(x for x in summary if x) or "    Rien a faire.",
-        body="\n".join(lines) or "    pass",
+        inputs=f"{{\n{entries}}}" if entries else "{}",
+        tables=f"\n{tables}" if tables else "",
     )

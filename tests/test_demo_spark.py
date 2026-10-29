@@ -117,9 +117,10 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
         "from spark_foundation.tables import read_input, run_sql, write_output"
         in ventes
     )
-    assert 'read_input("ventes", table="in_ventes")' in ventes
-    assert 'write_output("ventes_enrichies_v2", table="Ventes")' in ventes
-    assert "Lit : ref_sites_2024, ventes." in ventes
+    # une liste des entrees, une liste des tables, et deux boucles
+    assert '"ventes": "in_ventes",' in ventes
+    assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in ventes
+    assert ventes.count("read_input(") == 1 and ventes.count("run_sql(") == 1
     check_generated_code(project)
     # le metastore local garde les tables d'un lancement a l'autre ; on
     # relance ventes pour verifier qu'une table existante est bien remplacee
@@ -164,3 +165,34 @@ def check_generated_code(project: Project) -> None:
             text=True,
         )
         assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_read_input_gives_a_dataframe_and_optionally_a_table(
+    project: Project,
+) -> None:
+    """read_input renvoie le DataFrame ; avec table, il cree aussi la vue."""
+    code = (
+        "from core.internal.session import get_session\n"
+        "from core.internal import context\n"
+        "from spark_foundation.datasets import read_input\n"
+        "spark = get_session('demo')\n"
+        "context.start_job('demo')\n"
+        "df = read_input('ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.catalog.tableExists('in_ventes'))\n"
+        "df = read_input('ventes', table='in_ventes')\n"
+        "print('cols', df.columns)\n"
+        "print('vue', spark.table('in_ventes').columns[-1])\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=project.path,
+        env=dict(os.environ, PYTHONPATH=JOB_PATH, entrees="data/input"),
+        capture_output=True,
+        text=True,
+    )
+    out = res.stdout.splitlines()
+    assert out[1] == "vue False", res.stderr[-2000:]
+    # meme DataFrame dans les deux cas ; la vue a en plus l'ordre Qlik
+    assert out[0] == out[2] and "_qlik_order" not in out[0]
+    assert out[3] == "vue _qlik_order"

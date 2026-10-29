@@ -158,8 +158,9 @@ class SparkChecker:
         Spark (output_types).
         """
         views = section.get("views", {})
-        if not views or any(not v.get("columns") for v in views.values()):
-            # on ne connait pas toutes les colonnes
+        if any(not v.get("columns") for v in views.values()):
+            # on ne connait pas toutes les colonnes ; sans aucune vue (INLINE,
+            # AUTOGENERATE), il n'y a rien a declarer et on analyse quand meme
             return None
         with self.lock:
             try:
@@ -245,6 +246,112 @@ def is_table_from(code: str, pos: int) -> bool:
                 return bool(re.search(r"\bSELECT\b", code[k:pos], re.I))
             depth -= 1
     return True
+
+
+# Mots qui peuvent suivre une table sans etre son alias.
+NOT_ALIASES = {
+    "where",
+    "group",
+    "order",
+    "having",
+    "limit",
+    "union",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "full",
+    "cross",
+    "outer",
+    "semi",
+    "anti",
+    "on",
+    "using",
+    "lateral",
+    "window",
+    "except",
+    "intersect",
+    "minus",
+    "natural",
+    "select",
+}
+
+
+def closes_a_source(code: str, close: int) -> bool:
+    """Dit si la parenthese fermante a close termine une source de donnees :
+    sous-requete (SELECT, WITH), lignes de VALUES ou fonction-table apres
+    FROM / JOIN (range(...)). Sinon c'est une expression, et le nom qui suit
+    est celui d'une colonne.
+
+    Args:
+        code: la requete.
+        close: position de la parenthese fermante.
+
+    Returns:
+        Vrai pour une source de donnees.
+    """
+    depth = 0
+    for k in range(close - 1, -1, -1):
+        if code[k] == ")":
+            depth += 1
+        elif code[k] == "(":
+            if depth:
+                depth -= 1
+                continue
+            inner = code[k + 1 : close]
+            before = code[:k].rstrip()
+            return bool(
+                re.match(r"\s*(SELECT|WITH|VALUES)\b", inner, re.I)
+                or re.search(r"(\bVALUES|,)$", before, re.I)
+                and re.search(r"\bVALUES\b", code[:k], re.I)
+                or re.search(r"\b(FROM|JOIN)\s+[A-Za-z_]\w*$", before, re.I)
+            )
+    return False
+
+
+def unknown_prefixes(code: str, known: set[str]) -> list[str]:
+    """Prefixes x de x.colonne qui ne designent rien dans la requete.
+
+    Un prefixe doit etre une CTE, une vue, ou un alias pose dans la
+    requete : FROM t a, JOIN t AS a, (sous-requete) a, VALUES ... AS v(...).
+    Le modele invente parfois un prefixe (pos._qlik_order) : sans vue en
+    entree, Spark ne le voit pas, et avec il n'en fait qu'un avertissement.
+
+    Args:
+        code: la requete, sans commentaires ni chaines.
+        known: les CTE et les vues, en minuscules.
+
+    Returns:
+        Les references fautives (pos._qlik_order...), dans l'ordre.
+    """
+    words = r"[A-Za-z_]\w*|`(?:``|[^`])*`"
+    defined = set(known)
+    # alias apres une table, une sous-requete ou une fonction-table
+    for m in re.finditer(
+        rf"(?:\b(?:FROM|JOIN)\s+(?:{words})(?:\.(?:{words}))*|\))\s+"
+        rf"(?:AS\s+)?({words})",
+        code,
+        re.I,
+    ):
+        name = m.group(1).strip("`").lower()
+        if name in NOT_ALIASES:
+            continue
+        if m.group(0).startswith(")") and not closes_a_source(code, m.start()):
+            continue  # ") AS x" d'une expression : un nom de colonne
+        defined.add(name)
+    # alias de LATERAL VIEW explode(...) t AS c
+    for m in re.finditer(rf"\bLATERAL\s+VIEW\s+[^)]*\)\s+({words})", code, re.I):
+        defined.add(m.group(1).strip("`").lower())
+    bad: list[str] = []
+    for m in re.finditer(rf"(?<![\w.`])({words})\.({words}|\*)", code):
+        before = code[: m.start()].rstrip()
+        if re.search(r"\b(?:FROM|JOIN)$", before, re.I):
+            continue  # base.table : nom qualifie d'une table
+        prefix = m.group(1).strip("`").lower()
+        ref = m.group(0)
+        if prefix not in defined and ref not in bad:
+            bad.append(ref)
+    return bad
 
 
 def check_section(
@@ -339,6 +446,13 @@ def check_section(
             f"table ou vue inconnue : {', '.join(unknown)} (vues "
             f"autorisees : {', '.join(sorted(section.get('views', {}))) or 'aucune'}"
             " + les CTE de la requete)"
+        )
+
+    bad = unknown_prefixes(code, allowed)
+    if bad:
+        errors.append(
+            f"prefixe inconnu : {', '.join(bad)} (ni CTE, ni vue, ni alias "
+            "defini dans la requete)"
         )
 
     # colonnes de sortie

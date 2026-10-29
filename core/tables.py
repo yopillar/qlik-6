@@ -7,27 +7,13 @@ write_output("ventes_v2", table="Ventes")          STORE Ventes INTO ventes_v2
 
 from __future__ import annotations
 
-from commons import add_load_order
+from core.datasets import read_input
 from core.internal import context, lineage
 from core.internal.io import access
 from core.internal.session import active_session
 
-
-def read_input(name: str, table: str) -> None:
-    """Charge une entree de conf/io.yml, comme un LOAD ... FROM fichier.
-
-    Elle devient la table `table`, que les requetes du script peuvent lire.
-    Les lignes gardent leur ordre de lecture, comme dans Qlik.
-
-    Args:
-        name: le nom de l'entree dans conf/io.yml.
-        table: le nom sous lequel les requetes la lisent.
-    """
-    spark = active_session()
-    state = context.state()
-    add_load_order(access.read_config(spark, name)).createOrReplaceTempView(table)
-    state.tables.append(table)
-    state.read_locations.add(access.input_location(name))
+# read_input est defini une seule fois, dans datasets.py
+__all__ = ["read_input", "run_sql", "write_output"]
 
 
 def write_output(name: str, table: str) -> None:

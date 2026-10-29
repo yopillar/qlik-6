@@ -64,13 +64,19 @@ socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
 | Ici | Dans le socle | Contenu |
 |---|---|---|
 | `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `run_scripts`, `script_name`, `parse_options`, `select` |
-| `core/tables.py` | `spark_foundation/tables.py` | `read_input`, `write_output`, `run_sql` |
+| `core/datasets.py` | `spark_foundation/datasets.py` | `read_input` : la seule definition |
+| `core/tables.py` | `spark_foundation/tables.py` | `write_output`, `run_sql`, et `read_input` repris de `datasets.py` |
 | `core/internal/session.py` | `internal/session.py` | `get_session`, `active_session` |
 | `core/internal/config.py` | `internal/config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
 | `core/internal/context.py` | `internal/context.py` | `JobState`, `state`, `start_job`, `script_scope` |
 | `core/internal/lineage.py` | `internal/lineage.py` | `ensure_database`, `table_name`, `materialize` |
 | `core/internal/io/access.py` | `internal/io/access.py` | `read_config`, `write_config`, `input_location`, `output_location` |
 | `commons/` | `pyspark_commons` | `add_load_order`, `cast_void_to_string`, `drop_columns` |
+
+`read_input(nom)` renvoie l'entree en DataFrame (usage PySpark classique) ;
+`read_input(nom, table="in_x")` la range en plus dans la table `in_x` pour
+les requetes SQL, avec l'ordre de lecture Qlik. Une seule fonction, dans
+`datasets.py`, que `tables.py` reprend.
 
 Seul le nom des packages differe (`core`, `commons`). Les tests passent par
 `tests/fakelib/spark_foundation/`, qui expose `core/` sous le nom du socle
@@ -166,14 +172,29 @@ def run(spark: SparkSession, args: list[str]) -> None:
     )
 ```
 
-et chaque script Qlik devient un module de `scripts/`, une ligne par etape :
+et chaque script Qlik devient un module de `scripts/` : la liste de ses
+entrees, la liste de ses tables dans l'ordre, et deux boucles. Avec 50
+tables, on ajoute 50 lignes aux listes, pas 140 appels de fonction :
 
 ```python
+INPUTS: dict[str, str] = {
+    "ventes": "in_ventes",
+}
+
+TABLES: list[tuple[str, str, str | None]] = [
+    ("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),
+    ("ventes__02_clients.sql", "Clients", None),  # None : pas de STORE
+]
+
+
 def run() -> None:
     """Rejoue le script ventes.qvs."""
-    read_input("ventes", table="in_ventes")
-    run_sql("ventes__01_ventes.sql", table="Ventes")
-    write_output("ventes_enrichies_v2", table="Ventes")
+    for name, table in INPUTS.items():
+        read_input(name, table=table)
+    for sql_file, table, output in TABLES:
+        run_sql(sql_file, table=table)
+        if output:
+            write_output(output, table=table)
 ```
 
 - L'ordre des scripts est l'ordre des appels dans `run_scripts`, il n'y a
@@ -505,6 +526,11 @@ casse comme dans Qlik. Une erreur certaine (syntaxe, `GROUP BY`, reference
 ambigue...) bloque la table avant qu'elle n'arrive dans le job. Une colonne
 introuvable est seulement signalee quand les colonnes de la table amont ont
 ete deduites du script, faute de schema, parce qu'on n'en est pas sur.
+
+Le controle refuse aussi un prefixe `x.colonne` qui ne designe ni une CTE,
+ni une vue, ni un alias de la requete (le modele a deja ecrit
+`pos._qlik_order` pour un INLINE aliase `v(...)`). Une requete qui ne lit
+aucune vue (INLINE, AUTOGENERATE) est quand meme analysee par Spark.
 
 Les erreurs deja presentes dans le brouillon avant que le modele n'y touche
 viennent du traducteur. On ne les lui renvoie jamais, sinon il cherche a
