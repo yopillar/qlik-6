@@ -1,9 +1,10 @@
-"""Lire une entree de conf/io.yml.
+"""Lire une entree et ecrire une sortie de conf/io.yml.
 
     df = read_input("ventes")                      un DataFrame, pour du PySpark
     read_input("ventes", table="in_ventes")        en plus, une table pour le SQL
                                                    (et in_ventes__file pour
                                                    FileTime())
+    write_output("ventes_v2", table="Ventes")      STORE Ventes INTO ventes_v2
 
 Une seule fonction pour les deux usages : avant, datasets.py renvoyait le
 DataFrame et tables.py le rangeait dans une vue sans rien renvoyer.
@@ -46,6 +47,23 @@ def read_input(name: str, table: str | None = None) -> DataFrame:
             times.createOrReplaceTempView(table + "__file")
             state.tables.append(table + "__file")
     return df
+
+
+def write_output(name: str, table: str) -> None:
+    """Ecrit une table dans une sortie de conf/io.yml, comme un STORE.
+
+    Args:
+        name: le nom de la sortie dans conf/io.yml.
+        table: la table a ecrire.
+    """
+    spark = active_session()
+    state = context.state()
+    df = spark.table(table)
+    if state.database is None and access.output_location(name) in state.read_locations:
+        # Le script ecrase un fichier qu'il a lu : sans table intermediaire,
+        # Spark relirait le fichier en l'ecrivant. On fige la table avant.
+        df = df.localCheckpoint()
+    access.write_config(df, name)
 
 
 def file_times(df: DataFrame) -> DataFrame | None:

@@ -122,9 +122,10 @@ def test_job_is_simple_and_each_table_is_in_the_catalog(project: Project) -> Non
     assert "from spark_foundation.runner import script" in ventes
     assert "@script\ndef run() -> None:" in ventes
     assert (
-        "from spark_foundation.tables import read_input, run_sql, write_output"
-        in ventes
-    )
+        "from spark_foundation.datasets import read_input, write_output\n"
+        "from spark_foundation.runner import script\n"
+        "from spark_foundation.tables import run_sql\n"
+    ) in ventes
     # une liste des entrees, une liste des tables, et deux boucles
     assert '"ventes": "in_ventes",' in ventes
     assert '("ventes__01_ventes.sql", "Ventes", "ventes_enrichies_v2"),' in ventes

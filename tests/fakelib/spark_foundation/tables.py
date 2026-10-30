@@ -1,6 +1,5 @@
-"""Doublure de spark_foundation/tables.py : lecture, calcul et ecriture
-d'une table."""
+"""Doublure de spark_foundation/tables.py : calcul d'une table Qlik."""
 
-from core.tables import read_input, run_sql, write_output
+from core.tables import run_sql
 
-__all__ = ["read_input", "run_sql", "write_output"]
+__all__ = ["run_sql"]

@@ -48,7 +48,8 @@ Le code genere n'importe que le socle, et seulement ces fonctions :
 |---|---|---|
 | `from spark_foundation import pipeline` (`job.py`) | `spark_foundation/runner.py` | `@pipeline("<nom-projet>")` ouvre la session, lit `--from`, `--only`, `--database`, `--temp-views` et trouve `sql/` a cote de `job.py` |
 | `from spark_foundation.runner import script` (`<script>.py`) | `spark_foundation/runner.py` | `@script` sur le `run()` d'un script : `--from` / `--only`, vues du script, arret au premier echec |
-| `from spark_foundation.tables import read_input, run_sql, write_output` (`<script>.py`) | `spark_foundation/tables.py` | lire une entree de `conf/io.yml`, calculer une table Qlik avec sa requete, l'ecrire |
+| `from spark_foundation.datasets import read_input, write_output` (`<script>.py`) | `spark_foundation/datasets.py` | lire une entree de `conf/io.yml`, ecrire une table dans une sortie |
+| `from spark_foundation.tables import run_sql` (`<script>.py`) | `spark_foundation/tables.py` | calculer une table Qlik avec sa requete du dossier `sql/` |
 
 - les autres fichiers du socle, a plat (aucun sous-dossier) : session et reglages SQL (`session.py`),
   lecture de `conf/io.yml` (`config.py`), etat du job (`context.py`),
@@ -65,8 +66,8 @@ socle, pour qu'on puisse passer de l'un a l'autre fichier par fichier :
 | Ici | Dans le socle | Contenu |
 |---|---|---|
 | `core/runner.py` | `spark_foundation/runner.py` | `Pipeline`, `pipeline`, `script`, `parse_options` (plus de `run_scripts`) |
-| `core/datasets.py` | `spark_foundation/datasets.py` | `read_input` : la seule definition |
-| `core/tables.py` | `spark_foundation/tables.py` | `write_output`, `run_sql`, et `read_input` repris de `datasets.py` |
+| `core/datasets.py` | `spark_foundation/datasets.py` | `read_input`, `write_output`, `file_times` |
+| `core/tables.py` | `spark_foundation/tables.py` | `run_sql` |
 | `core/session.py` | `session.py` | `get_session`, `active_session` |
 | `core/config.py` | `config.py` | `load_io`, `section`, `entry`, `location`, `schema_ddl` |
 | `core/context.py` | `context.py` | `JobState`, `state`, `start_job`, `script_scope` |
@@ -81,8 +82,9 @@ ligne, `file_time`, la date de modification du fichier. C'est ce que lit
 `FileTime()` de Qlik, traduit en `(SELECT file_time FROM in_x__file)`. Spark
 ne la calcule que si une requete la lit. Elle vient de la colonne cachee
 `_metadata` de Spark, qui disparait des que la table passe par une vue :
-d'ou une vue a part, a reporter dans le socle. Une seule fonction, dans
-`datasets.py`, que `tables.py` reprend.
+d'ou une vue a part, a reporter dans le socle. `read_input` et
+`write_output` sont tous deux dans `datasets.py` ; `tables.py` n'a que
+`run_sql`.
 
 Seul le nom des packages differe (`core`, `commons`). Les tests passent par
 `tests/fakelib/spark_foundation/`, qui expose `core/` sous le nom du socle
@@ -695,7 +697,7 @@ tests sont sautes.
   Java 21. Pas encore teste sur le cluster, ni avec un vrai opencode.
 - Les tests tournent sur la doublure du socle, pas sur le vrai
   `spark_foundation` : on suppose que son API publique est celle decrite
-  plus haut (noms et signatures de `runner.py` et `tables.py`).
+  plus haut (noms et signatures de `runner.py`, `datasets.py` et `tables.py`).
 - Les tables du catalogue sont en Parquet, ecrasees a chaque lancement : on
   n'a que la derniere version. Un overwrite Parquet n'est pas atomique, un
   echec au milieu laisse la table incomplete jusqu'au prochain lancement

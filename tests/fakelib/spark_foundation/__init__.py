@@ -6,10 +6,11 @@ commons/ du depot, qui ont servi de base au socle :
     spark_foundation            pipeline, Pipeline, read_input,
                                 write_output, script
     spark_foundation.runner     Pipeline, pipeline, script
-    spark_foundation.tables     read_input, write_output, run_sql
+    spark_foundation.datasets   read_input, write_output
+    spark_foundation.tables     run_sql
 """
 
+from spark_foundation.datasets import read_input, write_output
 from spark_foundation.runner import Pipeline, pipeline, script
-from spark_foundation.tables import read_input, write_output
 
 __all__ = ["Pipeline", "pipeline", "read_input", "script", "write_output"]

@@ -4,7 +4,8 @@ Ce code est lu par des developpeurs Qlik qui ne connaissent pas PySpark. Il
 ne contient donc que des appels aux fonctions du socle spark_foundation :
     spark_foundation            pipeline (runner.py) : le job
     spark_foundation.runner     script : la fonction run() d'un script Qlik
-    spark_foundation.tables     read_input, run_sql, write_output
+    spark_foundation.datasets   read_input, write_output : lire et ecrire
+    spark_foundation.tables     run_sql : calculer une table Qlik
 Tout ce qui est technique (session, io.yml, lecture, ecriture, tables pour
 OpenLineage, reprise) est dans les autres fichiers du socle, et les
 transformations dans pyspark_commons.
@@ -133,8 +134,9 @@ dans l'ordre du script Qlik, et ecrit celles qui avaient un STORE.
 
 from __future__ import annotations
 
+from spark_foundation.datasets import read_input, write_output
 from spark_foundation.runner import script
-from spark_foundation.tables import read_input, run_sql, write_output
+from spark_foundation.tables import run_sql
 
 # Fichiers lus par le script (LOAD ... FROM) :
 # nom dans conf/io.yml -> nom de la table dans les requetes SQL
